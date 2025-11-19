@@ -55,19 +55,19 @@ app.post('/order/:remoteId', (req, res) => {
         } : null,
         Items: (order.products || []).map(p => ({
             Name: p.name || '',
-            Quantity: p.quantity || 0,
-            UnitPrice: p.unitPrice || 0,
-            TotalPrice: p.totalPrice || 0,
+            Quantity: parseInt(p.quantity) || 0,
+            UnitPrice: parseFloat(p.unitPrice) || 0,
+            TotalPrice: parseFloat(p.totalPrice) || 0,
             Note: p.note || '',
             Options: (p.options || []).map(o => ({
                 Name: o.name || '',
                 Value: o.value || '',
-                Price: o.price || 0
+                Price: parseFloat(o.price) || 0
             }))
         })),
-        TotalAmount: order.price?.grandTotal || 0,
-        DeliveryFee: order.price?.deliveryFee || 0,
-        DiscountAmount: order.price?.discount || 0,
+        TotalAmount: parseFloat(order.price?.grandTotal) || 0,
+        DeliveryFee: parseFloat(order.price?.deliveryFee) || 0,
+        DiscountAmount: parseFloat(order.price?.discount) || 0,
         PaymentMethod: order.paymentMethod || 'ONLINE',
         DeliveryType: order.deliveryType || 'DELIVERY',
         CourierType: order.courierType || 'VENDOR',
