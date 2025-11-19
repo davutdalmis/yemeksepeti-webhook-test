@@ -57,9 +57,9 @@ app.post('/order/:remoteId', (req, res) => {
             Name: p.name || '',
             Quantity: parseInt(p.quantity) || 0,
             UnitPrice: parseFloat(p.unitPrice) || 0,
-            TotalPrice: parseFloat(p.totalPrice) || 0,
-            Note: p.note || '',
-            Options: (p.options || []).map(o => ({
+            TotalPrice: parseFloat(p.paidPrice) || 0,  // YemekSepeti uses paidPrice
+            Note: p.description || '',
+            Options: (p.selectedToppings || []).map(o => ({
                 Name: o.name || '',
                 Value: o.value || '',
                 Price: parseFloat(o.price) || 0
