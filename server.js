@@ -27,7 +27,7 @@ app.post('/order/:remoteId', (req, res) => {
 
     // Transform YemekSepeti webhook to C# model format
     const transformedOrder = {
-        OrderId: order.code || '',
+        OrderId: order.code || order.token || '',  // code boşsa token kullan
         RemoteOrderId: `${remoteId}_${order.token}_${Date.now()}`,
         OrderToken: order.token || '',
         VendorId: remoteId || '',
