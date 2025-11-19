@@ -38,7 +38,7 @@ app.post('/order/:remoteId', (req, res) => {
         Customer: order.customer ? {
             FirstName: order.customer.firstName || '',
             LastName: order.customer.lastName || '',
-            Phone: order.customer.phone || '',
+            Phone: order.customer.mobilePhone || order.customer.phone || '',
             Email: order.customer.email || '',
             Address: order.customer.address ? {
                 FullAddress: order.customer.address.fullAddress || '',
@@ -68,11 +68,11 @@ app.post('/order/:remoteId', (req, res) => {
         TotalAmount: parseFloat(order.price?.grandTotal) || 0,
         DeliveryFee: parseFloat(order.price?.deliveryFee) || 0,
         DiscountAmount: parseFloat(order.price?.discount) || 0,
-        PaymentMethod: order.paymentMethod || 'ONLINE',
-        DeliveryType: order.deliveryType || 'DELIVERY',
-        CourierType: order.courierType || 'VENDOR',
-        Note: order.note || '',
-        PlatformOrderId: order.platformOrderId || null
+        PaymentMethod: order.payment?.type || 'ONLINE',
+        DeliveryType: order.expeditionType === 'pickup' ? 'PICKUP' : 'DELIVERY',
+        CourierType: 'VENDOR',  // YemekSepeti doesn't provide this, default to VENDOR
+        Note: order.comments?.customerComment || '',
+        PlatformOrderId: order.id || null
     };
 
     // Store transformed order in memory
