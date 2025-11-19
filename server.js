@@ -3,6 +3,9 @@ const app = express();
 
 app.use(express.json());
 
+// In-memory order storage
+const pendingOrders = new Map();
+
 // YemekSepeti Order Dispatch Webhook
 app.post('/order/:remoteId', (req, res) => {
     const { remoteId } = req.params;
@@ -21,6 +24,16 @@ app.post('/order/:remoteId', (req, res) => {
     console.log('\nFull Order Payload:');
     console.log(JSON.stringify(order, null, 2));
     console.log('='.repeat(80));
+
+    // Store order in memory
+    const orderId = order.token;
+    pendingOrders.set(orderId, {
+        ...order,
+        remoteId,
+        receivedAt: new Date().toISOString()
+    });
+
+    console.log(`✅ Order stored. Total pending: ${pendingOrders.size}`);
 
     // YemekSepeti'ye başarılı yanıt dön (remoteOrderId ile)
     res.status(200).json({
@@ -70,14 +83,55 @@ app.get('/health', (req, res) => {
     res.json({ status: 'ok', service: 'YemekSepeti Webhook Test' });
 });
 
+// POS Polling Endpoint - Get pending orders
+app.get('/api/yemeksepeti/pending-orders', (req, res) => {
+    const apiKey = req.headers['x-api-key'];
+
+    // Simple API key check
+    if (apiKey !== 'bafetto-yemeksepeti-2025-secure-key') {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const orders = Array.from(pendingOrders.values());
+
+    console.log(`📤 POS polling: ${orders.length} pending orders`);
+
+    res.json({
+        success: true,
+        count: orders.length,
+        orders: orders
+    });
+});
+
+// Mark order as fetched (delete from pending)
+app.delete('/api/yemeksepeti/orders/:orderId', (req, res) => {
+    const apiKey = req.headers['x-api-key'];
+    const { orderId } = req.params;
+
+    if (apiKey !== 'bafetto-yemeksepeti-2025-secure-key') {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    if (pendingOrders.has(orderId)) {
+        pendingOrders.delete(orderId);
+        console.log(`🗑️ Order ${orderId} removed. Remaining: ${pendingOrders.size}`);
+        res.json({ success: true, message: 'Order removed' });
+    } else {
+        res.status(404).json({ success: false, message: 'Order not found' });
+    }
+});
+
 // Root endpoint
 app.get('/', (req, res) => {
     res.json({
-        service: 'YemekSepeti Webhook Test Server',
+        service: 'YemekSepeti Webhook & Polling Server',
+        pendingOrders: pendingOrders.size,
         endpoints: {
             orderDispatch: 'POST /order/:remoteId',
             orderStatusUpdate: 'PUT /remoteId/:remoteId/remoteOrder/:remoteOrderId/posOrderStatus',
             menuImport: 'GET /menuimport/:remoteId',
+            getPendingOrders: 'GET /api/yemeksepeti/pending-orders (requires x-api-key header)',
+            deleteOrder: 'DELETE /api/yemeksepeti/orders/:orderId (requires x-api-key header)',
             health: 'GET /health'
         }
     });
