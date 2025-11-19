@@ -25,13 +25,59 @@ app.post('/order/:remoteId', (req, res) => {
     console.log(JSON.stringify(order, null, 2));
     console.log('='.repeat(80));
 
-    // Store order in memory
+    // Transform YemekSepeti webhook to C# model format
+    const transformedOrder = {
+        OrderId: order.code || '',
+        RemoteOrderId: `${remoteId}_${order.token}_${Date.now()}`,
+        OrderToken: order.token || '',
+        VendorId: remoteId || '',
+        ChainCode: '', // Will be filled from settings
+        OrderDate: order.createdAt || new Date().toISOString(),
+        ScheduledDeliveryTime: order.scheduledDeliveryTime || null,
+        IsScheduled: order.isScheduled || false,
+        Customer: order.customer ? {
+            FirstName: order.customer.firstName || '',
+            LastName: order.customer.lastName || '',
+            Phone: order.customer.phone || '',
+            Email: order.customer.email || '',
+            Address: order.customer.address ? {
+                FullAddress: order.customer.address.fullAddress || '',
+                City: order.customer.address.city || '',
+                District: order.customer.address.district || '',
+                Street: order.customer.address.street || '',
+                BuildingNo: order.customer.address.buildingNo || '',
+                ApartmentNo: order.customer.address.apartmentNo || '',
+                Floor: order.customer.address.floor || '',
+                DoorNo: order.customer.address.doorNo || '',
+                Latitude: order.customer.address.latitude || 0,
+                Longitude: order.customer.address.longitude || 0
+            } : null
+        } : null,
+        Items: (order.products || []).map(p => ({
+            Name: p.name || '',
+            Quantity: p.quantity || 0,
+            UnitPrice: p.unitPrice || 0,
+            TotalPrice: p.totalPrice || 0,
+            Note: p.note || '',
+            Options: (p.options || []).map(o => ({
+                Name: o.name || '',
+                Value: o.value || '',
+                Price: o.price || 0
+            }))
+        })),
+        TotalAmount: order.price?.grandTotal || 0,
+        DeliveryFee: order.price?.deliveryFee || 0,
+        DiscountAmount: order.price?.discount || 0,
+        PaymentMethod: order.paymentMethod || 'ONLINE',
+        DeliveryType: order.deliveryType || 'DELIVERY',
+        CourierType: order.courierType || 'VENDOR',
+        Note: order.note || '',
+        PlatformOrderId: order.platformOrderId || null
+    };
+
+    // Store transformed order in memory
     const orderId = order.token;
-    pendingOrders.set(orderId, {
-        ...order,
-        remoteId,
-        receivedAt: new Date().toISOString()
-    });
+    pendingOrders.set(orderId, transformedOrder);
 
     console.log(`✅ Order stored. Total pending: ${pendingOrders.size}`);
 
