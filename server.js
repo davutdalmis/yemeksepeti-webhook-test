@@ -240,7 +240,8 @@ app.delete('/api/yemeksepeti/orders/:orderId', (req, res) => {
 
 app.post('/webhook/newOrder', (req, res) => {
     const order = req.body;
-    const restaurantSecretKey = req.headers['x-restaurant-secret-key'] || '';
+    // GetirYemek header göndermiyorsa default key kullan
+    const restaurantSecretKey = req.headers['x-restaurant-secret-key'] || 'bc19c0303e194594d027b365a95015b53edaf5a2';
 
     console.log('[GetirYemek] New order:', order.id);
 
@@ -258,7 +259,8 @@ app.post('/webhook/newOrder', (req, res) => {
 
 app.post('/webhook/cancelOrder', (req, res) => {
     const order = req.body;
-    const restaurantSecretKey = req.headers['x-restaurant-secret-key'] || '';
+    // GetirYemek header göndermiyorsa default key kullan
+    const restaurantSecretKey = req.headers['x-restaurant-secret-key'] || 'bc19c0303e194594d027b365a95015b53edaf5a2';
 
     console.log('[GetirYemek] Order cancelled:', order.id);
 
@@ -276,7 +278,8 @@ app.post('/webhook/cancelOrder', (req, res) => {
 
 app.post('/webhook/courierArrival', (req, res) => {
     const notification = req.body;
-    const restaurantSecretKey = req.headers['x-restaurant-secret-key'] || '';
+    // GetirYemek header göndermiyorsa default key kullan
+    const restaurantSecretKey = req.headers['x-restaurant-secret-key'] || 'bc19c0303e194594d027b365a95015b53edaf5a2';
 
     console.log('[GetirYemek] Courier arrival:', notification.orderId);
 
