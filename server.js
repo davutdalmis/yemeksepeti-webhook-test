@@ -243,7 +243,10 @@ app.post('/webhook/newOrder', (req, res) => {
     // GetirYemek header göndermiyorsa default key kullan
     const restaurantSecretKey = req.headers['x-restaurant-secret-key'] || 'bc19c0303e194594d027b365a95015b53edaf5a2';
 
-    console.log('[GetirYemek] New order:', order.id);
+    // DEBUG: Full webhook body'sini log'la
+    console.log('[GetirYemek] New order webhook received');
+    console.log('[GetirYemek] Full body:', JSON.stringify(order, null, 2));
+    console.log('[GetirYemek] Headers:', JSON.stringify(req.headers, null, 2));
 
     const webhookId = Date.now() + '_' + Math.random().toString(36).substr(2, 9);
     getirYemekWebhooks.push({
