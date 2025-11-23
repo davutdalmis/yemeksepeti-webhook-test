@@ -253,7 +253,7 @@ app.post('/webhook/newOrder', (req, res) => {
     getirYemekWebhooks.push({
         id: webhookId,
         type: 'newOrder',
-        data: { foodOrder: order },
+        data: order,  // GetirYemek zaten full data gönderiyor
         restaurantSecretKey: restaurantSecretKey,
         timestamp: new Date()
     });
