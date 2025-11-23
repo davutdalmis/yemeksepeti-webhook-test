@@ -1,4 +1,5 @@
-require('dotenv').config();
+// Load .env file if exists (optional - Railway uses environment variables)
+try { require('dotenv').config(); } catch (e) { }
 const express = require('express');
 const axios = require('axios');
 const app = express();
