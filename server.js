@@ -74,6 +74,12 @@ async function checkOrderStatus(orderId) {
 }
 
 async function validateOrdersWithYemekSepeti() {
+    // Skip validation if no credentials (Railway polling mode only)
+    if (!YEMEKSEPETI_CONFIG.username || !YEMEKSEPETI_CONFIG.password || !YEMEKSEPETI_CONFIG.chainCode) {
+        console.log('[YemekSepeti] Validation skipped - API credentials not configured (Railway polling mode)');
+        return;
+    }
+
     if (orders.size === 0) return;
 
     console.log(`[YemekSepeti] Validating ${orders.size} orders...`);
