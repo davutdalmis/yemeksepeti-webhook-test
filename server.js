@@ -119,7 +119,10 @@ app.post('/order/:remoteId', (req, res) => {
     const { remoteId } = req.params;
     const order = req.body;
 
-    console.log('[YemekSepeti] New order:', order.code || order.token);
+    console.log('[YemekSepeti] ========== NEW ORDER RECEIVED ==========');
+    console.log('[YemekSepeti] Order Code:', order.code || order.token);
+    console.log('[YemekSepeti] Remote ID:', remoteId);
+    console.log('[YemekSepeti] Full Order Payload:', JSON.stringify(order, null, 2));
 
     const baseUrl = req.get('host').includes('localhost')
         ? `http://localhost:${PORT}`
@@ -188,6 +191,18 @@ app.post('/order/:remoteId', (req, res) => {
         status: 'NEW',
         createdAt: new Date()
     });
+
+    console.log('[YemekSepeti] ========== TRANSFORMED ORDER ==========');
+    console.log('[YemekSepeti] Customer:', transformedOrder.Customer?.FirstName, transformedOrder.Customer?.LastName);
+    console.log('[YemekSepeti] Phone:', transformedOrder.Customer?.Phone);
+    console.log('[YemekSepeti] Items:', transformedOrder.Items.length);
+    transformedOrder.Items.forEach((item, idx) => {
+        console.log(`[YemekSepeti]   ${idx + 1}. ${item.Name} x${item.Quantity} = ${item.TotalPrice} TL`);
+    });
+    console.log('[YemekSepeti] Total Amount:', transformedOrder.TotalAmount, 'TL');
+    console.log('[YemekSepeti] Payment Method:', transformedOrder.PaymentMethod);
+    console.log('[YemekSepeti] Delivery Type:', transformedOrder.DeliveryType);
+    console.log('[YemekSepeti] ========================================');
 
     res.status(200).json({
         remoteResponse: {
