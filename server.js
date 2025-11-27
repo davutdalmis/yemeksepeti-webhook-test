@@ -7,6 +7,7 @@ const app = express();
 app.use(express.json());
 
 const orders = new Map();
+const cancellations = new Map(); // YemekSepeti iptal bildirimleri
 const getirYemekWebhooks = [];
 
 // YemekSepeti API Configuration
@@ -217,9 +218,100 @@ app.post('/order/:remoteId', (req, res) => {
     });
 });
 
+// ==================== YEMEKSEPETI ORDER STATUS UPDATE (İPTAL DAHİL) ====================
+// Delivery Hero dokümantasyonuna göre: POS plugin'e sipariş durumu güncellemeleri bu endpoint'e gelir
+// İptal senaryoları: müşteri iptali, lojistik kaynaklı iptal, 10 dk timeout iptali
 app.put('/remoteId/:remoteId/remoteOrder/:remoteOrderId/posOrderStatus', (req, res) => {
-    console.log('[YemekSepeti] Order status update:', req.body.status);
-    res.status(200).send('OK');
+    const { remoteId, remoteOrderId } = req.params;
+    const statusUpdate = req.body;
+
+    console.log('[YemekSepeti] ========== ORDER STATUS UPDATE ==========');
+    console.log('[YemekSepeti] Remote ID:', remoteId);
+    console.log('[YemekSepeti] Remote Order ID:', remoteOrderId);
+    console.log('[YemekSepeti] Status:', statusUpdate.status);
+    console.log('[YemekSepeti] Full Payload:', JSON.stringify(statusUpdate, null, 2));
+    console.log('[YemekSepeti] ==========================================');
+
+    // İptal durumunu kontrol et
+    const status = (statusUpdate.status || '').toLowerCase();
+    if (status === 'cancelled' || status === 'rejected' || status === 'cancel') {
+        // İptal bildirimini kaydet - BafettoPOS polling ile alacak
+        const cancellationId = `cancel_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+        // remoteOrderId'den orderToken'ı çıkar (format: remoteId_orderToken_timestamp)
+        const parts = remoteOrderId.split('_');
+        const orderToken = parts.length >= 2 ? parts[1] : remoteOrderId;
+
+        const cancellation = {
+            id: cancellationId,
+            orderId: orderToken,
+            remoteOrderId: remoteOrderId,
+            remoteId: remoteId,
+            status: 'CANCELLED',
+            reason: statusUpdate.reason || statusUpdate.cancelReason || statusUpdate.rejectionReason || 'UNKNOWN',
+            reasonCode: statusUpdate.reasonCode || statusUpdate.cancelReasonCode || null,
+            cancelledBy: statusUpdate.cancelledBy || statusUpdate.initiator || 'PLATFORM',
+            note: statusUpdate.note || statusUpdate.cancelNote || null,
+            originalPayload: statusUpdate,
+            cancelledAt: new Date().toISOString(),
+            createdAt: new Date()
+        };
+
+        cancellations.set(cancellationId, cancellation);
+
+        console.log('[YemekSepeti] ========== CANCELLATION SAVED ==========');
+        console.log('[YemekSepeti] Cancellation ID:', cancellationId);
+        console.log('[YemekSepeti] Order Token:', orderToken);
+        console.log('[YemekSepeti] Reason:', cancellation.reason);
+        console.log('[YemekSepeti] Cancelled By:', cancellation.cancelledBy);
+        console.log('[YemekSepeti] Total Cancellations:', cancellations.size);
+        console.log('[YemekSepeti] ========================================');
+
+        // orders Map'ten de sil/güncelle
+        if (orders.has(orderToken)) {
+            const orderData = orders.get(orderToken);
+            orderData.status = 'CANCELLED';
+            orderData.cancelledAt = new Date();
+            orderData.cancelReason = cancellation.reason;
+        }
+    }
+
+    res.status(200).json({ success: true, message: 'Status update received' });
+});
+
+// Alternatif iptal endpoint'leri (Delivery Hero farklı formatlar kullanabilir)
+app.post('/remoteId/:remoteId/remoteOrder/:remoteOrderId/cancel', (req, res) => {
+    const { remoteId, remoteOrderId } = req.params;
+    const cancelData = req.body;
+
+    console.log('[YemekSepeti] ========== CANCEL ENDPOINT ==========');
+    console.log('[YemekSepeti] Remote ID:', remoteId);
+    console.log('[YemekSepeti] Remote Order ID:', remoteOrderId);
+    console.log('[YemekSepeti] Cancel Data:', JSON.stringify(cancelData, null, 2));
+
+    const cancellationId = `cancel_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const parts = remoteOrderId.split('_');
+    const orderToken = parts.length >= 2 ? parts[1] : remoteOrderId;
+
+    const cancellation = {
+        id: cancellationId,
+        orderId: orderToken,
+        remoteOrderId: remoteOrderId,
+        remoteId: remoteId,
+        status: 'CANCELLED',
+        reason: cancelData.reason || cancelData.cancelReason || 'UNKNOWN',
+        reasonCode: cancelData.reasonCode || null,
+        cancelledBy: cancelData.cancelledBy || cancelData.initiator || 'PLATFORM',
+        note: cancelData.note || null,
+        originalPayload: cancelData,
+        cancelledAt: new Date().toISOString(),
+        createdAt: new Date()
+    };
+
+    cancellations.set(cancellationId, cancellation);
+    console.log('[YemekSepeti] Cancellation saved:', cancellationId);
+
+    res.status(200).json({ success: true });
 });
 
 app.get('/menuimport/:remoteId', (req, res) => {
@@ -255,6 +347,47 @@ app.delete('/api/yemeksepeti/orders/:orderId', (req, res) => {
         res.json({ success: true });
     } else {
         res.status(404).json({ success: false });
+    }
+});
+
+// ==================== YEMEKSEPETI İPTAL POLLING ====================
+// BafettoPOS iptal bildirimlerini bu endpoint'ten polling ile alır
+app.get('/api/yemeksepeti/cancellations', (req, res) => {
+    const apiKey = req.headers['x-api-key'];
+    if (apiKey !== 'bafetto-yemeksepeti-2025-secure-key') {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const pendingCancellations = Array.from(cancellations.values())
+        .map(c => ({
+            id: c.id,
+            orderId: c.orderId,
+            remoteOrderId: c.remoteOrderId,
+            status: c.status,
+            reason: c.reason,
+            reasonCode: c.reasonCode,
+            cancelledBy: c.cancelledBy,
+            note: c.note,
+            cancelledAt: c.cancelledAt
+        }));
+
+    console.log(`[YemekSepeti] Cancellation Polling: ${pendingCancellations.length} cancellations`);
+    res.json({ success: true, count: pendingCancellations.length, cancellations: pendingCancellations });
+});
+
+// İptal bildirimini sil (BafettoPOS işledikten sonra)
+app.delete('/api/yemeksepeti/cancellations/:cancellationId', (req, res) => {
+    const apiKey = req.headers['x-api-key'];
+    if (apiKey !== 'bafetto-yemeksepeti-2025-secure-key') {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    if (cancellations.has(req.params.cancellationId)) {
+        cancellations.delete(req.params.cancellationId);
+        console.log(`[YemekSepeti] Cancellation deleted: ${req.params.cancellationId}`);
+        res.json({ success: true });
+    } else {
+        res.status(404).json({ success: false, message: 'Cancellation not found' });
     }
 });
 
@@ -405,15 +538,20 @@ app.get('/', (req, res) => {
         service: 'Restaurant Webhook & Polling Server',
         yemeksepeti: {
             totalOrders: orders.size,
-            ordersByStatus: ordersByStatus
+            ordersByStatus: ordersByStatus,
+            pendingCancellations: cancellations.size
         },
         getiryemek: {
             pendingWebhooks: getirYemekWebhooks.length
         },
         endpoints: {
             yemeksepeti: {
-                webhook: 'POST /order/:remoteId',
-                polling: 'GET /api/yemeksepeti/pending-orders'
+                orderWebhook: 'POST /order/:remoteId',
+                statusUpdate: 'PUT /remoteId/:remoteId/remoteOrder/:remoteOrderId/posOrderStatus',
+                cancelWebhook: 'POST /remoteId/:remoteId/remoteOrder/:remoteOrderId/cancel',
+                orderPolling: 'GET /api/yemeksepeti/pending-orders',
+                cancellationPolling: 'GET /api/yemeksepeti/cancellations',
+                deleteCancellation: 'DELETE /api/yemeksepeti/cancellations/:cancellationId'
             },
             getiryemek: {
                 webhooks: ['POST /webhook/newOrder', 'POST /webhook/cancelOrder', 'POST /webhook/courierArrival'],
