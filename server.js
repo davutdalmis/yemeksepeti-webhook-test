@@ -149,53 +149,64 @@ app.post('/order/:remoteId', (req, res) => {
     const deliveryInstructions = order.deliveryInstructions || deliveryAddress?.deliveryInstructions || '';
 
     // Full address oluştur - YemekSepeti Türkiye formatı
+    // Hem deliveryAddress içinden hem üst seviyeden değerleri al (fallback)
+    const street = deliveryAddress?.street || order.street || '';
+    const streetNumber = deliveryAddress?.number || order.number || '';
+    const city = deliveryAddress?.city || order.city || '';
+    const district = deliveryAddress?.district || order.district || '';
+    const building = deliveryAddress?.building || order.building || '';
+    const entrance = deliveryAddress?.entrance || order.entrance || '';
+    const floor = deliveryAddress?.floor || order.floor || '';
+    const flatNumber = deliveryAddress?.flatNumber || order.flatNumber || '';
+    const intercom = deliveryAddress?.intercom || order.intercom || '';
+
     let fullAddress = '';
-    if (deliveryAddress) {
-        const addressParts = [];
+    const addressParts = [];
 
-        // Sokak ve numara
-        if (deliveryAddress.street) {
-            let streetPart = deliveryAddress.street;
-            if (deliveryAddress.number) {
-                streetPart += ' ' + deliveryAddress.number;
-            }
-            addressParts.push(streetPart);
+    // Sokak ve numara
+    if (street) {
+        let streetPart = street;
+        if (streetNumber) {
+            streetPart += ' ' + streetNumber;
         }
-
-        // Mahalle/Semt (üst seviyeden)
-        if (deliveryMainArea) {
-            addressParts.push(deliveryMainArea);
-        }
-
-        // İlçe
-        if (deliveryAddress.district) {
-            addressParts.push(deliveryAddress.district);
-        }
-
-        // Şehir
-        if (deliveryAddress.city) {
-            addressParts.push(deliveryAddress.city);
-        }
-
-        fullAddress = addressParts.join(', ');
-
-        // Bina detayları ekle
-        const buildingDetails = [];
-        if (deliveryAddress.building) buildingDetails.push(`Bina: ${deliveryAddress.building}`);
-        if (deliveryAddress.entrance) buildingDetails.push(`Giriş: ${deliveryAddress.entrance}`);
-        if (deliveryAddress.floor) buildingDetails.push(`Kat: ${deliveryAddress.floor}`);
-        if (deliveryAddress.flatNumber) buildingDetails.push(`Daire: ${deliveryAddress.flatNumber}`);
-        if (deliveryAddress.intercom) buildingDetails.push(`Zil: ${deliveryAddress.intercom}`);
-
-        if (buildingDetails.length > 0) {
-            fullAddress += ' - ' + buildingDetails.join(', ');
-        }
-
-        // Teslimat talimatları varsa ekle
-        if (deliveryInstructions) {
-            fullAddress += ` (${deliveryInstructions})`;
-        }
+        addressParts.push(streetPart);
     }
+
+    // Mahalle/Semt (üst seviyeden)
+    if (deliveryMainArea) {
+        addressParts.push(deliveryMainArea);
+    }
+
+    // İlçe
+    if (district) {
+        addressParts.push(district);
+    }
+
+    // Şehir
+    if (city) {
+        addressParts.push(city);
+    }
+
+    fullAddress = addressParts.join(', ');
+
+    // Bina detayları ekle
+    const buildingDetails = [];
+    if (building) buildingDetails.push(`Bina: ${building}`);
+    if (entrance) buildingDetails.push(`Giriş: ${entrance}`);
+    if (floor) buildingDetails.push(`Kat: ${floor}`);
+    if (flatNumber) buildingDetails.push(`Daire: ${flatNumber}`);
+    if (intercom) buildingDetails.push(`Zil: ${intercom}`);
+
+    if (buildingDetails.length > 0) {
+        fullAddress += ' - ' + buildingDetails.join(', ');
+    }
+
+    // Teslimat talimatları varsa ekle
+    if (deliveryInstructions) {
+        fullAddress += ` (${deliveryInstructions})`;
+    }
+
+    console.log('[YemekSepeti] Parsed Address Fields:', { street, streetNumber, city, district, building, floor });
 
     console.log('[YemekSepeti] Delivery Address Object:', JSON.stringify(deliveryAddress, null, 2));
     console.log('[YemekSepeti] Coordinates:', latitude, longitude);
