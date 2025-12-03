@@ -235,7 +235,7 @@ app.put('/remoteId/:remoteId/remoteOrder/:remoteOrderId/posOrderStatus', (req, r
     // İptal durumunu kontrol et
     const status = (statusUpdate.status || '').toLowerCase();
     if (status === 'cancelled' || status === 'rejected' || status === 'cancel') {
-        // İptal bildirimini kaydet - BafettoPOS polling ile alacak
+        // İptal bildirimini kaydet - YemiGO polling ile alacak
         const cancellationId = `cancel_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
         // remoteOrderId'den orderToken'ı çıkar (format: remoteId_orderToken_timestamp)
@@ -325,14 +325,25 @@ app.get('/api/yemeksepeti/pending-orders', (req, res) => {
         return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    const newOrders = Array.from(orders.values())
-        .filter(item => item.status === 'NEW')
-        .map(item => ({
+    // Sadece bugünkü ve status='NEW' olan siparişleri döndür
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const newOrders = Array.from(orders.entries())
+        .filter(([key, item]) => {
+            // Sadece NEW status
+            if (item.status !== 'NEW') return false;
+            // Sadece bugünkü siparişler
+            const orderDate = new Date(item.createdAt);
+            return orderDate >= today;
+        })
+        .map(([key, item]) => ({
             ...item.order,
+            _railwayKey: key,  // Silme için doğru key'i gönder
             CreatedAt: item.createdAt.toISOString()
         }));
 
-    console.log(`[YemekSepeti] Polling: ${newOrders.length} NEW orders`);
+    console.log(`[YemekSepeti] Polling: ${newOrders.length} NEW orders (today only)`);
     res.json({ success: true, count: newOrders.length, orders: newOrders });
 });
 
@@ -342,16 +353,30 @@ app.delete('/api/yemeksepeti/orders/:orderId', (req, res) => {
         return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    if (orders.has(req.params.orderId)) {
-        orders.delete(req.params.orderId);
-        res.json({ success: true });
-    } else {
-        res.status(404).json({ success: false });
+    const orderId = req.params.orderId;
+
+    // Önce direkt key ile dene
+    if (orders.has(orderId)) {
+        orders.delete(orderId);
+        console.log(`[YemekSepeti] ✅ Order deleted by key: ${orderId}`);
+        return res.json({ success: true, deletedBy: 'key' });
     }
+
+    // Key bulunamadıysa OrderId ile ara
+    for (const [key, item] of orders.entries()) {
+        if (item.order.OrderId === orderId || item.order.OrderToken === orderId) {
+            orders.delete(key);
+            console.log(`[YemekSepeti] ✅ Order deleted by OrderId/Token: ${orderId} (key: ${key})`);
+            return res.json({ success: true, deletedBy: 'orderId' });
+        }
+    }
+
+    console.log(`[YemekSepeti] ⚠️ Order not found for deletion: ${orderId}`);
+    res.status(404).json({ success: false, message: 'Order not found' });
 });
 
 // ==================== YEMEKSEPETI İPTAL POLLING ====================
-// BafettoPOS iptal bildirimlerini bu endpoint'ten polling ile alır
+// YemiGO iptal bildirimlerini bu endpoint'ten polling ile alır
 app.get('/api/yemeksepeti/cancellations', (req, res) => {
     const apiKey = req.headers['x-api-key'];
     if (apiKey !== 'bafetto-yemeksepeti-2025-secure-key') {
@@ -375,7 +400,7 @@ app.get('/api/yemeksepeti/cancellations', (req, res) => {
     res.json({ success: true, count: pendingCancellations.length, cancellations: pendingCancellations });
 });
 
-// İptal bildirimini sil (BafettoPOS işledikten sonra)
+// İptal bildirimini sil (YemiGO işledikten sonra)
 app.delete('/api/yemeksepeti/cancellations/:cancellationId', (req, res) => {
     const apiKey = req.headers['x-api-key'];
     if (apiKey !== 'bafetto-yemeksepeti-2025-secure-key') {
@@ -487,39 +512,37 @@ app.delete('/api/getiryemek/webhooks/:webhookId', (req, res) => {
 // ==================== TEST CALLBACKS ====================
 
 app.post('/test-callbacks/order-accepted/:orderId', (req, res) => {
-    if (orders.has(req.params.orderId)) {
-        const orderData = orders.get(req.params.orderId);
-        orderData.status = 'ACCEPTED';
-        orderData.acceptedAt = new Date();
+    const orderId = req.params.orderId;
+    if (orders.has(orderId)) {
+        // Sipariş onaylandı - Railway'den SİL (tekrar polling'e düşmesin)
+        orders.delete(orderId);
+        console.log(`[YemekSepeti] ✅ Order ACCEPTED and REMOVED from queue: ${orderId}`);
     }
-    res.status(200).json({ success: true, orderId: req.params.orderId });
+    res.status(200).json({ success: true, orderId: orderId, action: 'accepted_and_removed' });
 });
 
 app.post('/test-callbacks/order-rejected/:orderId', (req, res) => {
-    if (orders.has(req.params.orderId)) {
-        const orderData = orders.get(req.params.orderId);
-        orderData.status = 'REJECTED';
-        orderData.rejectedAt = new Date();
+    const orderId = req.params.orderId;
+    if (orders.has(orderId)) {
+        // Sipariş reddedildi - Railway'den SİL
+        orders.delete(orderId);
+        console.log(`[YemekSepeti] ❌ Order REJECTED and REMOVED from queue: ${orderId}`);
     }
-    res.status(200).json({ success: true, orderId: req.params.orderId });
+    res.status(200).json({ success: true, orderId: orderId, action: 'rejected_and_removed' });
 });
 
 app.post('/test-callbacks/order-prepared/:orderId', (req, res) => {
-    if (orders.has(req.params.orderId)) {
-        const orderData = orders.get(req.params.orderId);
-        orderData.status = 'PREPARED';
-        orderData.preparedAt = new Date();
-    }
-    res.status(200).json({ success: true, orderId: req.params.orderId });
+    const orderId = req.params.orderId;
+    // Hazırlandı bildirimi - sipariş zaten queue'dan silinmiş olmalı
+    console.log(`[YemekSepeti] 📦 Order PREPARED: ${orderId}`);
+    res.status(200).json({ success: true, orderId: orderId });
 });
 
 app.post('/test-callbacks/order-pickedup/:orderId', (req, res) => {
-    if (orders.has(req.params.orderId)) {
-        const orderData = orders.get(req.params.orderId);
-        orderData.status = 'PICKED_UP';
-        orderData.pickedUpAt = new Date();
-    }
-    res.status(200).json({ success: true, orderId: req.params.orderId });
+    const orderId = req.params.orderId;
+    // Teslim alındı bildirimi - sipariş zaten queue'dan silinmiş olmalı
+    console.log(`[YemekSepeti] 🚗 Order PICKED UP: ${orderId}`);
+    res.status(200).json({ success: true, orderId: orderId });
 });
 
 // ==================== HEALTH & INFO ====================
@@ -562,7 +585,58 @@ app.get('/', (req, res) => {
     });
 });
 
+// ==================== CLEANUP FUNCTION ====================
+// Eski siparişleri otomatik temizle (memory leak önleme)
+function cleanupOldOrders() {
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    yesterday.setHours(0, 0, 0, 0);
+
+    let deletedOrders = 0;
+    let deletedCancellations = 0;
+
+    // Eski siparişleri sil
+    for (const [key, item] of orders.entries()) {
+        const orderDate = new Date(item.createdAt);
+        if (orderDate < yesterday) {
+            orders.delete(key);
+            deletedOrders++;
+        }
+    }
+
+    // Eski iptalleri sil
+    for (const [key, item] of cancellations.entries()) {
+        const cancelDate = new Date(item.createdAt);
+        if (cancelDate < yesterday) {
+            cancellations.delete(key);
+            deletedCancellations++;
+        }
+    }
+
+    // Eski GetirYemek webhook'larını sil
+    const webhooksToDelete = [];
+    for (let i = getirYemekWebhooks.length - 1; i >= 0; i--) {
+        const webhookDate = new Date(getirYemekWebhooks[i].timestamp);
+        if (webhookDate < yesterday) {
+            webhooksToDelete.push(i);
+        }
+    }
+    webhooksToDelete.forEach(i => getirYemekWebhooks.splice(i, 1));
+
+    if (deletedOrders > 0 || deletedCancellations > 0 || webhooksToDelete.length > 0) {
+        console.log(`[Cleanup] Deleted: ${deletedOrders} orders, ${deletedCancellations} cancellations, ${webhooksToDelete.length} webhooks`);
+    }
+}
+
+// Her saat başı temizlik yap
+setInterval(cleanupOldOrders, 60 * 60 * 1000);
+
+// Uygulama başlarken de temizle
+setTimeout(cleanupOldOrders, 5000);
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
+    console.log(`[YemekSepeti] Order validation interval: ${YEMEKSEPETI_CONFIG.checkIntervalMinutes} minutes`);
+    console.log(`[Cleanup] Auto-cleanup enabled (hourly)`);
 });
