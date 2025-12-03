@@ -136,49 +136,70 @@ app.post('/order/:remoteId', (req, res) => {
         : `http://${req.get('host')}`;
 
     const now = new Date();
-    // Delivery Hero API'den adres delivery objesi altında gelir
-    // Hem delivery.address hem customer.address kontrol et (backward compat)
+    // Delivery Hero API'den adres delivery.address altında gelir
+    // Koordinatlar ise üst seviyede (order.latitude, order.longitude)
     const deliveryAddress = order.delivery?.address || order.customer?.address || null;
 
-    // Full address oluştur - farklı field isimleri denenir
+    // Koordinatlar üst seviyede olabilir
+    const latitude = order.latitude || deliveryAddress?.latitude || 0;
+    const longitude = order.longitude || deliveryAddress?.longitude || 0;
+
+    // Mahalle/semt bilgisi üst seviyede
+    const deliveryMainArea = order.deliveryMainArea || '';
+    const deliveryInstructions = order.deliveryInstructions || deliveryAddress?.deliveryInstructions || '';
+
+    // Full address oluştur - YemekSepeti Türkiye formatı
     let fullAddress = '';
     if (deliveryAddress) {
-        fullAddress = deliveryAddress.fullAddress
-            || deliveryAddress.address
-            || deliveryAddress.streetName
-            || '';
+        const addressParts = [];
 
-        // Eğer fullAddress boşsa, parçalardan oluştur
-        if (!fullAddress) {
-            const parts = [];
-            if (deliveryAddress.streetName) parts.push(deliveryAddress.streetName);
-            if (deliveryAddress.streetNumber) parts.push(deliveryAddress.streetNumber);
-            if (deliveryAddress.district) parts.push(deliveryAddress.district);
-            if (deliveryAddress.city) parts.push(deliveryAddress.city);
-            fullAddress = parts.join(', ');
-        }
-
-        // Kat ve daire bilgisini ekle
-        const extraParts = [];
-        if (deliveryAddress.floor) extraParts.push(`Kat: ${deliveryAddress.floor}`);
-        if (deliveryAddress.doorNo || deliveryAddress.apartment) extraParts.push(`Daire: ${deliveryAddress.doorNo || deliveryAddress.apartment}`);
-        if (deliveryAddress.buildingNo || deliveryAddress.building) extraParts.push(`Bina: ${deliveryAddress.buildingNo || deliveryAddress.building}`);
-        if (extraParts.length > 0 && fullAddress) {
-            fullAddress += ' - ' + extraParts.join(', ');
-        }
-
-        // Adres tarifi/yönlendirme varsa ekle
-        if (deliveryAddress.directions || deliveryAddress.description || deliveryAddress.addressDescription) {
-            const directions = deliveryAddress.directions || deliveryAddress.description || deliveryAddress.addressDescription;
-            if (fullAddress) {
-                fullAddress += ` (${directions})`;
-            } else {
-                fullAddress = directions;
+        // Sokak ve numara
+        if (deliveryAddress.street) {
+            let streetPart = deliveryAddress.street;
+            if (deliveryAddress.number) {
+                streetPart += ' ' + deliveryAddress.number;
             }
+            addressParts.push(streetPart);
+        }
+
+        // Mahalle/Semt (üst seviyeden)
+        if (deliveryMainArea) {
+            addressParts.push(deliveryMainArea);
+        }
+
+        // İlçe
+        if (deliveryAddress.district) {
+            addressParts.push(deliveryAddress.district);
+        }
+
+        // Şehir
+        if (deliveryAddress.city) {
+            addressParts.push(deliveryAddress.city);
+        }
+
+        fullAddress = addressParts.join(', ');
+
+        // Bina detayları ekle
+        const buildingDetails = [];
+        if (deliveryAddress.building) buildingDetails.push(`Bina: ${deliveryAddress.building}`);
+        if (deliveryAddress.entrance) buildingDetails.push(`Giriş: ${deliveryAddress.entrance}`);
+        if (deliveryAddress.floor) buildingDetails.push(`Kat: ${deliveryAddress.floor}`);
+        if (deliveryAddress.flatNumber) buildingDetails.push(`Daire: ${deliveryAddress.flatNumber}`);
+        if (deliveryAddress.intercom) buildingDetails.push(`Zil: ${deliveryAddress.intercom}`);
+
+        if (buildingDetails.length > 0) {
+            fullAddress += ' - ' + buildingDetails.join(', ');
+        }
+
+        // Teslimat talimatları varsa ekle
+        if (deliveryInstructions) {
+            fullAddress += ` (${deliveryInstructions})`;
         }
     }
 
     console.log('[YemekSepeti] Delivery Address Object:', JSON.stringify(deliveryAddress, null, 2));
+    console.log('[YemekSepeti] Coordinates:', latitude, longitude);
+    console.log('[YemekSepeti] Delivery Main Area:', deliveryMainArea);
     console.log('[YemekSepeti] Constructed Full Address:', fullAddress);
 
     const transformedOrder = {
@@ -199,16 +220,19 @@ app.post('/order/:remoteId', (req, res) => {
             Address: {
                 FullAddress: fullAddress,
                 City: deliveryAddress?.city || '',
-                District: deliveryAddress?.district || '',
-                Neighborhood: deliveryAddress?.neighborhood || '',
-                Street: deliveryAddress?.streetName || deliveryAddress?.street || '',
-                BuildingNo: deliveryAddress?.buildingNo || deliveryAddress?.building || '',
-                ApartmentNo: deliveryAddress?.apartmentNo || deliveryAddress?.apartment || '',
+                District: deliveryAddress?.district || deliveryMainArea || '',
+                Neighborhood: deliveryMainArea || '',
+                Street: deliveryAddress?.street || '',
+                StreetNumber: deliveryAddress?.number || '',
+                BuildingNo: deliveryAddress?.building || '',
+                Entrance: deliveryAddress?.entrance || '',
                 Floor: deliveryAddress?.floor || '',
-                DoorNo: deliveryAddress?.doorNo || deliveryAddress?.door || '',
-                Directions: deliveryAddress?.directions || deliveryAddress?.description || deliveryAddress?.addressDescription || '',
-                Latitude: deliveryAddress?.latitude || deliveryAddress?.lat || 0,
-                Longitude: deliveryAddress?.longitude || deliveryAddress?.lng || deliveryAddress?.lon || 0
+                DoorNo: deliveryAddress?.flatNumber || '',
+                Intercom: deliveryAddress?.intercom || '',
+                Postcode: deliveryAddress?.deliveryAreaPostcode || deliveryAddress?.postcode || '',
+                Directions: deliveryInstructions,
+                Latitude: latitude,
+                Longitude: longitude
             }
         } : null,
         Items: (order.products || []).map(p => ({
