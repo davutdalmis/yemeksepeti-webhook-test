@@ -136,6 +136,51 @@ app.post('/order/:remoteId', (req, res) => {
         : `http://${req.get('host')}`;
 
     const now = new Date();
+    // Delivery Hero API'den adres delivery objesi altında gelir
+    // Hem delivery.address hem customer.address kontrol et (backward compat)
+    const deliveryAddress = order.delivery?.address || order.customer?.address || null;
+
+    // Full address oluştur - farklı field isimleri denenir
+    let fullAddress = '';
+    if (deliveryAddress) {
+        fullAddress = deliveryAddress.fullAddress
+            || deliveryAddress.address
+            || deliveryAddress.streetName
+            || '';
+
+        // Eğer fullAddress boşsa, parçalardan oluştur
+        if (!fullAddress) {
+            const parts = [];
+            if (deliveryAddress.streetName) parts.push(deliveryAddress.streetName);
+            if (deliveryAddress.streetNumber) parts.push(deliveryAddress.streetNumber);
+            if (deliveryAddress.district) parts.push(deliveryAddress.district);
+            if (deliveryAddress.city) parts.push(deliveryAddress.city);
+            fullAddress = parts.join(', ');
+        }
+
+        // Kat ve daire bilgisini ekle
+        const extraParts = [];
+        if (deliveryAddress.floor) extraParts.push(`Kat: ${deliveryAddress.floor}`);
+        if (deliveryAddress.doorNo || deliveryAddress.apartment) extraParts.push(`Daire: ${deliveryAddress.doorNo || deliveryAddress.apartment}`);
+        if (deliveryAddress.buildingNo || deliveryAddress.building) extraParts.push(`Bina: ${deliveryAddress.buildingNo || deliveryAddress.building}`);
+        if (extraParts.length > 0 && fullAddress) {
+            fullAddress += ' - ' + extraParts.join(', ');
+        }
+
+        // Adres tarifi/yönlendirme varsa ekle
+        if (deliveryAddress.directions || deliveryAddress.description || deliveryAddress.addressDescription) {
+            const directions = deliveryAddress.directions || deliveryAddress.description || deliveryAddress.addressDescription;
+            if (fullAddress) {
+                fullAddress += ` (${directions})`;
+            } else {
+                fullAddress = directions;
+            }
+        }
+    }
+
+    console.log('[YemekSepeti] Delivery Address Object:', JSON.stringify(deliveryAddress, null, 2));
+    console.log('[YemekSepeti] Constructed Full Address:', fullAddress);
+
     const transformedOrder = {
         OrderId: order.code || order.token || '',
         RemoteOrderId: `${remoteId}_${order.token}_${Date.now()}`,
@@ -147,22 +192,24 @@ app.post('/order/:remoteId', (req, res) => {
         ScheduledDeliveryTime: order.scheduledDeliveryTime || null,
         IsScheduled: order.isScheduled || false,
         Customer: order.customer ? {
-            FirstName: order.customer.firstName || '',
-            LastName: order.customer.lastName || '',
-            Phone: order.customer.mobilePhone || order.customer.phone || '',
+            FirstName: order.customer.firstName || order.customer.name?.split(' ')[0] || '',
+            LastName: order.customer.lastName || order.customer.name?.split(' ').slice(1).join(' ') || '',
+            Phone: order.customer.mobilePhone || order.customer.phone || order.customer.phoneNumber || '',
             Email: order.customer.email || '',
-            Address: order.customer.address ? {
-                FullAddress: order.customer.address.fullAddress || '',
-                City: order.customer.address.city || '',
-                District: order.customer.address.district || '',
-                Street: order.customer.address.street || '',
-                BuildingNo: order.customer.address.buildingNo || '',
-                ApartmentNo: order.customer.address.apartmentNo || '',
-                Floor: order.customer.address.floor || '',
-                DoorNo: order.customer.address.doorNo || '',
-                Latitude: order.customer.address.latitude || 0,
-                Longitude: order.customer.address.longitude || 0
-            } : null
+            Address: {
+                FullAddress: fullAddress,
+                City: deliveryAddress?.city || '',
+                District: deliveryAddress?.district || '',
+                Neighborhood: deliveryAddress?.neighborhood || '',
+                Street: deliveryAddress?.streetName || deliveryAddress?.street || '',
+                BuildingNo: deliveryAddress?.buildingNo || deliveryAddress?.building || '',
+                ApartmentNo: deliveryAddress?.apartmentNo || deliveryAddress?.apartment || '',
+                Floor: deliveryAddress?.floor || '',
+                DoorNo: deliveryAddress?.doorNo || deliveryAddress?.door || '',
+                Directions: deliveryAddress?.directions || deliveryAddress?.description || deliveryAddress?.addressDescription || '',
+                Latitude: deliveryAddress?.latitude || deliveryAddress?.lat || 0,
+                Longitude: deliveryAddress?.longitude || deliveryAddress?.lng || deliveryAddress?.lon || 0
+            }
         } : null,
         Items: (order.products || []).map(p => ({
             Name: p.name || '',
@@ -202,6 +249,7 @@ app.post('/order/:remoteId', (req, res) => {
     console.log('[YemekSepeti] ========== TRANSFORMED ORDER ==========');
     console.log('[YemekSepeti] Customer:', transformedOrder.Customer?.FirstName, transformedOrder.Customer?.LastName);
     console.log('[YemekSepeti] Phone:', transformedOrder.Customer?.Phone);
+    console.log('[YemekSepeti] Address:', transformedOrder.Customer?.Address?.FullAddress || 'NO ADDRESS');
     console.log('[YemekSepeti] Items:', transformedOrder.Items.length);
     transformedOrder.Items.forEach((item, idx) => {
         console.log(`[YemekSepeti]   ${idx + 1}. ${item.Name} x${item.Quantity} = ${item.TotalPrice} TL`);
