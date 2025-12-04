@@ -2,13 +2,158 @@
 try { require('dotenv').config(); } catch (e) { }
 const express = require('express');
 const axios = require('axios');
+const http = require('http');
+const { Server } = require('socket.io');
+
 const app = express();
+const server = http.createServer(app);
+
+// Socket.io setup with CORS
+const io = new Server(server, {
+    cors: {
+        origin: "*",
+        methods: ["GET", "POST"]
+    },
+    pingTimeout: 60000,
+    pingInterval: 25000
+});
 
 app.use(express.json());
 
 const orders = new Map();
 const cancellations = new Map(); // YemekSepeti iptal bildirimleri
 const getirYemekWebhooks = [];
+
+// ==================== SOCKET.IO COURIER TRACKING ====================
+
+// Bağlı kuryeler: { courierId: socketId }
+const connectedCouriers = new Map();
+// Son kurye konumları (cache): { courierId: { lat, lng, timestamp } }
+const courierLocations = new Map();
+
+io.on('connection', (socket) => {
+    console.log(`[Socket.io] Yeni bağlantı: ${socket.id}`);
+
+    // Kurye bağlantısı
+    socket.on('courier:connect', (data) => {
+        const { courierId, branchId, name } = data;
+        console.log(`[Socket.io] Kurye bağlandı: ${name} (${courierId}) - Şube: ${branchId}`);
+
+        // Kurye bilgilerini socket'e kaydet
+        socket.courierId = courierId;
+        socket.branchId = branchId;
+        socket.courierName = name;
+        socket.userType = 'courier';
+
+        // Şube odasına katıl
+        socket.join(`branch:${branchId}`);
+        connectedCouriers.set(courierId, socket.id);
+
+        // POS'lara kurye online bilgisi gönder
+        io.to(`branch:${branchId}`).emit('courier:online', {
+            courierId,
+            name,
+            timestamp: new Date().toISOString()
+        });
+    });
+
+    // POS bağlantısı
+    socket.on('pos:connect', (data) => {
+        const { branchId, posName } = data;
+        console.log(`[Socket.io] POS bağlandı: ${posName} - Şube: ${branchId}`);
+
+        socket.branchId = branchId;
+        socket.posName = posName;
+        socket.userType = 'pos';
+
+        // Şube odasına katıl
+        socket.join(`branch:${branchId}`);
+
+        // Mevcut bağlı kuryeler ve konumlarını gönder
+        const branchCouriers = [];
+        for (const [courierId, socketId] of connectedCouriers.entries()) {
+            const courierSocket = io.sockets.sockets.get(socketId);
+            if (courierSocket && courierSocket.branchId === branchId) {
+                branchCouriers.push({
+                    courierId,
+                    name: courierSocket.courierName,
+                    location: courierLocations.get(courierId) || null
+                });
+            }
+        }
+
+        socket.emit('couriers:list', branchCouriers);
+    });
+
+    // Kurye konum güncellemesi
+    socket.on('courier:location', (data) => {
+        const { courierId, latitude, longitude, speed, heading } = data;
+
+        if (!courierId || !socket.branchId) return;
+
+        const locationData = {
+            courierId,
+            latitude,
+            longitude,
+            speed: speed || 0,
+            heading: heading || 0,
+            timestamp: new Date().toISOString()
+        };
+
+        // Cache'e kaydet
+        courierLocations.set(courierId, locationData);
+
+        // Aynı şubedeki tüm POS'lara yayınla
+        io.to(`branch:${socket.branchId}`).emit('courier:location', locationData);
+
+        console.log(`[Socket.io] Konum: ${socket.courierName} → ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`);
+    });
+
+    // Bağlantı kopması
+    socket.on('disconnect', () => {
+        if (socket.userType === 'courier' && socket.courierId) {
+            console.log(`[Socket.io] Kurye ayrıldı: ${socket.courierName} (${socket.courierId})`);
+
+            connectedCouriers.delete(socket.courierId);
+
+            // POS'lara kurye offline bilgisi gönder
+            if (socket.branchId) {
+                io.to(`branch:${socket.branchId}`).emit('courier:offline', {
+                    courierId: socket.courierId,
+                    name: socket.courierName,
+                    timestamp: new Date().toISOString()
+                });
+            }
+        } else if (socket.userType === 'pos') {
+            console.log(`[Socket.io] POS ayrıldı: ${socket.posName}`);
+        } else {
+            console.log(`[Socket.io] Bağlantı koptu: ${socket.id}`);
+        }
+    });
+});
+
+// Socket.io durum endpoint'i
+app.get('/socket/status', (req, res) => {
+    const couriers = [];
+    for (const [courierId, socketId] of connectedCouriers.entries()) {
+        const courierSocket = io.sockets.sockets.get(socketId);
+        if (courierSocket) {
+            couriers.push({
+                courierId,
+                name: courierSocket.courierName,
+                branchId: courierSocket.branchId,
+                location: courierLocations.get(courierId) || null
+            });
+        }
+    }
+
+    res.json({
+        status: 'ok',
+        connectedCouriers: couriers.length,
+        couriers,
+        totalConnections: io.sockets.sockets.size
+    });
+});
 
 // YemekSepeti API Configuration
 const YEMEKSEPETI_CONFIG = {
@@ -718,8 +863,9 @@ setInterval(cleanupOldOrders, 60 * 60 * 1000);
 setTimeout(cleanupOldOrders, 5000);
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+server.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
+    console.log(`[Socket.io] WebSocket ready for courier tracking`);
     console.log(`[YemekSepeti] Order validation interval: ${YEMEKSEPETI_CONFIG.checkIntervalMinutes} minutes`);
     console.log(`[Cleanup] Auto-cleanup enabled (hourly)`);
 });
