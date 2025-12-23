@@ -710,7 +710,7 @@ app.get('/poll/webhooks', (req, res) => {
     const apiKey = req.headers['x-api-key'];
     const restaurantSecretKey = req.query.restaurantSecretKey;
 
-    if (apiKey !== 'bafetto-pos-getiryemek-2024-stable-key-d0025f3ffa8172ac') {
+    if (apiKey !== 'yemigo-getiryemek-prod-01db97e8dfc0621a8eb670d90eeae79f') {
         return res.status(401).json({ error: 'Unauthorized' });
     }
 
@@ -724,7 +724,7 @@ app.get('/poll/webhooks', (req, res) => {
 
 app.delete('/api/getiryemek/webhooks/:webhookId', (req, res) => {
     const apiKey = req.headers['x-api-key'];
-    if (apiKey !== 'bafetto-pos-getiryemek-2024-stable-key-d0025f3ffa8172ac') {
+    if (apiKey !== 'yemigo-getiryemek-prod-01db97e8dfc0621a8eb670d90eeae79f') {
         return res.status(401).json({ error: 'Unauthorized' });
     }
 
