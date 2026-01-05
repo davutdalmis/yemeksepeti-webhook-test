@@ -39,19 +39,19 @@ const API_KEYS = {
 };
 
 // ==================== STARTUP VALIDATION ====================
-// SECURITY: Verify all required API keys are configured before starting
+// SECURITY: Verify required API keys are configured before starting
 function validateConfiguration() {
     const missingKeys = [];
 
+    // Polling key'leri ZORUNLU - WPF bunlarla authenticate oluyor
     if (!API_KEYS.YEMEKSEPETI_POLLING_KEY) {
         missingKeys.push('YEMEKSEPETI_POLLING_API_KEY');
     }
     if (!API_KEYS.GETIRYEMEK_POLLING_KEY) {
         missingKeys.push('GETIRYEMEK_POLLING_API_KEY');
     }
-    if (!API_KEYS.GETIRYEMEK_DEFAULT_RESTAURANT_SECRET) {
-        missingKeys.push('GETIRYEMEK_DEFAULT_RESTAURANT_SECRET');
-    }
+    // NOT: GETIRYEMEK_DEFAULT_RESTAURANT_SECRET opsiyonel
+    // Her şubenin kendi restaurantSecretKey'i var (Firebase'de)
 
     if (missingKeys.length > 0) {
         console.error('==================== SECURITY ERROR ====================');
@@ -65,10 +65,10 @@ function validateConfiguration() {
     }
 
     // Log successful configuration (masked for security)
-    console.log('[Security] API Keys Configuration: All keys loaded from environment');
+    console.log('[Security] API Keys Configuration:');
     console.log(`  - YEMEKSEPETI_POLLING_KEY: ✅ (${API_KEYS.YEMEKSEPETI_POLLING_KEY.substring(0, 8)}...)`);
     console.log(`  - GETIRYEMEK_POLLING_KEY: ✅ (${API_KEYS.GETIRYEMEK_POLLING_KEY.substring(0, 8)}...)`);
-    console.log(`  - GETIRYEMEK_DEFAULT_RESTAURANT_SECRET: ✅ (${API_KEYS.GETIRYEMEK_DEFAULT_RESTAURANT_SECRET.substring(0, 8)}...)`);
+    console.log(`  - GETIRYEMEK_DEFAULT_RESTAURANT_SECRET: ${API_KEYS.GETIRYEMEK_DEFAULT_RESTAURANT_SECRET ? '✅ (fallback set)' : '⚠️ Not set (will use header only)'}`);
 }
 
 // Run validation immediately
