@@ -1,4 +1,39 @@
 node_modules/
 .env
+.env.local
+.env.production
+.env.*.local
 *.log
 .DS_Store
+
+# ==================== SECURITY - NEVER COMMIT ====================
+# API Keys and Secrets
+*.key
+*.pem
+*.p12
+*.pfx
+secrets.json
+credentials.json
+
+# Environment files with secrets
+.env*
+!.env.example
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+Thumbs.db
+desktop.ini
+
+# Temporary files
+*.tmp
+*.temp
+
+# Backup files
+*.bak
+*.backup
+*~

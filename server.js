@@ -25,23 +25,54 @@ const cancellations = new Map(); // YemekSepeti iptal bildirimleri
 const getirYemekWebhooks = [];
 
 // ==================== API KEY CONFIGURATION ====================
-// SECURITY: All API keys should be set via environment variables in production
+// SECURITY: All API keys MUST be set via environment variables
+// NO HARDCODED FALLBACKS - Server will refuse to start without proper configuration
 const API_KEYS = {
     // YemekSepeti polling API key - WPF uses this to authenticate
-    YEMEKSEPETI_POLLING_KEY: process.env.YEMEKSEPETI_POLLING_API_KEY || 'bafetto-yemeksepeti-2025-secure-key',
+    YEMEKSEPETI_POLLING_KEY: process.env.YEMEKSEPETI_POLLING_API_KEY || null,
 
     // GetirYemek polling API key - WPF uses this to poll webhooks
-    GETIRYEMEK_POLLING_KEY: process.env.GETIRYEMEK_POLLING_API_KEY || 'yemigo-getiryemek-prod-01db97e8dfc0621a8eb670d90eeae79f',
+    GETIRYEMEK_POLLING_KEY: process.env.GETIRYEMEK_POLLING_API_KEY || null,
 
     // GetirYemek default restaurant secret (fallback for webhooks without header)
-    GETIRYEMEK_DEFAULT_RESTAURANT_SECRET: process.env.GETIRYEMEK_DEFAULT_RESTAURANT_SECRET || 'bc19c0303e194594d027b365a95015b53edaf5a2'
+    GETIRYEMEK_DEFAULT_RESTAURANT_SECRET: process.env.GETIRYEMEK_DEFAULT_RESTAURANT_SECRET || null
 };
 
-// Log which keys are from environment (masked for security)
-console.log('[Security] API Keys Configuration:');
-console.log(`  - YEMEKSEPETI_POLLING_KEY: ${process.env.YEMEKSEPETI_POLLING_API_KEY ? '✅ ENV' : '⚠️ DEFAULT'}`);
-console.log(`  - GETIRYEMEK_POLLING_KEY: ${process.env.GETIRYEMEK_POLLING_API_KEY ? '✅ ENV' : '⚠️ DEFAULT'}`);
-console.log(`  - GETIRYEMEK_DEFAULT_RESTAURANT_SECRET: ${process.env.GETIRYEMEK_DEFAULT_RESTAURANT_SECRET ? '✅ ENV' : '⚠️ DEFAULT'}`);
+// ==================== STARTUP VALIDATION ====================
+// SECURITY: Verify all required API keys are configured before starting
+function validateConfiguration() {
+    const missingKeys = [];
+
+    if (!API_KEYS.YEMEKSEPETI_POLLING_KEY) {
+        missingKeys.push('YEMEKSEPETI_POLLING_API_KEY');
+    }
+    if (!API_KEYS.GETIRYEMEK_POLLING_KEY) {
+        missingKeys.push('GETIRYEMEK_POLLING_API_KEY');
+    }
+    if (!API_KEYS.GETIRYEMEK_DEFAULT_RESTAURANT_SECRET) {
+        missingKeys.push('GETIRYEMEK_DEFAULT_RESTAURANT_SECRET');
+    }
+
+    if (missingKeys.length > 0) {
+        console.error('==================== SECURITY ERROR ====================');
+        console.error('CRITICAL: Missing required environment variables:');
+        missingKeys.forEach(key => console.error(`  - ${key}`));
+        console.error('');
+        console.error('Server cannot start without proper API key configuration.');
+        console.error('Please set these environment variables in Railway or .env file.');
+        console.error('=========================================================');
+        process.exit(1);
+    }
+
+    // Log successful configuration (masked for security)
+    console.log('[Security] API Keys Configuration: All keys loaded from environment');
+    console.log(`  - YEMEKSEPETI_POLLING_KEY: ✅ (${API_KEYS.YEMEKSEPETI_POLLING_KEY.substring(0, 8)}...)`);
+    console.log(`  - GETIRYEMEK_POLLING_KEY: ✅ (${API_KEYS.GETIRYEMEK_POLLING_KEY.substring(0, 8)}...)`);
+    console.log(`  - GETIRYEMEK_DEFAULT_RESTAURANT_SECRET: ✅ (${API_KEYS.GETIRYEMEK_DEFAULT_RESTAURANT_SECRET.substring(0, 8)}...)`);
+}
+
+// Run validation immediately
+validateConfiguration();
 
 // ==================== SOCKET.IO COURIER TRACKING ====================
 
