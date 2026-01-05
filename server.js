@@ -706,6 +706,30 @@ app.post('/webhook/courierArrival', (req, res) => {
     res.status(200).send('OK');
 });
 
+app.post('/webhook/restaurantStatus', (req, res) => {
+    const notification = req.body;
+    // GetirYemek header göndermiyorsa default key kullan
+    const restaurantSecretKey = req.headers['x-restaurant-secret-key'] || 'bc19c0303e194594d027b365a95015b53edaf5a2';
+
+    console.log('[GetirYemek] ========== RESTAURANT STATUS WEBHOOK ==========');
+    console.log('[GetirYemek] Restaurant ID:', notification.restaurantId || notification.id);
+    console.log('[GetirYemek] Status:', notification.status);
+    console.log('[GetirYemek] Reason:', notification.reason || 'N/A');
+    console.log('[GetirYemek] Full Payload:', JSON.stringify(notification, null, 2));
+    console.log('[GetirYemek] ================================================');
+
+    const webhookId = Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+    getirYemekWebhooks.push({
+        id: webhookId,
+        type: 'restaurantStatus',
+        data: notification,
+        restaurantSecretKey: restaurantSecretKey,
+        timestamp: new Date()
+    });
+
+    res.status(200).send('OK');
+});
+
 app.get('/poll/webhooks', (req, res) => {
     const apiKey = req.headers['x-api-key'];
     const restaurantSecretKey = req.query.restaurantSecretKey;
@@ -805,7 +829,7 @@ app.get('/', (req, res) => {
                 deleteCancellation: 'DELETE /api/yemeksepeti/cancellations/:cancellationId'
             },
             getiryemek: {
-                webhooks: ['POST /webhook/newOrder', 'POST /webhook/cancelOrder', 'POST /webhook/courierArrival'],
+                webhooks: ['POST /webhook/newOrder', 'POST /webhook/cancelOrder', 'POST /webhook/courierArrival', 'POST /webhook/restaurantStatus'],
                 polling: 'GET /poll/webhooks?restaurantSecretKey=xxx',
                 delete: 'DELETE /api/getiryemek/webhooks/:webhookId'
             }
