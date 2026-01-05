@@ -24,6 +24,25 @@ const orders = new Map();
 const cancellations = new Map(); // YemekSepeti iptal bildirimleri
 const getirYemekWebhooks = [];
 
+// ==================== API KEY CONFIGURATION ====================
+// SECURITY: All API keys should be set via environment variables in production
+const API_KEYS = {
+    // YemekSepeti polling API key - WPF uses this to authenticate
+    YEMEKSEPETI_POLLING_KEY: process.env.YEMEKSEPETI_POLLING_API_KEY || 'bafetto-yemeksepeti-2025-secure-key',
+
+    // GetirYemek polling API key - WPF uses this to poll webhooks
+    GETIRYEMEK_POLLING_KEY: process.env.GETIRYEMEK_POLLING_API_KEY || 'yemigo-getiryemek-prod-01db97e8dfc0621a8eb670d90eeae79f',
+
+    // GetirYemek default restaurant secret (fallback for webhooks without header)
+    GETIRYEMEK_DEFAULT_RESTAURANT_SECRET: process.env.GETIRYEMEK_DEFAULT_RESTAURANT_SECRET || 'bc19c0303e194594d027b365a95015b53edaf5a2'
+};
+
+// Log which keys are from environment (masked for security)
+console.log('[Security] API Keys Configuration:');
+console.log(`  - YEMEKSEPETI_POLLING_KEY: ${process.env.YEMEKSEPETI_POLLING_API_KEY ? '✅ ENV' : '⚠️ DEFAULT'}`);
+console.log(`  - GETIRYEMEK_POLLING_KEY: ${process.env.GETIRYEMEK_POLLING_API_KEY ? '✅ ENV' : '⚠️ DEFAULT'}`);
+console.log(`  - GETIRYEMEK_DEFAULT_RESTAURANT_SECRET: ${process.env.GETIRYEMEK_DEFAULT_RESTAURANT_SECRET ? '✅ ENV' : '⚠️ DEFAULT'}`);
+
 // ==================== SOCKET.IO COURIER TRACKING ====================
 
 // Bağlı kuryeler: { courierId: socketId }
@@ -549,7 +568,7 @@ app.get('/menuimport/:remoteId', (req, res) => {
 
 app.get('/api/yemeksepeti/pending-orders', (req, res) => {
     const apiKey = req.headers['x-api-key'];
-    if (apiKey !== 'bafetto-yemeksepeti-2025-secure-key') {
+    if (apiKey !== API_KEYS.YEMEKSEPETI_POLLING_KEY) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
 
@@ -577,7 +596,7 @@ app.get('/api/yemeksepeti/pending-orders', (req, res) => {
 
 app.delete('/api/yemeksepeti/orders/:orderId', (req, res) => {
     const apiKey = req.headers['x-api-key'];
-    if (apiKey !== 'bafetto-yemeksepeti-2025-secure-key') {
+    if (apiKey !== API_KEYS.YEMEKSEPETI_POLLING_KEY) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
 
@@ -607,7 +626,7 @@ app.delete('/api/yemeksepeti/orders/:orderId', (req, res) => {
 // YemiGO iptal bildirimlerini bu endpoint'ten polling ile alır
 app.get('/api/yemeksepeti/cancellations', (req, res) => {
     const apiKey = req.headers['x-api-key'];
-    if (apiKey !== 'bafetto-yemeksepeti-2025-secure-key') {
+    if (apiKey !== API_KEYS.YEMEKSEPETI_POLLING_KEY) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
 
@@ -631,7 +650,7 @@ app.get('/api/yemeksepeti/cancellations', (req, res) => {
 // İptal bildirimini sil (YemiGO işledikten sonra)
 app.delete('/api/yemeksepeti/cancellations/:cancellationId', (req, res) => {
     const apiKey = req.headers['x-api-key'];
-    if (apiKey !== 'bafetto-yemeksepeti-2025-secure-key') {
+    if (apiKey !== API_KEYS.YEMEKSEPETI_POLLING_KEY) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
 
@@ -649,7 +668,7 @@ app.delete('/api/yemeksepeti/cancellations/:cancellationId', (req, res) => {
 app.post('/webhook/newOrder', (req, res) => {
     const order = req.body;
     // GetirYemek header göndermiyorsa default key kullan
-    const restaurantSecretKey = req.headers['x-restaurant-secret-key'] || 'bc19c0303e194594d027b365a95015b53edaf5a2';
+    const restaurantSecretKey = req.headers['x-restaurant-secret-key'] || API_KEYS.GETIRYEMEK_DEFAULT_RESTAURANT_SECRET;
 
     // DEBUG: Full webhook body'sini log'la
     console.log('[GetirYemek] New order webhook received');
@@ -671,7 +690,7 @@ app.post('/webhook/newOrder', (req, res) => {
 app.post('/webhook/cancelOrder', (req, res) => {
     const order = req.body;
     // GetirYemek header göndermiyorsa default key kullan
-    const restaurantSecretKey = req.headers['x-restaurant-secret-key'] || 'bc19c0303e194594d027b365a95015b53edaf5a2';
+    const restaurantSecretKey = req.headers['x-restaurant-secret-key'] || API_KEYS.GETIRYEMEK_DEFAULT_RESTAURANT_SECRET;
 
     console.log('[GetirYemek] Order cancelled:', order.id);
 
@@ -690,7 +709,7 @@ app.post('/webhook/cancelOrder', (req, res) => {
 app.post('/webhook/courierArrival', (req, res) => {
     const notification = req.body;
     // GetirYemek header göndermiyorsa default key kullan
-    const restaurantSecretKey = req.headers['x-restaurant-secret-key'] || 'bc19c0303e194594d027b365a95015b53edaf5a2';
+    const restaurantSecretKey = req.headers['x-restaurant-secret-key'] || API_KEYS.GETIRYEMEK_DEFAULT_RESTAURANT_SECRET;
 
     console.log('[GetirYemek] Courier arrival:', notification.orderId);
 
@@ -709,7 +728,7 @@ app.post('/webhook/courierArrival', (req, res) => {
 app.post('/webhook/restaurantStatus', (req, res) => {
     const notification = req.body;
     // GetirYemek header göndermiyorsa default key kullan
-    const restaurantSecretKey = req.headers['x-restaurant-secret-key'] || 'bc19c0303e194594d027b365a95015b53edaf5a2';
+    const restaurantSecretKey = req.headers['x-restaurant-secret-key'] || API_KEYS.GETIRYEMEK_DEFAULT_RESTAURANT_SECRET;
 
     console.log('[GetirYemek] ========== RESTAURANT STATUS WEBHOOK ==========');
     console.log('[GetirYemek] Restaurant ID:', notification.restaurantId || notification.id);
@@ -734,7 +753,7 @@ app.get('/poll/webhooks', (req, res) => {
     const apiKey = req.headers['x-api-key'];
     const restaurantSecretKey = req.query.restaurantSecretKey;
 
-    if (apiKey !== 'yemigo-getiryemek-prod-01db97e8dfc0621a8eb670d90eeae79f') {
+    if (apiKey !== API_KEYS.GETIRYEMEK_POLLING_KEY) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
 
@@ -748,7 +767,7 @@ app.get('/poll/webhooks', (req, res) => {
 
 app.delete('/api/getiryemek/webhooks/:webhookId', (req, res) => {
     const apiKey = req.headers['x-api-key'];
-    if (apiKey !== 'yemigo-getiryemek-prod-01db97e8dfc0621a8eb670d90eeae79f') {
+    if (apiKey !== API_KEYS.GETIRYEMEK_POLLING_KEY) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
 
