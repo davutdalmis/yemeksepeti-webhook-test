@@ -1,9 +1,18 @@
-// Load .env file if exists (optional - Railway uses environment variables)
+// ==================================================================================
+// YEMIGO CLOUD-FIRST WEBHOOK SERVER v3.0.0
+// ==================================================================================
+// Bu server hem eski WPF polling sistemini destekler hem de Firebase'e direkt yazar.
+// WPF kapalı olsa bile siparişler Firebase'e yazılır ve kurye uygulaması çalışmaya devam eder.
+// ==================================================================================
+
 try { require('dotenv').config(); } catch (e) { }
+
 const express = require('express');
 const axios = require('axios');
 const http = require('http');
 const { Server } = require('socket.io');
+const admin = require('firebase-admin');
+const geolib = require('geolib');
 
 const app = express();
 const server = http.createServer(app);
@@ -20,86 +29,461 @@ const io = new Server(server, {
 
 app.use(express.json());
 
+// ==================== IN-MEMORY QUEUES (ESKİ SİSTEM İÇİN - GERİYE UYUMLULUK) ====================
 const orders = new Map();
-const cancellations = new Map(); // YemekSepeti iptal bildirimleri
+const cancellations = new Map();
 const getirYemekWebhooks = [];
 
 // ==================== API KEY CONFIGURATION ====================
-// SECURITY: All API keys MUST be set via environment variables
-// NO HARDCODED FALLBACKS - Server will refuse to start without proper configuration
 const API_KEYS = {
-    // YemekSepeti polling API key - WPF uses this to authenticate
     YEMEKSEPETI_POLLING_KEY: process.env.YEMEKSEPETI_POLLING_API_KEY || null,
-
-    // GetirYemek polling API key - WPF uses this to poll webhooks
     GETIRYEMEK_POLLING_KEY: process.env.GETIRYEMEK_POLLING_API_KEY || null,
-
-    // GetirYemek default restaurant secret (fallback for webhooks without header)
     GETIRYEMEK_DEFAULT_RESTAURANT_SECRET: process.env.GETIRYEMEK_DEFAULT_RESTAURANT_SECRET || null
 };
 
+// ==================== FIREBASE CONFIGURATION ====================
+let db = null;
+let firebaseInitialized = false;
+
+function initializeFirebase() {
+    try {
+        // Firebase credentials - environment variable veya dosyadan
+        const firebaseCredentials = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+
+        if (firebaseCredentials) {
+            // JSON string olarak environment variable'dan
+            const serviceAccount = JSON.parse(firebaseCredentials);
+            admin.initializeApp({
+                credential: admin.credential.cert(serviceAccount)
+            });
+            console.log('[Firebase] Initialized from environment variable');
+        } else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+            // Dosya yolu olarak
+            admin.initializeApp({
+                credential: admin.credential.applicationDefault()
+            });
+            console.log('[Firebase] Initialized from GOOGLE_APPLICATION_CREDENTIALS');
+        } else {
+            // Local development - firebase-credentials.json dosyasından
+            try {
+                const serviceAccount = require('./firebase-credentials.json');
+                admin.initializeApp({
+                    credential: admin.credential.cert(serviceAccount)
+                });
+                console.log('[Firebase] Initialized from local firebase-credentials.json');
+            } catch (e) {
+                console.warn('[Firebase] No credentials found - Firebase features disabled');
+                console.warn('[Firebase] To enable: Set FIREBASE_SERVICE_ACCOUNT_JSON env var or add firebase-credentials.json');
+                return false;
+            }
+        }
+
+        db = admin.firestore();
+        firebaseInitialized = true;
+        console.log('[Firebase] Firestore connected successfully');
+        return true;
+    } catch (error) {
+        console.error('[Firebase] Initialization error:', error.message);
+        return false;
+    }
+}
+
+// Initialize Firebase
+initializeFirebase();
+
 // ==================== STARTUP VALIDATION ====================
-// SECURITY: Verify required API keys are configured before starting
 function validateConfiguration() {
     const missingKeys = [];
 
-    // Polling key'leri ZORUNLU - WPF bunlarla authenticate oluyor
     if (!API_KEYS.YEMEKSEPETI_POLLING_KEY) {
         missingKeys.push('YEMEKSEPETI_POLLING_API_KEY');
     }
     if (!API_KEYS.GETIRYEMEK_POLLING_KEY) {
         missingKeys.push('GETIRYEMEK_POLLING_API_KEY');
     }
-    // NOT: GETIRYEMEK_DEFAULT_RESTAURANT_SECRET opsiyonel
-    // Her şubenin kendi restaurantSecretKey'i var (Firebase'de)
 
     if (missingKeys.length > 0) {
         console.error('==================== SECURITY ERROR ====================');
         console.error('CRITICAL: Missing required environment variables:');
         missingKeys.forEach(key => console.error(`  - ${key}`));
-        console.error('');
         console.error('Server cannot start without proper API key configuration.');
-        console.error('Please set these environment variables in Railway or .env file.');
         console.error('=========================================================');
         process.exit(1);
     }
 
-    // Log successful configuration (masked for security)
     console.log('[Security] API Keys Configuration:');
     console.log(`  - YEMEKSEPETI_POLLING_KEY: ✅ (${API_KEYS.YEMEKSEPETI_POLLING_KEY.substring(0, 8)}...)`);
     console.log(`  - GETIRYEMEK_POLLING_KEY: ✅ (${API_KEYS.GETIRYEMEK_POLLING_KEY.substring(0, 8)}...)`);
-    console.log(`  - GETIRYEMEK_DEFAULT_RESTAURANT_SECRET: ${API_KEYS.GETIRYEMEK_DEFAULT_RESTAURANT_SECRET ? '✅ (fallback set)' : '⚠️ Not set (will use header only)'}`);
+    console.log(`  - GETIRYEMEK_DEFAULT_RESTAURANT_SECRET: ${API_KEYS.GETIRYEMEK_DEFAULT_RESTAURANT_SECRET ? '✅' : '⚠️ Not set'}`);
+    console.log(`  - FIREBASE: ${firebaseInitialized ? '✅ Connected' : '⚠️ Disabled (WPF-only mode)'}`);
 }
 
-// Run validation immediately
 validateConfiguration();
+
+// ==================== SMART DISPATCH SERVICE ====================
+// Kurye atama algoritması - en uygun kuryeyi seçer
+
+async function getBranchLocation(branchId) {
+    if (!firebaseInitialized) return null;
+
+    try {
+        // branches koleksiyonundan şube lokasyonunu al
+        const branchDoc = await db.collection('tenants').doc('*').collection('branches').doc(branchId).get();
+
+        if (!branchDoc.exists) {
+            // Alternatif: direkt branches koleksiyonundan dene
+            const allBranches = await db.collectionGroup('branches').where('id', '==', branchId).get();
+            if (!allBranches.empty) {
+                const data = allBranches.docs[0].data();
+                return {
+                    latitude: data.latitude || data.lat || 0,
+                    longitude: data.longitude || data.lng || 0
+                };
+            }
+            return null;
+        }
+
+        const data = branchDoc.data();
+        return {
+            latitude: data.latitude || data.lat || 0,
+            longitude: data.longitude || data.lng || 0
+        };
+    } catch (error) {
+        console.error('[SmartDispatch] Branch location error:', error.message);
+        return null;
+    }
+}
+
+async function getAvailableCouriers(branchId) {
+    if (!firebaseInitialized) return [];
+
+    try {
+        // Couriers koleksiyonundan aktif kuryeler
+        const couriersSnapshot = await db.collectionGroup('couriers')
+            .where('branchId', '==', branchId)
+            .where('isOnDuty', '==', true)
+            .where('isActive', '==', true)
+            .get();
+
+        const couriers = [];
+        couriersSnapshot.forEach(doc => {
+            const data = doc.data();
+            couriers.push({
+                id: doc.id,
+                name: data.name || data.fullName || '',
+                phone: data.phone || '',
+                latitude: data.latitude || data.currentLatitude || 0,
+                longitude: data.longitude || data.currentLongitude || 0,
+                activeOrderCount: data.activeOrderCount || 0,
+                dailyDeliveryCount: data.dailyDeliveryCount || 0,
+                fcmToken: data.fcmToken || null
+            });
+        });
+
+        return couriers;
+    } catch (error) {
+        console.error('[SmartDispatch] Get couriers error:', error.message);
+        return [];
+    }
+}
+
+async function getActiveOrderCount(courierId) {
+    if (!firebaseInitialized) return 0;
+
+    try {
+        // Platform siparişlerinden aktif olanları say
+        const platforms = ['yemekSepetiOrders', 'getirYemekOrders', 'trendyolGoOrders'];
+        let totalActive = 0;
+
+        for (const platform of platforms) {
+            const ordersSnapshot = await db.collectionGroup(platform)
+                .where('assignedCourierId', '==', courierId)
+                .where('Status', 'in', ['ASSIGNED', 'ACCEPTED', 'PICKED_UP', 'ON_THE_WAY'])
+                .get();
+            totalActive += ordersSnapshot.size;
+        }
+
+        return totalActive;
+    } catch (error) {
+        console.error('[SmartDispatch] Active order count error:', error.message);
+        return 0;
+    }
+}
+
+function calculateCourierScore(courier, deliveryLocation, branchLocation) {
+    let score = 0;
+
+    // 1. Mesafe skoru (teslimat adresine yakınlık)
+    if (courier.latitude && courier.longitude && deliveryLocation.latitude && deliveryLocation.longitude) {
+        const distanceToDelivery = geolib.getDistance(
+            { latitude: courier.latitude, longitude: courier.longitude },
+            { latitude: deliveryLocation.latitude, longitude: deliveryLocation.longitude }
+        );
+        // Her 100 metre için 1 puan ekle (yakın olan düşük puan alır)
+        score += distanceToDelivery / 100;
+    } else if (branchLocation && branchLocation.latitude && branchLocation.longitude) {
+        // Kurye konumu yoksa şubeye yakınlık kullan
+        score += 500; // Default mesafe skoru
+    }
+
+    // 2. İş yükü skoru (aktif sipariş sayısı)
+    score += (courier.activeOrderCount || 0) * 200; // Her aktif sipariş için 200 puan
+
+    // 3. Günlük teslimat sayısı (yorgunluk faktörü)
+    score += (courier.dailyDeliveryCount || 0) * 10; // Her teslimat için 10 puan
+
+    return score;
+}
+
+async function assignBestCourier(branchId, deliveryLocation) {
+    if (!firebaseInitialized) {
+        console.log('[SmartDispatch] Firebase disabled - skipping auto-assignment');
+        return null;
+    }
+
+    try {
+        const couriers = await getAvailableCouriers(branchId);
+
+        if (couriers.length === 0) {
+            console.log('[SmartDispatch] No available couriers for branch:', branchId);
+            return null;
+        }
+
+        const branchLocation = await getBranchLocation(branchId);
+
+        // Her kurye için skor hesapla
+        const scoredCouriers = await Promise.all(
+            couriers.map(async (courier) => {
+                const activeOrders = await getActiveOrderCount(courier.id);
+                courier.activeOrderCount = activeOrders;
+
+                const score = calculateCourierScore(courier, deliveryLocation, branchLocation);
+                return { courier, score };
+            })
+        );
+
+        // En düşük skorlu kuryeyi seç
+        scoredCouriers.sort((a, b) => a.score - b.score);
+        const bestMatch = scoredCouriers[0];
+
+        console.log(`[SmartDispatch] Best courier: ${bestMatch.courier.name} (score: ${bestMatch.score.toFixed(0)})`);
+        console.log(`[SmartDispatch] Candidates: ${scoredCouriers.map(c => `${c.courier.name}:${c.score.toFixed(0)}`).join(', ')}`);
+
+        return bestMatch.courier;
+    } catch (error) {
+        console.error('[SmartDispatch] Assignment error:', error.message);
+        return null;
+    }
+}
+
+// ==================== PUSH NOTIFICATION SERVICE ====================
+
+async function sendPushNotification(fcmToken, title, body, data = {}) {
+    if (!firebaseInitialized || !fcmToken) {
+        console.log('[FCM] Skipping notification - Firebase disabled or no token');
+        return false;
+    }
+
+    try {
+        const message = {
+            token: fcmToken,
+            notification: {
+                title: title,
+                body: body
+            },
+            data: {
+                ...data,
+                click_action: 'FLUTTER_NOTIFICATION_CLICK'
+            },
+            android: {
+                priority: 'high',
+                notification: {
+                    sound: 'default',
+                    channelId: 'orders'
+                }
+            }
+        };
+
+        const response = await admin.messaging().send(message);
+        console.log(`[FCM] Notification sent: ${response}`);
+        return true;
+    } catch (error) {
+        console.error('[FCM] Send error:', error.message);
+        return false;
+    }
+}
+
+async function notifyCourierNewOrder(courier, order, platform) {
+    if (!courier || !courier.fcmToken) return false;
+
+    const customerName = order.Customer?.FirstName || order.customerName || 'Müşteri';
+    const address = order.Customer?.Address?.FullAddress || order.deliveryAddress || '';
+    const shortAddress = address.length > 50 ? address.substring(0, 50) + '...' : address;
+
+    return await sendPushNotification(
+        courier.fcmToken,
+        `Yeni ${platform} Siparişi`,
+        `${customerName} - ${shortAddress}`,
+        {
+            type: 'NEW_ORDER',
+            orderId: order.OrderId || order.id,
+            platform: platform,
+            branchId: order.branchId || ''
+        }
+    );
+}
+
+// ==================== FIREBASE DIRECT WRITE ====================
+// YENİ SİSTEM: Siparişleri direkt Firebase'e yazar
+
+async function writeOrderToFirebase(order, platform, branchId) {
+    if (!firebaseInitialized) {
+        console.log(`[Firebase] Skipping write - Firebase disabled`);
+        return { success: false, reason: 'firebase_disabled' };
+    }
+
+    const collectionName = {
+        'yemeksepeti': 'yemekSepetiOrders',
+        'getiryemek': 'getirYemekOrders',
+        'trendyolgo': 'trendyolGoOrders'
+    }[platform.toLowerCase()];
+
+    if (!collectionName) {
+        console.error(`[Firebase] Unknown platform: ${platform}`);
+        return { success: false, reason: 'unknown_platform' };
+    }
+
+    try {
+        const orderId = order.OrderId || order.id || `${platform}_${Date.now()}`;
+
+        // Duplicate check - aynı sipariş zaten var mı?
+        const existingOrder = await db.collectionGroup(collectionName)
+            .where('OrderId', '==', orderId)
+            .get();
+
+        if (!existingOrder.empty) {
+            console.log(`[Firebase] Order already exists: ${orderId} - skipping duplicate`);
+            return { success: true, reason: 'duplicate_skipped', orderId };
+        }
+
+        // Delivery location
+        const deliveryLocation = {
+            latitude: order.Customer?.Address?.Latitude || order.latitude || 0,
+            longitude: order.Customer?.Address?.Longitude || order.longitude || 0
+        };
+
+        // SmartDispatch - kurye ata
+        let assignedCourier = null;
+        const isPickup = (order.DeliveryType === 'PICKUP' || order.expeditionType === 'pickup');
+
+        if (!isPickup && branchId) {
+            assignedCourier = await assignBestCourier(branchId, deliveryLocation);
+        }
+
+        // Firebase document hazırla
+        const firebaseOrder = {
+            // Temel bilgiler
+            OrderId: orderId,
+            OrderToken: order.OrderToken || orderId,
+            Platform: platform.toUpperCase(),
+            Status: 'NEW',
+            IsCancelled: false,
+
+            // Müşteri bilgileri
+            CustomerName: order.Customer?.FirstName ?
+                `${order.Customer.FirstName} ${order.Customer.LastName || ''}`.trim() :
+                (order.customerName || ''),
+            CustomerPhone: order.Customer?.Phone || order.customerPhone || '',
+
+            // Adres bilgileri
+            DeliveryAddress: order.Customer?.Address?.FullAddress || order.deliveryAddress || '',
+            Latitude: deliveryLocation.latitude,
+            Longitude: deliveryLocation.longitude,
+
+            // Sipariş detayları
+            Items: order.Items || order.items || [],
+            TotalAmount: order.TotalAmount || order.totalAmount || 0,
+            PaymentMethod: order.PaymentMethod || order.paymentMethod || 'ONLINE',
+            DeliveryType: order.DeliveryType || 'DELIVERY',
+            Note: order.Note || order.note || '',
+
+            // Kurye ataması
+            assignedCourierId: assignedCourier?.id || null,
+            assignedCourierName: assignedCourier?.name || null,
+
+            // Branch bilgisi
+            branchId: branchId || null,
+
+            // Zaman bilgileri
+            CreatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            OrderDate: order.OrderDate || new Date().toISOString(),
+
+            // Kaynak bilgisi
+            source: 'railway_webhook',
+            updatedBy: 'railway_server'
+        };
+
+        // Branch path'i bul ve yaz
+        if (branchId) {
+            // Tenant'ı bul
+            const branchQuery = await db.collectionGroup('branches')
+                .where('id', '==', branchId)
+                .limit(1)
+                .get();
+
+            if (!branchQuery.empty) {
+                const branchPath = branchQuery.docs[0].ref.parent.parent; // tenant doc ref
+                await branchPath.collection('branches').doc(branchId)
+                    .collection(collectionName).doc(orderId).set(firebaseOrder);
+            } else {
+                // Fallback: root level collection
+                await db.collection(collectionName).doc(orderId).set(firebaseOrder);
+            }
+        } else {
+            // branchId yoksa root level'a yaz
+            await db.collection(collectionName).doc(orderId).set(firebaseOrder);
+        }
+
+        console.log(`[Firebase] ✅ Order written: ${orderId} (${platform})`);
+
+        // Push notification gönder
+        if (assignedCourier) {
+            await notifyCourierNewOrder(assignedCourier, order, platform);
+        }
+
+        return {
+            success: true,
+            orderId,
+            assignedCourierId: assignedCourier?.id || null,
+            assignedCourierName: assignedCourier?.name || null
+        };
+
+    } catch (error) {
+        console.error(`[Firebase] Write error:`, error.message);
+        return { success: false, reason: error.message };
+    }
+}
 
 // ==================== SOCKET.IO COURIER TRACKING ====================
 
-// Bağlı kuryeler: { courierId: socketId }
 const connectedCouriers = new Map();
-// Son kurye konumları (cache): { courierId: { lat, lng, timestamp } }
 const courierLocations = new Map();
 
 io.on('connection', (socket) => {
     console.log(`[Socket.io] Yeni bağlantı: ${socket.id}`);
 
-    // Kurye bağlantısı
     socket.on('courier:connect', (data) => {
         const { courierId, branchId, name } = data;
         console.log(`[Socket.io] Kurye bağlandı: ${name} (${courierId}) - Şube: ${branchId}`);
 
-        // Kurye bilgilerini socket'e kaydet
         socket.courierId = courierId;
         socket.branchId = branchId;
         socket.courierName = name;
         socket.userType = 'courier';
 
-        // Şube odasına katıl
         socket.join(`branch:${branchId}`);
         connectedCouriers.set(courierId, socket.id);
 
-        // POS'lara kurye online bilgisi gönder
         io.to(`branch:${branchId}`).emit('courier:online', {
             courierId,
             name,
@@ -107,7 +491,6 @@ io.on('connection', (socket) => {
         });
     });
 
-    // POS bağlantısı
     socket.on('pos:connect', (data) => {
         const { branchId, posName } = data;
         console.log(`[Socket.io] POS bağlandı: ${posName} - Şube: ${branchId}`);
@@ -116,10 +499,8 @@ io.on('connection', (socket) => {
         socket.posName = posName;
         socket.userType = 'pos';
 
-        // Şube odasına katıl
         socket.join(`branch:${branchId}`);
 
-        // Mevcut bağlı kuryeler ve konumlarını gönder
         const branchCouriers = [];
         for (const [courierId, socketId] of connectedCouriers.entries()) {
             const courierSocket = io.sockets.sockets.get(socketId);
@@ -135,7 +516,6 @@ io.on('connection', (socket) => {
         socket.emit('couriers:list', branchCouriers);
     });
 
-    // Kurye konum güncellemesi
     socket.on('courier:location', (data) => {
         const { courierId, latitude, longitude, speed, heading } = data;
 
@@ -150,23 +530,21 @@ io.on('connection', (socket) => {
             timestamp: new Date().toISOString()
         };
 
-        // Cache'e kaydet
         courierLocations.set(courierId, locationData);
-
-        // Aynı şubedeki tüm POS'lara yayınla
         io.to(`branch:${socket.branchId}`).emit('courier:location', locationData);
 
-        console.log(`[Socket.io] Konum: ${socket.courierName} → ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`);
+        // Firebase'e de yaz (async, bloklamaz)
+        if (firebaseInitialized) {
+            updateCourierLocationInFirebase(courierId, locationData).catch(() => {});
+        }
     });
 
-    // Bağlantı kopması
     socket.on('disconnect', () => {
         if (socket.userType === 'courier' && socket.courierId) {
             console.log(`[Socket.io] Kurye ayrıldı: ${socket.courierName} (${socket.courierId})`);
 
             connectedCouriers.delete(socket.courierId);
 
-            // POS'lara kurye offline bilgisi gönder
             if (socket.branchId) {
                 io.to(`branch:${socket.branchId}`).emit('courier:offline', {
                     courierId: socket.courierId,
@@ -176,13 +554,31 @@ io.on('connection', (socket) => {
             }
         } else if (socket.userType === 'pos') {
             console.log(`[Socket.io] POS ayrıldı: ${socket.posName}`);
-        } else {
-            console.log(`[Socket.io] Bağlantı koptu: ${socket.id}`);
         }
     });
 });
 
-// Socket.io durum endpoint'i
+async function updateCourierLocationInFirebase(courierId, locationData) {
+    if (!firebaseInitialized) return;
+
+    try {
+        await db.collectionGroup('couriers')
+            .where('id', '==', courierId)
+            .get()
+            .then(snapshot => {
+                snapshot.forEach(doc => {
+                    doc.ref.update({
+                        currentLatitude: locationData.latitude,
+                        currentLongitude: locationData.longitude,
+                        lastLocationUpdate: admin.firestore.FieldValue.serverTimestamp()
+                    });
+                });
+            });
+    } catch (error) {
+        // Silent fail - konum güncellemesi kritik değil
+    }
+}
+
 app.get('/socket/status', (req, res) => {
     const couriers = [];
     for (const [courierId, socketId] of connectedCouriers.entries()) {
@@ -205,19 +601,19 @@ app.get('/socket/status', (req, res) => {
     });
 });
 
-// YemekSepeti API Configuration
+// ==================== YEMEKSEPETI API ====================
+
 const YEMEKSEPETI_CONFIG = {
     baseUrl: process.env.YEMEKSEPETI_BASE_URL || 'https://integration-middleware.stg.restaurant-partners.com',
     chainCode: process.env.YEMEKSEPETI_CHAIN_CODE || '',
     username: process.env.YEMEKSEPETI_USERNAME || '',
     password: process.env.YEMEKSEPETI_PASSWORD || '',
-    checkIntervalMinutes: parseInt(process.env.YEMEKSEPETI_CHECK_INTERVAL_MINUTES) || 5
+    checkIntervalMinutes: parseInt(process.env.YEMEKSEPETI_CHECK_INTERVAL_MINUTES) || 5,
+    defaultBranchId: process.env.DEFAULT_BRANCH_ID || null
 };
 
 let yemeksepetiToken = null;
 let tokenExpiry = null;
-
-// ==================== YEMEKSEPETI API ====================
 
 async function getYemekSepetiToken() {
     if (yemeksepetiToken && tokenExpiry && Date.now() < tokenExpiry) {
@@ -225,7 +621,6 @@ async function getYemekSepetiToken() {
     }
 
     if (!YEMEKSEPETI_CONFIG.username || !YEMEKSEPETI_CONFIG.password) {
-        console.log('[YemekSepeti] Missing credentials');
         return null;
     }
 
@@ -264,15 +659,12 @@ async function checkOrderStatus(orderId) {
         if (error.response?.status === 404) {
             return { status: 'NOT_FOUND' };
         }
-        console.error(`[YemekSepeti] Order check error (${orderId}):`, error.message);
         return null;
     }
 }
 
 async function validateOrdersWithYemekSepeti() {
-    // Skip validation if no credentials (Railway polling mode only)
     if (!YEMEKSEPETI_CONFIG.username || !YEMEKSEPETI_CONFIG.password || !YEMEKSEPETI_CONFIG.chainCode) {
-        console.log('[YemekSepeti] Validation skipped - API credentials not configured (Railway polling mode)');
         return;
     }
 
@@ -310,41 +702,33 @@ setInterval(() => {
 }, YEMEKSEPETI_CONFIG.checkIntervalMinutes * 60 * 1000);
 
 setTimeout(() => {
-    validateOrdersWithYemekSepeti().catch(err => {
-        console.error('[YemekSepeti] Initial validation error:', err.message);
-    });
+    validateOrdersWithYemekSepeti().catch(() => {});
 }, 30000);
 
 // ==================== YEMEKSEPETI WEBHOOKS ====================
 
-app.post('/order/:remoteId', (req, res) => {
+app.post('/order/:remoteId', async (req, res) => {
     const { remoteId } = req.params;
     const order = req.body;
 
+    // branchId - header'dan veya query'den al
+    const branchId = req.headers['x-branch-id'] || req.query.branchId || YEMEKSEPETI_CONFIG.defaultBranchId;
+
     console.log('[YemekSepeti] ========== NEW ORDER RECEIVED ==========');
     console.log('[YemekSepeti] Order Code:', order.code || order.token);
-    console.log('[YemekSepeti] Remote ID:', remoteId);
-    console.log('[YemekSepeti] Full Order Payload:', JSON.stringify(order, null, 2));
+    console.log('[YemekSepeti] Branch ID:', branchId);
 
     const baseUrl = req.get('host').includes('localhost')
         ? `http://localhost:${PORT}`
-        : `http://${req.get('host')}`;
+        : `https://${req.get('host')}`;
 
     const now = new Date();
-    // Delivery Hero API'den adres delivery.address altında gelir
-    // Koordinatlar ise üst seviyede (order.latitude, order.longitude)
     const deliveryAddress = order.delivery?.address || order.customer?.address || null;
-
-    // Koordinatlar üst seviyede olabilir
     const latitude = order.latitude || deliveryAddress?.latitude || 0;
     const longitude = order.longitude || deliveryAddress?.longitude || 0;
-
-    // Mahalle/semt bilgisi üst seviyede
     const deliveryMainArea = order.deliveryMainArea || '';
     const deliveryInstructions = order.deliveryInstructions || deliveryAddress?.deliveryInstructions || '';
 
-    // Full address oluştur - YemekSepeti Türkiye formatı
-    // Hem deliveryAddress içinden hem üst seviyeden değerleri al (fallback)
     const street = deliveryAddress?.street || order.street || '';
     const streetNumber = deliveryAddress?.number || order.number || '';
     const city = deliveryAddress?.city || order.city || '';
@@ -358,33 +742,17 @@ app.post('/order/:remoteId', (req, res) => {
     let fullAddress = '';
     const addressParts = [];
 
-    // Sokak ve numara
     if (street) {
         let streetPart = street;
-        if (streetNumber) {
-            streetPart += ' ' + streetNumber;
-        }
+        if (streetNumber) streetPart += ' ' + streetNumber;
         addressParts.push(streetPart);
     }
-
-    // Mahalle/Semt (üst seviyeden)
-    if (deliveryMainArea) {
-        addressParts.push(deliveryMainArea);
-    }
-
-    // İlçe
-    if (district) {
-        addressParts.push(district);
-    }
-
-    // Şehir
-    if (city) {
-        addressParts.push(city);
-    }
+    if (deliveryMainArea) addressParts.push(deliveryMainArea);
+    if (district) addressParts.push(district);
+    if (city) addressParts.push(city);
 
     fullAddress = addressParts.join(', ');
 
-    // Bina detayları ekle
     const buildingDetails = [];
     if (building) buildingDetails.push(`Bina: ${building}`);
     if (entrance) buildingDetails.push(`Giriş: ${entrance}`);
@@ -395,18 +763,9 @@ app.post('/order/:remoteId', (req, res) => {
     if (buildingDetails.length > 0) {
         fullAddress += ' - ' + buildingDetails.join(', ');
     }
-
-    // Teslimat talimatları varsa ekle
     if (deliveryInstructions) {
         fullAddress += ` (${deliveryInstructions})`;
     }
-
-    console.log('[YemekSepeti] Parsed Address Fields:', { street, streetNumber, city, district, building, floor });
-
-    console.log('[YemekSepeti] Delivery Address Object:', JSON.stringify(deliveryAddress, null, 2));
-    console.log('[YemekSepeti] Coordinates:', latitude, longitude);
-    console.log('[YemekSepeti] Delivery Main Area:', deliveryMainArea);
-    console.log('[YemekSepeti] Constructed Full Address:', fullAddress);
 
     const transformedOrder = {
         OrderId: order.code || order.token || '',
@@ -418,6 +777,7 @@ app.post('/order/:remoteId', (req, res) => {
         CreatedAt: now.toISOString(),
         ScheduledDeliveryTime: order.scheduledDeliveryTime || null,
         IsScheduled: order.isScheduled || false,
+        branchId: branchId,
         Customer: order.customer ? {
             FirstName: order.customer.firstName || order.customer.name?.split(' ')[0] || '',
             LastName: order.customer.lastName || order.customer.name?.split(' ').slice(1).join(' ') || '',
@@ -425,16 +785,16 @@ app.post('/order/:remoteId', (req, res) => {
             Email: order.customer.email || '',
             Address: {
                 FullAddress: fullAddress,
-                City: deliveryAddress?.city || '',
-                District: deliveryAddress?.district || deliveryMainArea || '',
+                City: city,
+                District: district || deliveryMainArea || '',
                 Neighborhood: deliveryMainArea || '',
-                Street: deliveryAddress?.street || '',
-                StreetNumber: deliveryAddress?.number || '',
-                BuildingNo: deliveryAddress?.building || '',
-                Entrance: deliveryAddress?.entrance || '',
-                Floor: deliveryAddress?.floor || '',
-                DoorNo: deliveryAddress?.flatNumber || '',
-                Intercom: deliveryAddress?.intercom || '',
+                Street: street,
+                StreetNumber: streetNumber,
+                BuildingNo: building,
+                Entrance: entrance,
+                Floor: floor,
+                DoorNo: flatNumber,
+                Intercom: intercom,
                 Postcode: deliveryAddress?.deliveryAreaPostcode || deliveryAddress?.postcode || '',
                 Directions: deliveryInstructions,
                 Latitude: latitude,
@@ -470,23 +830,24 @@ app.post('/order/:remoteId', (req, res) => {
     };
 
     const orderId = order.token;
+
+    // ==================== PARALEL YAZIM ====================
+    // ESKİ YOL: Queue'ya ekle (WPF polling için)
     orders.set(orderId, {
         order: transformedOrder,
         status: 'NEW',
         createdAt: new Date()
     });
+    console.log('[YemekSepeti] ✅ Added to queue (WPF polling)');
 
-    console.log('[YemekSepeti] ========== TRANSFORMED ORDER ==========');
-    console.log('[YemekSepeti] Customer:', transformedOrder.Customer?.FirstName, transformedOrder.Customer?.LastName);
-    console.log('[YemekSepeti] Phone:', transformedOrder.Customer?.Phone);
-    console.log('[YemekSepeti] Address:', transformedOrder.Customer?.Address?.FullAddress || 'NO ADDRESS');
-    console.log('[YemekSepeti] Items:', transformedOrder.Items.length);
-    transformedOrder.Items.forEach((item, idx) => {
-        console.log(`[YemekSepeti]   ${idx + 1}. ${item.Name} x${item.Quantity} = ${item.TotalPrice} TL`);
-    });
-    console.log('[YemekSepeti] Total Amount:', transformedOrder.TotalAmount, 'TL');
-    console.log('[YemekSepeti] Payment Method:', transformedOrder.PaymentMethod);
-    console.log('[YemekSepeti] Delivery Type:', transformedOrder.DeliveryType);
+    // YENİ YOL: Firebase'e direkt yaz (kurye app için)
+    const firebaseResult = await writeOrderToFirebase(transformedOrder, 'yemeksepeti', branchId);
+    if (firebaseResult.success) {
+        console.log(`[YemekSepeti] ✅ Written to Firebase (courier: ${firebaseResult.assignedCourierName || 'unassigned'})`);
+    } else {
+        console.log(`[YemekSepeti] ⚠️ Firebase write skipped: ${firebaseResult.reason}`);
+    }
+
     console.log('[YemekSepeti] ========================================');
 
     res.status(200).json({
@@ -496,27 +857,18 @@ app.post('/order/:remoteId', (req, res) => {
     });
 });
 
-// ==================== YEMEKSEPETI ORDER STATUS UPDATE (İPTAL DAHİL) ====================
-// Delivery Hero dokümantasyonuna göre: POS plugin'e sipariş durumu güncellemeleri bu endpoint'e gelir
-// İptal senaryoları: müşteri iptali, lojistik kaynaklı iptal, 10 dk timeout iptali
-app.put('/remoteId/:remoteId/remoteOrder/:remoteOrderId/posOrderStatus', (req, res) => {
+// YemekSepeti Status Update
+app.put('/remoteId/:remoteId/remoteOrder/:remoteOrderId/posOrderStatus', async (req, res) => {
     const { remoteId, remoteOrderId } = req.params;
     const statusUpdate = req.body;
 
     console.log('[YemekSepeti] ========== ORDER STATUS UPDATE ==========');
-    console.log('[YemekSepeti] Remote ID:', remoteId);
     console.log('[YemekSepeti] Remote Order ID:', remoteOrderId);
     console.log('[YemekSepeti] Status:', statusUpdate.status);
-    console.log('[YemekSepeti] Full Payload:', JSON.stringify(statusUpdate, null, 2));
-    console.log('[YemekSepeti] ==========================================');
 
-    // İptal durumunu kontrol et
     const status = (statusUpdate.status || '').toLowerCase();
     if (status === 'cancelled' || status === 'rejected' || status === 'cancel') {
-        // İptal bildirimini kaydet - YemiGO polling ile alacak
         const cancellationId = `cancel_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-
-        // remoteOrderId'den orderToken'ı çıkar (format: remoteId_orderToken_timestamp)
         const parts = remoteOrderId.split('_');
         const orderToken = parts.length >= 2 ? parts[1] : remoteOrderId;
 
@@ -537,35 +889,43 @@ app.put('/remoteId/:remoteId/remoteOrder/:remoteOrderId/posOrderStatus', (req, r
 
         cancellations.set(cancellationId, cancellation);
 
-        console.log('[YemekSepeti] ========== CANCELLATION SAVED ==========');
-        console.log('[YemekSepeti] Cancellation ID:', cancellationId);
-        console.log('[YemekSepeti] Order Token:', orderToken);
-        console.log('[YemekSepeti] Reason:', cancellation.reason);
-        console.log('[YemekSepeti] Cancelled By:', cancellation.cancelledBy);
-        console.log('[YemekSepeti] Total Cancellations:', cancellations.size);
-        console.log('[YemekSepeti] ========================================');
+        // Firebase'de de iptal et
+        if (firebaseInitialized) {
+            try {
+                const ordersSnapshot = await db.collectionGroup('yemekSepetiOrders')
+                    .where('OrderToken', '==', orderToken)
+                    .get();
 
-        // orders Map'ten de sil/güncelle
+                ordersSnapshot.forEach(doc => {
+                    doc.ref.update({
+                        Status: 'CANCELLED',
+                        IsCancelled: true,
+                        cancelReason: cancellation.reason,
+                        cancelledAt: admin.firestore.FieldValue.serverTimestamp()
+                    });
+                });
+                console.log('[YemekSepeti] ✅ Cancellation synced to Firebase');
+            } catch (e) {
+                console.error('[YemekSepeti] Firebase cancel error:', e.message);
+            }
+        }
+
         if (orders.has(orderToken)) {
             const orderData = orders.get(orderToken);
             orderData.status = 'CANCELLED';
             orderData.cancelledAt = new Date();
             orderData.cancelReason = cancellation.reason;
         }
+
+        console.log('[YemekSepeti] ✅ Cancellation saved:', cancellationId);
     }
 
     res.status(200).json({ success: true, message: 'Status update received' });
 });
 
-// Alternatif iptal endpoint'leri (Delivery Hero farklı formatlar kullanabilir)
 app.post('/remoteId/:remoteId/remoteOrder/:remoteOrderId/cancel', (req, res) => {
     const { remoteId, remoteOrderId } = req.params;
     const cancelData = req.body;
-
-    console.log('[YemekSepeti] ========== CANCEL ENDPOINT ==========');
-    console.log('[YemekSepeti] Remote ID:', remoteId);
-    console.log('[YemekSepeti] Remote Order ID:', remoteOrderId);
-    console.log('[YemekSepeti] Cancel Data:', JSON.stringify(cancelData, null, 2));
 
     const cancellationId = `cancel_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     const parts = remoteOrderId.split('_');
@@ -587,15 +947,14 @@ app.post('/remoteId/:remoteId/remoteOrder/:remoteOrderId/cancel', (req, res) => 
     };
 
     cancellations.set(cancellationId, cancellation);
-    console.log('[YemekSepeti] Cancellation saved:', cancellationId);
-
     res.status(200).json({ success: true });
 });
 
 app.get('/menuimport/:remoteId', (req, res) => {
-    console.log('[YemekSepeti] Menu import request');
     res.status(202).send('Accepted');
 });
+
+// ==================== YEMEKSEPETI POLLING ENDPOINTS (ESKİ SİSTEM) ====================
 
 app.get('/api/yemeksepeti/pending-orders', (req, res) => {
     const apiKey = req.headers['x-api-key'];
@@ -603,25 +962,22 @@ app.get('/api/yemeksepeti/pending-orders', (req, res) => {
         return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    // Sadece bugünkü ve status='NEW' olan siparişleri döndür
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
     const newOrders = Array.from(orders.entries())
         .filter(([key, item]) => {
-            // Sadece NEW status
             if (item.status !== 'NEW') return false;
-            // Sadece bugünkü siparişler
             const orderDate = new Date(item.createdAt);
             return orderDate >= today;
         })
         .map(([key, item]) => ({
             ...item.order,
-            _railwayKey: key,  // Silme için doğru key'i gönder
+            _railwayKey: key,
             CreatedAt: item.createdAt.toISOString()
         }));
 
-    console.log(`[YemekSepeti] Polling: ${newOrders.length} NEW orders (today only)`);
+    console.log(`[YemekSepeti] Polling: ${newOrders.length} NEW orders`);
     res.json({ success: true, count: newOrders.length, orders: newOrders });
 });
 
@@ -633,28 +989,21 @@ app.delete('/api/yemeksepeti/orders/:orderId', (req, res) => {
 
     const orderId = req.params.orderId;
 
-    // Önce direkt key ile dene
     if (orders.has(orderId)) {
         orders.delete(orderId);
-        console.log(`[YemekSepeti] ✅ Order deleted by key: ${orderId}`);
         return res.json({ success: true, deletedBy: 'key' });
     }
 
-    // Key bulunamadıysa OrderId ile ara
     for (const [key, item] of orders.entries()) {
         if (item.order.OrderId === orderId || item.order.OrderToken === orderId) {
             orders.delete(key);
-            console.log(`[YemekSepeti] ✅ Order deleted by OrderId/Token: ${orderId} (key: ${key})`);
             return res.json({ success: true, deletedBy: 'orderId' });
         }
     }
 
-    console.log(`[YemekSepeti] ⚠️ Order not found for deletion: ${orderId}`);
     res.status(404).json({ success: false, message: 'Order not found' });
 });
 
-// ==================== YEMEKSEPETI İPTAL POLLING ====================
-// YemiGO iptal bildirimlerini bu endpoint'ten polling ile alır
 app.get('/api/yemeksepeti/cancellations', (req, res) => {
     const apiKey = req.headers['x-api-key'];
     if (apiKey !== API_KEYS.YEMEKSEPETI_POLLING_KEY) {
@@ -674,11 +1023,9 @@ app.get('/api/yemeksepeti/cancellations', (req, res) => {
             cancelledAt: c.cancelledAt
         }));
 
-    console.log(`[YemekSepeti] Cancellation Polling: ${pendingCancellations.length} cancellations`);
     res.json({ success: true, count: pendingCancellations.length, cancellations: pendingCancellations });
 });
 
-// İptal bildirimini sil (YemiGO işledikten sonra)
 app.delete('/api/yemeksepeti/cancellations/:cancellationId', (req, res) => {
     const apiKey = req.headers['x-api-key'];
     if (apiKey !== API_KEYS.YEMEKSEPETI_POLLING_KEY) {
@@ -687,7 +1034,6 @@ app.delete('/api/yemeksepeti/cancellations/:cancellationId', (req, res) => {
 
     if (cancellations.has(req.params.cancellationId)) {
         cancellations.delete(req.params.cancellationId);
-        console.log(`[YemekSepeti] Cancellation deleted: ${req.params.cancellationId}`);
         res.json({ success: true });
     } else {
         res.status(404).json({ success: false, message: 'Cancellation not found' });
@@ -696,31 +1042,60 @@ app.delete('/api/yemeksepeti/cancellations/:cancellationId', (req, res) => {
 
 // ==================== GETIRYEMEK WEBHOOKS ====================
 
-app.post('/webhook/newOrder', (req, res) => {
+app.post('/webhook/newOrder', async (req, res) => {
     const order = req.body;
-    // GetirYemek header göndermiyorsa default key kullan
     const restaurantSecretKey = req.headers['x-restaurant-secret-key'] || API_KEYS.GETIRYEMEK_DEFAULT_RESTAURANT_SECRET;
+    const branchId = req.headers['x-branch-id'] || req.query.branchId || process.env.DEFAULT_BRANCH_ID;
 
-    // DEBUG: Full webhook body'sini log'la
-    console.log('[GetirYemek] New order webhook received');
-    console.log('[GetirYemek] Full body:', JSON.stringify(order, null, 2));
-    console.log('[GetirYemek] Headers:', JSON.stringify(req.headers, null, 2));
+    console.log('[GetirYemek] ========== NEW ORDER RECEIVED ==========');
+    console.log('[GetirYemek] Order ID:', order.id);
+    console.log('[GetirYemek] Branch ID:', branchId);
 
+    // ESKİ YOL: Queue'ya ekle
     const webhookId = Date.now() + '_' + Math.random().toString(36).substr(2, 9);
     getirYemekWebhooks.push({
         id: webhookId,
         type: 'newOrder',
-        data: order,  // GetirYemek zaten full data gönderiyor
+        data: order,
         restaurantSecretKey: restaurantSecretKey,
         timestamp: new Date()
     });
+    console.log('[GetirYemek] ✅ Added to queue (WPF polling)');
+
+    // YENİ YOL: Firebase'e direkt yaz
+    const transformedOrder = {
+        OrderId: order.id || '',
+        OrderToken: order.id || '',
+        customerName: order.client?.name || '',
+        customerPhone: order.client?.clientPhoneNumber || order.client?.maskedPhoneNumber || '',
+        deliveryAddress: order.client?.deliveryAddress?.address || '',
+        latitude: order.client?.deliveryAddress?.latitude || 0,
+        longitude: order.client?.deliveryAddress?.longitude || 0,
+        Items: (order.products || []).map(p => ({
+            Name: p.name || '',
+            Quantity: p.count || 1,
+            UnitPrice: p.price || 0,
+            TotalPrice: (p.price || 0) * (p.count || 1)
+        })),
+        TotalAmount: order.totalPrice || 0,
+        PaymentMethod: order.paymentMethodText || 'ONLINE',
+        DeliveryType: order.isScheduled ? 'SCHEDULED' : 'DELIVERY',
+        Note: order.clientNote || '',
+        branchId: branchId
+    };
+
+    const firebaseResult = await writeOrderToFirebase(transformedOrder, 'getiryemek', branchId);
+    if (firebaseResult.success) {
+        console.log(`[GetirYemek] ✅ Written to Firebase (courier: ${firebaseResult.assignedCourierName || 'unassigned'})`);
+    }
+
+    console.log('[GetirYemek] ========================================');
 
     res.status(200).send('OK');
 });
 
-app.post('/webhook/cancelOrder', (req, res) => {
+app.post('/webhook/cancelOrder', async (req, res) => {
     const order = req.body;
-    // GetirYemek header göndermiyorsa default key kullan
     const restaurantSecretKey = req.headers['x-restaurant-secret-key'] || API_KEYS.GETIRYEMEK_DEFAULT_RESTAURANT_SECRET;
 
     console.log('[GetirYemek] Order cancelled:', order.id);
@@ -734,12 +1109,30 @@ app.post('/webhook/cancelOrder', (req, res) => {
         timestamp: new Date()
     });
 
+    // Firebase'de iptal et
+    if (firebaseInitialized && order.id) {
+        try {
+            const ordersSnapshot = await db.collectionGroup('getirYemekOrders')
+                .where('OrderId', '==', order.id)
+                .get();
+
+            ordersSnapshot.forEach(doc => {
+                doc.ref.update({
+                    Status: 'CANCELLED',
+                    IsCancelled: true,
+                    cancelledAt: admin.firestore.FieldValue.serverTimestamp()
+                });
+            });
+        } catch (e) {
+            console.error('[GetirYemek] Firebase cancel error:', e.message);
+        }
+    }
+
     res.status(200).send('OK');
 });
 
 app.post('/webhook/courierArrival', (req, res) => {
     const notification = req.body;
-    // GetirYemek header göndermiyorsa default key kullan
     const restaurantSecretKey = req.headers['x-restaurant-secret-key'] || API_KEYS.GETIRYEMEK_DEFAULT_RESTAURANT_SECRET;
 
     console.log('[GetirYemek] Courier arrival:', notification.orderId);
@@ -758,15 +1151,9 @@ app.post('/webhook/courierArrival', (req, res) => {
 
 app.post('/webhook/restaurantStatus', (req, res) => {
     const notification = req.body;
-    // GetirYemek header göndermiyorsa default key kullan
     const restaurantSecretKey = req.headers['x-restaurant-secret-key'] || API_KEYS.GETIRYEMEK_DEFAULT_RESTAURANT_SECRET;
 
-    console.log('[GetirYemek] ========== RESTAURANT STATUS WEBHOOK ==========');
-    console.log('[GetirYemek] Restaurant ID:', notification.restaurantId || notification.id);
-    console.log('[GetirYemek] Status:', notification.status);
-    console.log('[GetirYemek] Reason:', notification.reason || 'N/A');
-    console.log('[GetirYemek] Full Payload:', JSON.stringify(notification, null, 2));
-    console.log('[GetirYemek] ================================================');
+    console.log('[GetirYemek] Restaurant Status:', notification.status);
 
     const webhookId = Date.now() + '_' + Math.random().toString(36).substr(2, 9);
     getirYemekWebhooks.push({
@@ -780,6 +1167,7 @@ app.post('/webhook/restaurantStatus', (req, res) => {
     res.status(200).send('OK');
 });
 
+// GetirYemek Polling (ESKİ SİSTEM)
 app.get('/poll/webhooks', (req, res) => {
     const apiKey = req.headers['x-api-key'];
     const restaurantSecretKey = req.query.restaurantSecretKey;
@@ -792,7 +1180,6 @@ app.get('/poll/webhooks', (req, res) => {
         ? getirYemekWebhooks.filter(w => w.restaurantSecretKey === restaurantSecretKey)
         : getirYemekWebhooks;
 
-    console.log(`[GetirYemek] Polling: ${filteredWebhooks.length} webhooks`);
     res.json({ success: true, webhooks: filteredWebhooks });
 });
 
@@ -811,46 +1198,87 @@ app.delete('/api/getiryemek/webhooks/:webhookId', (req, res) => {
     }
 });
 
+// ==================== TRENDYOLGO WEBHOOKS (YENİ) ====================
+
+app.post('/webhook/trendyolgo/order', async (req, res) => {
+    const order = req.body;
+    const branchId = req.headers['x-branch-id'] || req.query.branchId || process.env.DEFAULT_BRANCH_ID;
+
+    console.log('[TrendyolGo] ========== NEW ORDER RECEIVED ==========');
+    console.log('[TrendyolGo] Package ID:', order.id || order.packageId);
+    console.log('[TrendyolGo] Branch ID:', branchId);
+
+    // Firebase'e direkt yaz
+    const transformedOrder = {
+        OrderId: order.id || order.packageId || '',
+        OrderToken: order.id || order.packageId || '',
+        customerName: order.recipientName || order.customerName || '',
+        customerPhone: order.recipientPhone || order.customerPhone || '',
+        deliveryAddress: order.deliveryAddress || order.address || '',
+        latitude: order.latitude || 0,
+        longitude: order.longitude || 0,
+        Items: (order.lines || order.items || []).map(item => ({
+            Name: item.productName || item.name || '',
+            Quantity: item.quantity || 1,
+            UnitPrice: item.price || 0,
+            TotalPrice: (item.price || 0) * (item.quantity || 1)
+        })),
+        TotalAmount: order.totalPrice || order.grossAmount || 0,
+        PaymentMethod: order.paymentType || 'ONLINE',
+        DeliveryType: 'DELIVERY',
+        Note: order.customerNote || order.note || '',
+        branchId: branchId
+    };
+
+    const firebaseResult = await writeOrderToFirebase(transformedOrder, 'trendyolgo', branchId);
+    if (firebaseResult.success) {
+        console.log(`[TrendyolGo] ✅ Written to Firebase (courier: ${firebaseResult.assignedCourierName || 'unassigned'})`);
+    }
+
+    console.log('[TrendyolGo] ========================================');
+
+    res.status(200).json({ success: true });
+});
+
 // ==================== TEST CALLBACKS ====================
 
 app.post('/test-callbacks/order-accepted/:orderId', (req, res) => {
     const orderId = req.params.orderId;
     if (orders.has(orderId)) {
-        // Sipariş onaylandı - Railway'den SİL (tekrar polling'e düşmesin)
         orders.delete(orderId);
-        console.log(`[YemekSepeti] ✅ Order ACCEPTED and REMOVED from queue: ${orderId}`);
+        console.log(`[YemekSepeti] ✅ Order ACCEPTED: ${orderId}`);
     }
-    res.status(200).json({ success: true, orderId: orderId, action: 'accepted_and_removed' });
+    res.status(200).json({ success: true, orderId: orderId, action: 'accepted' });
 });
 
 app.post('/test-callbacks/order-rejected/:orderId', (req, res) => {
     const orderId = req.params.orderId;
     if (orders.has(orderId)) {
-        // Sipariş reddedildi - Railway'den SİL
         orders.delete(orderId);
-        console.log(`[YemekSepeti] ❌ Order REJECTED and REMOVED from queue: ${orderId}`);
+        console.log(`[YemekSepeti] ❌ Order REJECTED: ${orderId}`);
     }
-    res.status(200).json({ success: true, orderId: orderId, action: 'rejected_and_removed' });
+    res.status(200).json({ success: true, orderId: orderId, action: 'rejected' });
 });
 
 app.post('/test-callbacks/order-prepared/:orderId', (req, res) => {
-    const orderId = req.params.orderId;
-    // Hazırlandı bildirimi - sipariş zaten queue'dan silinmiş olmalı
-    console.log(`[YemekSepeti] 📦 Order PREPARED: ${orderId}`);
-    res.status(200).json({ success: true, orderId: orderId });
+    console.log(`[YemekSepeti] 📦 Order PREPARED: ${req.params.orderId}`);
+    res.status(200).json({ success: true, orderId: req.params.orderId });
 });
 
 app.post('/test-callbacks/order-pickedup/:orderId', (req, res) => {
-    const orderId = req.params.orderId;
-    // Teslim alındı bildirimi - sipariş zaten queue'dan silinmiş olmalı
-    console.log(`[YemekSepeti] 🚗 Order PICKED UP: ${orderId}`);
-    res.status(200).json({ success: true, orderId: orderId });
+    console.log(`[YemekSepeti] 🚗 Order PICKED UP: ${req.params.orderId}`);
+    res.status(200).json({ success: true, orderId: req.params.orderId });
 });
 
 // ==================== HEALTH & INFO ====================
 
 app.get('/health', (req, res) => {
-    res.json({ status: 'ok', service: 'Restaurant Webhook Server' });
+    res.json({
+        status: 'ok',
+        service: 'YemiGO Cloud-First Webhook Server',
+        version: '3.0.0',
+        firebase: firebaseInitialized ? 'connected' : 'disabled'
+    });
 });
 
 app.get('/', (req, res) => {
@@ -860,35 +1288,43 @@ app.get('/', (req, res) => {
     });
 
     res.json({
-        service: 'Restaurant Webhook & Polling Server',
-        yemeksepeti: {
-            totalOrders: orders.size,
-            ordersByStatus: ordersByStatus,
-            pendingCancellations: cancellations.size
+        service: 'YemiGO Cloud-First Webhook Server',
+        version: '3.0.0',
+        architecture: 'PARALLEL (Queue + Firebase Direct Write)',
+        firebase: {
+            status: firebaseInitialized ? 'CONNECTED' : 'DISABLED',
+            features: firebaseInitialized ? ['direct_write', 'smart_dispatch', 'push_notifications'] : []
         },
-        getiryemek: {
-            pendingWebhooks: getirYemekWebhooks.length
-        },
-        endpoints: {
+        queues: {
             yemeksepeti: {
-                orderWebhook: 'POST /order/:remoteId',
-                statusUpdate: 'PUT /remoteId/:remoteId/remoteOrder/:remoteOrderId/posOrderStatus',
-                cancelWebhook: 'POST /remoteId/:remoteId/remoteOrder/:remoteOrderId/cancel',
-                orderPolling: 'GET /api/yemeksepeti/pending-orders',
-                cancellationPolling: 'GET /api/yemeksepeti/cancellations',
-                deleteCancellation: 'DELETE /api/yemeksepeti/cancellations/:cancellationId'
+                totalOrders: orders.size,
+                ordersByStatus: ordersByStatus,
+                pendingCancellations: cancellations.size
             },
             getiryemek: {
-                webhooks: ['POST /webhook/newOrder', 'POST /webhook/cancelOrder', 'POST /webhook/courierArrival', 'POST /webhook/restaurantStatus'],
-                polling: 'GET /poll/webhooks?restaurantSecretKey=xxx',
-                delete: 'DELETE /api/getiryemek/webhooks/:webhookId'
+                pendingWebhooks: getirYemekWebhooks.length
+            }
+        },
+        sockets: {
+            connectedCouriers: connectedCouriers.size,
+            totalConnections: io.sockets.sockets.size
+        },
+        endpoints: {
+            webhooks: {
+                yemeksepeti: 'POST /order/:remoteId',
+                getiryemek: ['POST /webhook/newOrder', 'POST /webhook/cancelOrder'],
+                trendyolgo: 'POST /webhook/trendyolgo/order'
+            },
+            polling: {
+                yemeksepeti: 'GET /api/yemeksepeti/pending-orders',
+                getiryemek: 'GET /poll/webhooks'
             }
         }
     });
 });
 
-// ==================== CLEANUP FUNCTION ====================
-// Eski siparişleri otomatik temizle (memory leak önleme)
+// ==================== CLEANUP ====================
+
 function cleanupOldOrders() {
     const yesterday = new Date();
     yesterday.setDate(yesterday.getDate() - 1);
@@ -897,7 +1333,6 @@ function cleanupOldOrders() {
     let deletedOrders = 0;
     let deletedCancellations = 0;
 
-    // Eski siparişleri sil
     for (const [key, item] of orders.entries()) {
         const orderDate = new Date(item.createdAt);
         if (orderDate < yesterday) {
@@ -906,7 +1341,6 @@ function cleanupOldOrders() {
         }
     }
 
-    // Eski iptalleri sil
     for (const [key, item] of cancellations.entries()) {
         const cancelDate = new Date(item.createdAt);
         if (cancelDate < yesterday) {
@@ -915,7 +1349,6 @@ function cleanupOldOrders() {
         }
     }
 
-    // Eski GetirYemek webhook'larını sil
     const webhooksToDelete = [];
     for (let i = getirYemekWebhooks.length - 1; i >= 0; i--) {
         const webhookDate = new Date(getirYemekWebhooks[i].timestamp);
@@ -930,16 +1363,27 @@ function cleanupOldOrders() {
     }
 }
 
-// Her saat başı temizlik yap
 setInterval(cleanupOldOrders, 60 * 60 * 1000);
-
-// Uygulama başlarken de temizle
 setTimeout(cleanupOldOrders, 5000);
+
+// ==================== SERVER START ====================
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-    console.log(`[Socket.io] WebSocket ready for courier tracking`);
-    console.log(`[YemekSepeti] Order validation interval: ${YEMEKSEPETI_CONFIG.checkIntervalMinutes} minutes`);
-    console.log(`[Cleanup] Auto-cleanup enabled (hourly)`);
+    console.log('');
+    console.log('================================================================================');
+    console.log('  YEMIGO CLOUD-FIRST WEBHOOK SERVER v3.0.0');
+    console.log('================================================================================');
+    console.log(`  Port: ${PORT}`);
+    console.log(`  Firebase: ${firebaseInitialized ? '✅ CONNECTED (Direct Write Enabled)' : '⚠️ DISABLED (Queue-Only Mode)'}`);
+    console.log(`  Socket.io: ✅ Ready for courier tracking`);
+    console.log(`  Architecture: PARALLEL (Queue + Firebase)`);
+    console.log('');
+    console.log('  PARALEL ÇALIŞMA:');
+    console.log('  ├─ ESKİ YOL: Queue → WPF Polling → Firebase (WPF açıkken)');
+    console.log('  └─ YENİ YOL: Webhook → Firebase Direct (WPF kapalı olsa bile)');
+    console.log('');
+    console.log('  WPF KAPALI OLSA BİLE SİPARİŞLER FİREBASE\'E YAZILIR!');
+    console.log('================================================================================');
+    console.log('');
 });
