@@ -384,6 +384,11 @@ io.on('connection', (socket) => {
         io.to(`branch:${branchId}`).emit('courier:online', {
             courierId, name, timestamp: new Date().toISOString()
         });
+
+        // Confirm connection to the courier app
+        socket.emit('courier:connected', {
+            courierId, branchId, timestamp: new Date().toISOString()
+        });
     });
 
     socket.on('pos:connect', (data) => {
@@ -417,6 +422,26 @@ io.on('connection', (socket) => {
         const locationData = { courierId, latitude, longitude, speed: speed || 0, heading: heading || 0, timestamp: new Date().toISOString() };
         courierLocations.set(courierId, locationData);
         io.to(`branch:${socket.branchId}`).emit('courier:location:update', locationData);
+    });
+
+    // Handle batch location updates from courier app (offline queue sync)
+    socket.on('courier:location:batch', (data) => {
+        const { courierId, locations } = data;
+        if (!courierId || !socket.branchId || !Array.isArray(locations)) return;
+
+        console.log(`[Socket.io] Batch location update: ${locations.length} points from ${courierId}`);
+        for (const loc of locations) {
+            const locationData = {
+                courierId,
+                latitude: loc.latitude || loc.lat,
+                longitude: loc.longitude || loc.lng,
+                speed: loc.speed || 0,
+                heading: loc.heading || 0,
+                timestamp: loc.timestamp ? new Date(loc.timestamp).toISOString() : new Date().toISOString()
+            };
+            courierLocations.set(courierId, locationData);
+            io.to(`branch:${socket.branchId}`).emit('courier:location:update', locationData);
+        }
     });
 
     socket.on('disconnect', () => {
