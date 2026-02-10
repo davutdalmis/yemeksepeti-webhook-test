@@ -5,6 +5,8 @@
 const BasePlatformConnector = require('../base-connector');
 const axios = require('axios');
 
+const API_TIMEOUT = 10000; // 10 seconds
+
 class TrendyolGoConnector extends BasePlatformConnector {
     constructor(db, registry) {
         super('trendyolgo', db, registry);
@@ -144,7 +146,8 @@ class TrendyolGoConnector extends BasePlatformConnector {
                     headers: {
                         'Authorization': authHeader,
                         'Content-Type': 'application/json'
-                    }
+                    },
+                    timeout: API_TIMEOUT
                 }
             );
 
@@ -189,7 +192,8 @@ class TrendyolGoConnector extends BasePlatformConnector {
                     headers: {
                         'Authorization': authHeader,
                         'Content-Type': 'application/json'
-                    }
+                    },
+                    timeout: API_TIMEOUT
                 }
             );
 
@@ -219,7 +223,8 @@ class TrendyolGoConnector extends BasePlatformConnector {
                     headers: {
                         'Authorization': authHeader,
                         'Content-Type': 'application/json'
-                    }
+                    },
+                    timeout: API_TIMEOUT
                 }
             );
 
@@ -274,7 +279,8 @@ class TrendyolGoConnector extends BasePlatformConnector {
                     headers: {
                         'Authorization': authHeader,
                         'Content-Type': 'application/json'
-                    }
+                    },
+                    timeout: API_TIMEOUT
                 }
             );
 

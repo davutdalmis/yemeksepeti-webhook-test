@@ -5,6 +5,8 @@
 const BasePlatformConnector = require('../base-connector');
 const axios = require('axios');
 
+const API_TIMEOUT = 10000; // 10 seconds
+
 class YemekSepetiConnector extends BasePlatformConnector {
     constructor(db, registry) {
         super('yemeksepeti', db, registry);
@@ -181,7 +183,7 @@ class YemekSepetiConnector extends BasePlatformConnector {
                     password: this.config.password,
                     grant_type: 'client_credentials'
                 }),
-                { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+                { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: API_TIMEOUT }
             );
 
             this.token = response.data.access_token;
@@ -205,7 +207,8 @@ class YemekSepetiConnector extends BasePlatformConnector {
             const callbackUrl = branchConfig.acceptCallbackUrl;
             if (callbackUrl) {
                 await axios.post(callbackUrl, {}, {
-                    headers: { 'Authorization': `Bearer ${token}` }
+                    headers: { 'Authorization': `Bearer ${token}` },
+                    timeout: API_TIMEOUT
                 });
             }
 
@@ -227,7 +230,8 @@ class YemekSepetiConnector extends BasePlatformConnector {
             const callbackUrl = branchConfig.rejectCallbackUrl;
             if (callbackUrl) {
                 await axios.post(callbackUrl, { reason }, {
-                    headers: { 'Authorization': `Bearer ${token}` }
+                    headers: { 'Authorization': `Bearer ${token}` },
+                    timeout: API_TIMEOUT
                 });
             }
 
@@ -249,7 +253,8 @@ class YemekSepetiConnector extends BasePlatformConnector {
             const callbackUrl = branchConfig.preparedCallbackUrl;
             if (callbackUrl) {
                 await axios.post(callbackUrl, {}, {
-                    headers: { 'Authorization': `Bearer ${token}` }
+                    headers: { 'Authorization': `Bearer ${token}` },
+                    timeout: API_TIMEOUT
                 });
             }
 
@@ -271,7 +276,8 @@ class YemekSepetiConnector extends BasePlatformConnector {
             const callbackUrl = branchConfig.pickedUpCallbackUrl;
             if (callbackUrl) {
                 await axios.post(callbackUrl, {}, {
-                    headers: { 'Authorization': `Bearer ${token}` }
+                    headers: { 'Authorization': `Bearer ${token}` },
+                    timeout: API_TIMEOUT
                 });
             }
 
@@ -300,7 +306,7 @@ class YemekSepetiConnector extends BasePlatformConnector {
         try {
             const response = await axios.get(
                 `${this.config.baseUrl}/v2/chains/${this.config.chainCode}/orders/${orderToken}`,
-                { headers: { 'Authorization': `Bearer ${token}` } }
+                { headers: { 'Authorization': `Bearer ${token}` }, timeout: API_TIMEOUT }
             );
             return response.data.order;
 

@@ -29,9 +29,13 @@ const app = express();
 const server = http.createServer(app);
 
 // Socket.io setup with CORS
+const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
+    ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
+    : [];
+
 const io = new Server(server, {
     cors: {
-        origin: "*",
+        origin: ALLOWED_ORIGINS.length > 0 ? ALLOWED_ORIGINS : false,
         methods: ["GET", "POST"]
     },
     pingTimeout: 60000,
@@ -53,6 +57,21 @@ const API_KEYS = {
     UNIFIED_API_KEY: process.env.UNIFIED_API_KEY || null,
     ADMIN_API_KEY: process.env.ADMIN_API_KEY || null
 };
+
+// Webhook secret for incoming platform webhooks
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || null;
+const SOCKET_AUTH_TOKEN = process.env.SOCKET_AUTH_TOKEN || null;
+
+// Webhook authentication middleware
+function authenticateWebhook(req, res, next) {
+    if (!WEBHOOK_SECRET) return next(); // Skip if not configured
+    const secret = req.headers['x-webhook-secret'] || req.query.secret;
+    if (secret !== WEBHOOK_SECRET) {
+        console.warn(`[Security] Unauthorized webhook attempt from ${req.ip} to ${req.path}`);
+        return res.status(401).json({ error: 'Unauthorized webhook' });
+    }
+    next();
+}
 
 // ==================== FIREBASE CONFIGURATION ====================
 let db = null;
@@ -335,11 +354,23 @@ async function writeOrderToFirebaseUnified(order, platformId, branchId) {
 const connectedCouriers = new Map();
 const courierLocations = new Map();
 
+// Socket.IO authentication middleware
+io.use((socket, next) => {
+    if (!SOCKET_AUTH_TOKEN) return next(); // Skip if not configured
+    const token = socket.handshake.auth?.token || socket.handshake.query?.token;
+    if (token !== SOCKET_AUTH_TOKEN) {
+        console.warn(`[Socket.io] Unauthorized connection attempt from ${socket.handshake.address}`);
+        return next(new Error('Authentication failed'));
+    }
+    next();
+});
+
 io.on('connection', (socket) => {
     console.log(`[Socket.io] New connection: ${socket.id}`);
 
     socket.on('courier:connect', (data) => {
         const { courierId, branchId, name } = data;
+        if (!courierId || !branchId) return;
         console.log(`[Socket.io] Courier connected: ${name} (${courierId})`);
 
         socket.courierId = courierId;
@@ -357,6 +388,7 @@ io.on('connection', (socket) => {
 
     socket.on('pos:connect', (data) => {
         const { branchId, posName } = data;
+        if (!branchId) return;
         console.log(`[Socket.io] POS connected: ${posName}`);
 
         socket.branchId = branchId;
@@ -391,6 +423,7 @@ io.on('connection', (socket) => {
         if (socket.userType === 'courier' && socket.courierId) {
             console.log(`[Socket.io] Courier disconnected: ${socket.courierName}`);
             connectedCouriers.delete(socket.courierId);
+            courierLocations.delete(socket.courierId);
             if (socket.branchId) {
                 io.to(`branch:${socket.branchId}`).emit('courier:offline', {
                     courierId: socket.courierId, name: socket.courierName, timestamp: new Date().toISOString()
@@ -412,49 +445,54 @@ app.use('/api/v2/platforms', createPlatformsApi(platformRegistry, db));
 
 // ==================== YEMEKSEPETI WEBHOOKS (LEGACY COMPATIBILITY) ====================
 
-app.post('/order/:remoteId', async (req, res) => {
+app.post('/order/:remoteId', authenticateWebhook, async (req, res) => {
     const { remoteId } = req.params;
     const order = req.body;
     const branchId = req.headers['x-branch-id'] || req.query.branchId || process.env.DEFAULT_BRANCH_ID;
 
     console.log('[YemekSepeti] ========== NEW ORDER ==========');
 
-    // Use connector for transformation
-    const connector = platformRegistry.getConnector('yemeksepeti');
-    const transformedOrder = connector ? connector.transformOrder(order, branchId) : order;
-    transformedOrder.RemoteOrderId = `${remoteId}_${order.token}_${Date.now()}`;
+    try {
+        // Use connector for transformation
+        const connector = platformRegistry.getConnector('yemeksepeti');
+        const transformedOrder = connector ? connector.transformOrder(order, branchId) : order;
+        transformedOrder.RemoteOrderId = `${remoteId}_${order.token}_${Date.now()}`;
 
-    // Legacy queue (WPF polling)
-    const orderId = order.token;
-    orders.set(orderId, { order: transformedOrder, status: 'NEW', createdAt: new Date() });
-    console.log('[YemekSepeti] Added to legacy queue');
+        // Legacy queue (WPF polling)
+        const orderId = order.token;
+        orders.set(orderId, { order: transformedOrder, status: 'NEW', createdAt: new Date() });
+        console.log('[YemekSepeti] Added to legacy queue');
 
-    // Firebase direct write
-    const firebaseResult = await writeOrderToFirebaseUnified(transformedOrder, 'yemeksepeti', branchId);
-    if (firebaseResult.success) {
-        // Auto-assign courier
-        if (smartDispatchService && branchId) {
-            const deliveryLocation = {
-                latitude: transformedOrder.Customer?.Address?.Latitude || 0,
-                longitude: transformedOrder.Customer?.Address?.Longitude || 0
-            };
-            const courier = await smartDispatchService.assignBestCourier(branchId, deliveryLocation);
-            if (courier) {
-                await connector?.assignCourier(firebaseResult.orderId, courier.id, courier.name);
-                await notifyCourierNewOrder(courier, transformedOrder, 'YemekSepeti');
+        // Firebase direct write
+        const firebaseResult = await writeOrderToFirebaseUnified(transformedOrder, 'yemeksepeti', branchId);
+        if (firebaseResult.success) {
+            // Auto-assign courier
+            if (smartDispatchService && branchId) {
+                const deliveryLocation = {
+                    latitude: transformedOrder.Customer?.Address?.Latitude || 0,
+                    longitude: transformedOrder.Customer?.Address?.Longitude || 0
+                };
+                const courier = await smartDispatchService.assignBestCourier(branchId, deliveryLocation);
+                if (courier) {
+                    await connector?.assignCourier(firebaseResult.orderId, courier.id, courier.name);
+                    await notifyCourierNewOrder(courier, transformedOrder, 'YemekSepeti');
+                }
             }
         }
+
+        console.log('[YemekSepeti] ============================');
+
+        res.status(200).json({
+            remoteResponse: { remoteOrderId: transformedOrder.RemoteOrderId }
+        });
+    } catch (error) {
+        console.error('[YemekSepeti] Webhook processing error:', error.message);
+        res.status(500).json({ error: 'Internal server error' });
     }
-
-    console.log('[YemekSepeti] ============================');
-
-    res.status(200).json({
-        remoteResponse: { remoteOrderId: transformedOrder.RemoteOrderId }
-    });
 });
 
 // YemekSepeti Status Update
-app.put('/remoteId/:remoteId/remoteOrder/:remoteOrderId/posOrderStatus', async (req, res) => {
+app.put('/remoteId/:remoteId/remoteOrder/:remoteOrderId/posOrderStatus', authenticateWebhook, async (req, res) => {
     const { remoteOrderId } = req.params;
     const statusUpdate = req.body;
 
@@ -483,46 +521,51 @@ app.put('/remoteId/:remoteId/remoteOrder/:remoteOrderId/posOrderStatus', async (
 
 // ==================== GETIRYEMEK WEBHOOKS (LEGACY COMPATIBILITY) ====================
 
-app.post('/webhook/newOrder', async (req, res) => {
+app.post('/webhook/newOrder', authenticateWebhook, async (req, res) => {
     const order = req.body;
     const restaurantSecretKey = req.headers['x-restaurant-secret-key'] || API_KEYS.GETIRYEMEK_DEFAULT_RESTAURANT_SECRET;
     const branchId = req.headers['x-branch-id'] || req.query.branchId || process.env.DEFAULT_BRANCH_ID;
 
     console.log('[GetirYemek] ========== NEW ORDER ==========');
 
-    // Use connector for transformation
-    const connector = platformRegistry.getConnector('getiryemek');
-    const transformedOrder = connector ? connector.transformOrder(order, branchId) : order;
+    try {
+        // Use connector for transformation
+        const connector = platformRegistry.getConnector('getiryemek');
+        const transformedOrder = connector ? connector.transformOrder(order, branchId) : order;
 
-    // Legacy queue
-    const webhookId = Date.now() + '_' + Math.random().toString(36).substr(2, 9);
-    getirYemekWebhooks.push({
-        id: webhookId,
-        type: 'newOrder',
-        data: order,
-        restaurantSecretKey,
-        timestamp: new Date()
-    });
+        // Legacy queue
+        const webhookId = Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+        getirYemekWebhooks.push({
+            id: webhookId,
+            type: 'newOrder',
+            data: order,
+            restaurantSecretKey,
+            timestamp: new Date()
+        });
 
-    // Firebase direct write
-    const firebaseResult = await writeOrderToFirebaseUnified(transformedOrder, 'getiryemek', branchId);
-    if (firebaseResult.success && smartDispatchService && branchId) {
-        const deliveryLocation = {
-            latitude: order.client?.deliveryAddress?.latitude || 0,
-            longitude: order.client?.deliveryAddress?.longitude || 0
-        };
-        const courier = await smartDispatchService.assignBestCourier(branchId, deliveryLocation);
-        if (courier) {
-            await connector?.assignCourier(firebaseResult.orderId, courier.id, courier.name);
-            await notifyCourierNewOrder(courier, transformedOrder, 'GetirYemek');
+        // Firebase direct write
+        const firebaseResult = await writeOrderToFirebaseUnified(transformedOrder, 'getiryemek', branchId);
+        if (firebaseResult.success && smartDispatchService && branchId) {
+            const deliveryLocation = {
+                latitude: order.client?.deliveryAddress?.latitude || 0,
+                longitude: order.client?.deliveryAddress?.longitude || 0
+            };
+            const courier = await smartDispatchService.assignBestCourier(branchId, deliveryLocation);
+            if (courier) {
+                await connector?.assignCourier(firebaseResult.orderId, courier.id, courier.name);
+                await notifyCourierNewOrder(courier, transformedOrder, 'GetirYemek');
+            }
         }
-    }
 
-    console.log('[GetirYemek] ============================');
-    res.status(200).send('OK');
+        console.log('[GetirYemek] ============================');
+        res.status(200).send('OK');
+    } catch (error) {
+        console.error('[GetirYemek] Webhook processing error:', error.message);
+        res.status(500).json({ error: 'Internal server error' });
+    }
 });
 
-app.post('/webhook/cancelOrder', async (req, res) => {
+app.post('/webhook/cancelOrder', authenticateWebhook, async (req, res) => {
     const order = req.body;
     const restaurantSecretKey = req.headers['x-restaurant-secret-key'];
 
@@ -544,7 +587,7 @@ app.post('/webhook/cancelOrder', async (req, res) => {
     res.status(200).send('OK');
 });
 
-app.post('/webhook/courierArrival', (req, res) => {
+app.post('/webhook/courierArrival', authenticateWebhook, (req, res) => {
     const notification = req.body;
     getirYemekWebhooks.push({
         id: Date.now() + '_' + Math.random().toString(36).substr(2, 9),
@@ -556,7 +599,7 @@ app.post('/webhook/courierArrival', (req, res) => {
     res.status(200).send('OK');
 });
 
-app.post('/webhook/restaurantStatus', (req, res) => {
+app.post('/webhook/restaurantStatus', authenticateWebhook, (req, res) => {
     const notification = req.body;
     getirYemekWebhooks.push({
         id: Date.now() + '_' + Math.random().toString(36).substr(2, 9),
@@ -570,30 +613,35 @@ app.post('/webhook/restaurantStatus', (req, res) => {
 
 // ==================== TRENDYOLGO WEBHOOKS ====================
 
-app.post('/webhook/trendyolgo/order', async (req, res) => {
+app.post('/webhook/trendyolgo/order', authenticateWebhook, async (req, res) => {
     const order = req.body;
     const branchId = req.headers['x-branch-id'] || req.query.branchId || process.env.DEFAULT_BRANCH_ID;
 
     console.log('[TrendyolGo] ========== NEW ORDER ==========');
 
-    const connector = platformRegistry.getConnector('trendyolgo');
-    const transformedOrder = connector ? connector.transformOrder(order, branchId) : order;
+    try {
+        const connector = platformRegistry.getConnector('trendyolgo');
+        const transformedOrder = connector ? connector.transformOrder(order, branchId) : order;
 
-    const firebaseResult = await writeOrderToFirebaseUnified(transformedOrder, 'trendyolgo', branchId);
-    if (firebaseResult.success && smartDispatchService && branchId) {
-        const deliveryLocation = {
-            latitude: order.latitude || 0,
-            longitude: order.longitude || 0
-        };
-        const courier = await smartDispatchService.assignBestCourier(branchId, deliveryLocation);
-        if (courier) {
-            await connector?.assignCourier(firebaseResult.orderId, courier.id, courier.name);
-            await notifyCourierNewOrder(courier, transformedOrder, 'TrendyolGo');
+        const firebaseResult = await writeOrderToFirebaseUnified(transformedOrder, 'trendyolgo', branchId);
+        if (firebaseResult.success && smartDispatchService && branchId) {
+            const deliveryLocation = {
+                latitude: order.latitude || 0,
+                longitude: order.longitude || 0
+            };
+            const courier = await smartDispatchService.assignBestCourier(branchId, deliveryLocation);
+            if (courier) {
+                await connector?.assignCourier(firebaseResult.orderId, courier.id, courier.name);
+                await notifyCourierNewOrder(courier, transformedOrder, 'TrendyolGo');
+            }
         }
-    }
 
-    console.log('[TrendyolGo] ============================');
-    res.status(200).json({ success: true });
+        console.log('[TrendyolGo] ============================');
+        res.status(200).json({ success: true });
+    } catch (error) {
+        console.error('[TrendyolGo] Webhook processing error:', error.message);
+        res.status(500).json({ error: 'Internal server error' });
+    }
 });
 
 // ==================== LEGACY POLLING ENDPOINTS ====================
@@ -793,13 +841,22 @@ function cleanupOldOrders() {
         }
     }
 
+    // Stale courier locations (30 min no update = stale)
+    const thirtyMinAgo = new Date(Date.now() - 30 * 60 * 1000);
+    for (const [courierId, loc] of courierLocations.entries()) {
+        if (new Date(loc.timestamp) < thirtyMinAgo) {
+            courierLocations.delete(courierId);
+            deleted++;
+        }
+    }
+
     if (deleted > 0) {
         console.log(`[Cleanup] Deleted ${deleted} old items`);
     }
 }
 
-setInterval(cleanupOldOrders, 60 * 60 * 1000);
-setTimeout(cleanupOldOrders, 5000);
+setInterval(cleanupOldOrders, 15 * 60 * 1000); // 15 dakikada bir
+setTimeout(cleanupOldOrders, 30000);
 
 // ==================== SERVER START ====================
 

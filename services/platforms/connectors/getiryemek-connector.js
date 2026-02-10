@@ -5,6 +5,8 @@
 const BasePlatformConnector = require('../base-connector');
 const axios = require('axios');
 
+const API_TIMEOUT = 10000; // 10 seconds
+
 class GetirYemekConnector extends BasePlatformConnector {
     constructor(db, registry) {
         super('getiryemek', db, registry);
@@ -123,7 +125,8 @@ class GetirYemekConnector extends BasePlatformConnector {
                     headers: {
                         'Content-Type': 'application/json',
                         'x-restaurant-secret-key': restaurantSecret
-                    }
+                    },
+                    timeout: API_TIMEOUT
                 }
             );
 
@@ -163,7 +166,8 @@ class GetirYemekConnector extends BasePlatformConnector {
                     headers: {
                         'Content-Type': 'application/json',
                         'x-restaurant-secret-key': restaurantSecret
-                    }
+                    },
+                    timeout: API_TIMEOUT
                 }
             );
 
@@ -192,7 +196,8 @@ class GetirYemekConnector extends BasePlatformConnector {
                     headers: {
                         'Content-Type': 'application/json',
                         'x-restaurant-secret-key': restaurantSecret
-                    }
+                    },
+                    timeout: API_TIMEOUT
                 }
             );
 
@@ -237,7 +242,8 @@ class GetirYemekConnector extends BasePlatformConnector {
                     headers: {
                         'Content-Type': 'application/json',
                         'x-restaurant-secret-key': restaurantSecret
-                    }
+                    },
+                    timeout: API_TIMEOUT
                 }
             );
 
