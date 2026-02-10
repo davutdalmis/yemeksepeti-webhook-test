@@ -24,6 +24,7 @@ const GetirYemekConnector = require('./services/platforms/connectors/getiryemek-
 const TrendyolGoConnector = require('./services/platforms/connectors/trendyolgo-connector');
 const createOrdersApi = require('./services/api/orders-api');
 const createPlatformsApi = require('./services/api/platforms-api');
+const GoogleMapsDistanceService = require('./services/google-maps-distance');
 
 const app = express();
 const server = http.createServer(app);
@@ -147,6 +148,7 @@ class SmartDispatchService {
     constructor(db, registry) {
         this.db = db;
         this.registry = registry;
+        this.googleMaps = new GoogleMapsDistanceService();
     }
 
     async getBranchLocation(branchId) {
@@ -218,10 +220,18 @@ class SmartDispatchService {
         }
     }
 
-    calculateCourierScore(courier, deliveryLocation, branchLocation) {
+    calculateCourierScore(courier, deliveryLocation, branchLocation, distanceInfo) {
         let score = 0;
 
-        if (courier.latitude && courier.longitude && deliveryLocation.latitude && deliveryLocation.longitude) {
+        // Gerçek mesafe/süre verisi varsa kullan
+        if (distanceInfo && distanceInfo.isSuccess && !distanceInfo.isFallback) {
+            score += distanceInfo.distanceMeters / 100;
+
+            // 10dk altında süre bonusu → %20 skor indirimi
+            if (distanceInfo.durationMinutes < 10) {
+                score *= 0.8;
+            }
+        } else if (courier.latitude && courier.longitude && deliveryLocation.latitude && deliveryLocation.longitude) {
             const distanceToDelivery = geolib.getDistance(
                 { latitude: courier.latitude, longitude: courier.longitude },
                 { latitude: deliveryLocation.latitude, longitude: deliveryLocation.longitude }
@@ -252,19 +262,41 @@ class SmartDispatchService {
 
             const branchLocation = await this.getBranchLocation(branchId);
 
+            // Google Maps mesafe verilerini al (paralel)
+            let deliveryDistances = null;
+            try {
+                const destination = {
+                    latitude: deliveryLocation?.latitude || 0,
+                    longitude: deliveryLocation?.longitude || 0
+                };
+                const distResult = await this.googleMaps.getBatchDistances(couriers, destination);
+                deliveryDistances = distResult.results;
+
+                if (distResult.fallbackCount === 0) {
+                    console.log('[SmartDispatch] Google Maps verileri alındı (tüm kuryeler API)');
+                } else {
+                    console.log(`[SmartDispatch] Google Maps: ${distResult.fallbackCount} fallback`);
+                }
+            } catch (gmError) {
+                console.warn('[SmartDispatch] Google Maps hata, geolib kullanılacak:', gmError.message);
+            }
+
             const scoredCouriers = await Promise.all(
                 couriers.map(async (courier) => {
                     const activeOrders = await this.getActiveOrderCount(courier.id);
                     courier.activeOrderCount = activeOrders;
-                    const score = this.calculateCourierScore(courier, deliveryLocation, branchLocation);
-                    return { courier, score };
+
+                    const distanceInfo = deliveryDistances ? deliveryDistances.get(courier.id) : null;
+                    const score = this.calculateCourierScore(courier, deliveryLocation, branchLocation, distanceInfo);
+
+                    return { courier, score, source: distanceInfo?.source || 'geolib' };
                 })
             );
 
             scoredCouriers.sort((a, b) => a.score - b.score);
             const bestMatch = scoredCouriers[0];
 
-            console.log(`[SmartDispatch] Best courier: ${bestMatch.courier.name} (score: ${bestMatch.score.toFixed(0)})`);
+            console.log(`[SmartDispatch] Best courier: ${bestMatch.courier.name} (score: ${bestMatch.score.toFixed(0)}, source: ${bestMatch.source})`);
             return bestMatch.courier;
         } catch (error) {
             console.error('[SmartDispatch] Assignment error:', error.message);
