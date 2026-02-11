@@ -4,7 +4,7 @@
 
 const express = require('express');
 
-function createOrdersApi(registry, smartDispatch) {
+function createOrdersApi(registry, smartDispatch, { sendPushNotification, notifyCourierNewOrder } = {}) {
     const router = express.Router();
 
     // API Key authentication middleware
@@ -37,10 +37,12 @@ function createOrdersApi(registry, smartDispatch) {
 
     /**
      * POST /api/orders/:platformId/:orderId/accept
-     * Sipariş kabul et
+     * Sipariş kabul et + otomatik kurye ata
+     * Body: { autoAssign: true } (opsiyonel, default: true)
      */
     router.post('/:platformId/:orderId/accept', async (req, res) => {
         const { platformId, orderId } = req.params;
+        const { autoAssign = true } = req.body || {};
         const branchId = req.branchId;
 
         try {
@@ -56,21 +58,72 @@ function createOrdersApi(registry, smartDispatch) {
             const branchConfig = registry.getBranchPlatformConfig(branchId, platformId) || {};
             const result = await connector.acceptOrder(orderId, branchConfig);
 
-            if (result.success) {
-                console.log(`[OrdersAPI] Order accepted: ${platformId}/${orderId}`);
-                res.json({
-                    success: true,
-                    orderId,
-                    platform: platformId,
-                    status: 'ACCEPTED'
-                });
-            } else {
-                res.status(400).json({
+            if (!result.success) {
+                return res.status(400).json({
                     success: false,
                     error: result.reason,
                     code: 'ACCEPT_FAILED'
                 });
             }
+
+            console.log(`[OrdersAPI] Order accepted: ${platformId}/${orderId}`);
+
+            // Auto-assign courier after successful accept
+            let courierInfo = null;
+            if (autoAssign !== false && smartDispatch && branchId) {
+                try {
+                    const order = await connector.getOrder(orderId);
+                    if (order) {
+                        // Extract delivery coordinates (platform-agnostic)
+                        const deliveryLocation = {
+                            latitude: order.Customer?.Address?.Latitude ||
+                                      order.Latitude ||
+                                      order.deliveryLatitude || 0,
+                            longitude: order.Customer?.Address?.Longitude ||
+                                       order.Longitude ||
+                                       order.deliveryLongitude || 0
+                        };
+
+                        const courier = await smartDispatch.assignBestCourier(branchId, deliveryLocation);
+                        if (courier) {
+                            const assignResult = await connector.assignCourier(orderId, courier.id, courier.name);
+                            if (assignResult.success) {
+                                courierInfo = {
+                                    courierId: courier.id,
+                                    courierName: courier.name
+                                };
+
+                                // Send push notification to courier
+                                if (notifyCourierNewOrder) {
+                                    await notifyCourierNewOrder(courier, order, platformId);
+                                }
+
+                                console.log(`[OrdersAPI] Auto-assigned courier: ${courier.name} -> ${platformId}/${orderId}`);
+                            }
+                        } else {
+                            console.log(`[OrdersAPI] No courier available for auto-assign: ${platformId}/${orderId}`);
+                        }
+                    }
+                } catch (assignError) {
+                    // Non-fatal: order is accepted even if courier assignment fails
+                    console.warn(`[OrdersAPI] Auto-assign failed for ${platformId}/${orderId}:`, assignError.message);
+                }
+            }
+
+            const response = {
+                success: true,
+                orderId,
+                platform: platformId,
+                status: 'ACCEPTED'
+            };
+
+            if (courierInfo) {
+                response.courierId = courierInfo.courierId;
+                response.courierName = courierInfo.courierName;
+                response.autoAssigned = true;
+            }
+
+            res.json(response);
         } catch (error) {
             console.error(`[OrdersAPI] Accept error:`, error.message);
             res.status(500).json({

@@ -7,17 +7,21 @@
     "start": "node server-v4.js",
     "start:legacy": "node server.js",
     "dev": "node server-v4.js",
-    "dev:legacy": "node server.js"
+    "dev:legacy": "node server.js",
+    "test": "jest --verbose"
   },
   "dependencies": {
     "axios": "^1.6.0",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
     "firebase-admin": "^12.0.0",
-    "socket.io": "^4.7.2",
-    "geolib": "^3.3.4"
+    "geolib": "^3.3.4",
+    "socket.io": "^4.7.2"
   },
   "engines": {
     "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0"
   }
 }

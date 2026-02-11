@@ -144,11 +144,39 @@ async function initializePlatformHub() {
 }
 
 // ==================== SMART DISPATCH SERVICE ====================
+// 5-factor weighted scoring matching WPF CourierScoreCalculator
+// Weights: distanceToBranch=0.25, availability=0.25, workload=0.20, deliveryProximity=0.15, performance=0.15
 class SmartDispatchService {
     constructor(db, registry) {
         this.db = db;
         this.registry = registry;
         this.googleMaps = new GoogleMapsDistanceService();
+
+        // [FIX-2] Assignment tracking: counter-based, supports multiple assignments per courier
+        // Key: courierId, Value: number (pending assignment count within TTL window)
+        this.pendingAssignments = new Map();
+
+        // [FIX-3] Mutex: serializes assignBestCourier calls to prevent race conditions
+        this._assignmentQueue = Promise.resolve();
+
+        // Scoring weights (matching WPF DispatchWeights defaults)
+        this.weights = {
+            distanceToBranch: 0.25,
+            availability: 0.25,
+            workload: 0.20,
+            deliveryProximity: 0.15,
+            performance: 0.15
+        };
+
+        // Constants
+        this.MAX_DISTANCE_KM = 10.0;
+        this.MAX_AVAILABILITY_MINUTES = 60.0;
+        this.MAX_ACTIVE_ORDERS = 5;
+        this.MAX_RATING = 5.0;
+        this.ASSIGNMENT_TRACKING_TTL_MS = 60 * 1000; // 60 seconds
+
+        // [FIX-4] Tie-breaker threshold: 5 points (covers typical location differences)
+        this.TIE_BREAKER_THRESHOLD = 5.0;
     }
 
     async getBranchLocation(branchId) {
@@ -180,19 +208,23 @@ class SmartDispatchService {
                 .where('isActive', '==', true)
                 .get();
 
-            return couriersSnapshot.docs.map(doc => {
-                const data = doc.data();
-                return {
-                    id: doc.id,
-                    name: data.name || data.fullName || '',
-                    phone: data.phone || '',
-                    latitude: data.latitude || data.currentLatitude || 0,
-                    longitude: data.longitude || data.currentLongitude || 0,
-                    activeOrderCount: data.activeOrderCount || 0,
-                    dailyDeliveryCount: data.dailyDeliveryCount || 0,
-                    fcmToken: data.fcmToken || null
-                };
-            });
+            return couriersSnapshot.docs
+                .map(doc => {
+                    const data = doc.data();
+                    return {
+                        id: doc.id,
+                        name: data.name || data.fullName || '',
+                        phone: data.phone || '',
+                        latitude: data.latitude || data.currentLatitude || 0,
+                        longitude: data.longitude || data.currentLongitude || 0,
+                        activeOrderCount: data.activeOrderCount || 0,
+                        dailyDeliveryCount: data.dailyDeliveryCount || data.totalDeliveriesToday || 0,
+                        rating: data.rating || 0,
+                        isApproved: data.isApproved !== undefined ? data.isApproved : true,
+                        fcmToken: data.fcmToken || null
+                    };
+                })
+                .filter(c => c.isApproved); // Only approved couriers
         } catch (error) {
             console.error('[SmartDispatch] Get couriers error:', error.message);
             return [];
@@ -200,54 +232,237 @@ class SmartDispatchService {
     }
 
     async getActiveOrderCount(courierId) {
-        if (!this.db) return 0;
+        if (!this.db) return this._getPendingCount(courierId);
 
         try {
             const platforms = ['yemekSepetiOrders', 'getirYemekOrders', 'trendyolGoOrders'];
             let totalActive = 0;
 
+            // [FIX-1] Include 'NEW' and 'PREPARING' statuses — orders assigned during
+            // webhook flow keep Status:'NEW', accept flow keeps Status:'ACCEPTED'
             for (const platform of platforms) {
                 const ordersSnapshot = await this.db.collectionGroup(platform)
                     .where('assignedCourierId', '==', courierId)
-                    .where('Status', 'in', ['ASSIGNED', 'ACCEPTED', 'PICKED_UP', 'ON_THE_WAY'])
+                    .where('Status', 'in', ['NEW', 'PREPARING', 'ASSIGNED', 'ACCEPTED', 'PICKED_UP', 'ON_THE_WAY'])
                     .get();
                 totalActive += ordersSnapshot.size;
             }
 
+            // [FIX-2] Add ALL pending assignments not yet reflected in Firestore
+            totalActive += this._getPendingCount(courierId);
+
             return totalActive;
         } catch (error) {
-            return 0;
+            // On error, still return pending count as best-effort
+            return this._getPendingCount(courierId);
         }
     }
 
-    calculateCourierScore(courier, deliveryLocation, branchLocation, distanceInfo) {
-        let score = 0;
+    // ==================== 5-FACTOR SCORING ====================
 
-        // Gerçek mesafe/süre verisi varsa kullan
-        if (distanceInfo && distanceInfo.isSuccess && !distanceInfo.isFallback) {
-            score += distanceInfo.distanceMeters / 100;
+    /**
+     * Distance to branch score (0-100, low = close = good)
+     */
+    _calcDistanceToBranchScore(courier, branchLocation, branchDistanceInfo) {
+        // Real Google Maps data available
+        if (branchDistanceInfo && branchDistanceInfo.isSuccess && !branchDistanceInfo.isFallback) {
+            return this._calcDistanceScoreFromReal(branchDistanceInfo.distanceKm);
+        }
 
-            // 10dk altında süre bonusu → %20 skor indirimi
-            if (distanceInfo.durationMinutes < 10) {
-                score *= 0.8;
+        // Haversine fallback
+        if (this._isValidCoordinate(courier.latitude, courier.longitude) &&
+            branchLocation && this._isValidCoordinate(branchLocation.latitude, branchLocation.longitude)) {
+            const distanceMeters = geolib.getDistance(
+                { latitude: courier.latitude, longitude: courier.longitude },
+                { latitude: branchLocation.latitude, longitude: branchLocation.longitude }
+            );
+            const distanceKm = distanceMeters / 1000;
+            let normalized = Math.min(distanceKm / this.MAX_DISTANCE_KM, 1.0) * 100;
+            if (distanceKm < 0.5) normalized *= 0.5; // Near-branch bonus
+            return normalized;
+        }
+
+        return 100; // No location = worst score
+    }
+
+    /**
+     * Real road distance to score (0-100)
+     */
+    _calcDistanceScoreFromReal(distanceKm) {
+        if (distanceKm <= 0) return 0;
+        let normalized = Math.min(distanceKm / this.MAX_DISTANCE_KM, 1.0) * 100;
+        if (distanceKm < 0.5) normalized *= 0.5; // 500m bonus
+        return normalized;
+    }
+
+    /**
+     * Availability score (0-100, low = available soon = good)
+     */
+    _calcAvailabilityScore(courier, branchLocation, branchDistanceInfo) {
+        if (courier.activeOrderCount === 0) {
+            // Free courier - score based on return time to branch
+            if (branchDistanceInfo && branchDistanceInfo.isSuccess && !branchDistanceInfo.isFallback) {
+                // Real return time: if under 10 min, great
+                if (branchDistanceInfo.durationMinutes <= 10) return 0;
+                const lateMinutes = branchDistanceInfo.durationMinutes - 10;
+                return Math.min(lateMinutes / 10 * 100, 100);
             }
-        } else if (courier.latitude && courier.longitude && deliveryLocation.latitude && deliveryLocation.longitude) {
-            const distanceToDelivery = geolib.getDistance(
+
+            // Haversine estimate
+            if (this._isValidCoordinate(courier.latitude, courier.longitude) &&
+                branchLocation && this._isValidCoordinate(branchLocation.latitude, branchLocation.longitude)) {
+                const distanceMeters = geolib.getDistance(
+                    { latitude: courier.latitude, longitude: courier.longitude },
+                    { latitude: branchLocation.latitude, longitude: branchLocation.longitude }
+                );
+                const estimatedMinutes = Math.max(2, (distanceMeters / 1000 / 25) * 60); // 25 km/h motorcycle
+                if (estimatedMinutes <= 10) return 0;
+                return Math.min((estimatedMinutes - 10) / 10 * 100, 100);
+            }
+
+            return 0; // Free and no location data - assume available
+        }
+
+        // Busy courier: each active order ~15 min
+        const estimatedBusyMinutes = courier.activeOrderCount * 15;
+        return Math.min(estimatedBusyMinutes / this.MAX_AVAILABILITY_MINUTES, 1.0) * 100;
+    }
+
+    /**
+     * Workload score (0-100, low = light workload = good)
+     */
+    _calcWorkloadScore(activeOrderCount) {
+        if (activeOrderCount === 0) return 0;
+        return Math.min(activeOrderCount / this.MAX_ACTIVE_ORDERS, 1.0) * 100;
+    }
+
+    /**
+     * Delivery proximity score (0-100, low = close to delivery = good)
+     */
+    _calcDeliveryProximityScore(courier, deliveryLocation, deliveryDistanceInfo) {
+        // Real Google Maps data
+        if (deliveryDistanceInfo && deliveryDistanceInfo.isSuccess && !deliveryDistanceInfo.isFallback) {
+            return this._calcDistanceScoreFromReal(deliveryDistanceInfo.distanceKm);
+        }
+
+        // Haversine fallback
+        if (this._isValidCoordinate(courier.latitude, courier.longitude) &&
+            this._isValidCoordinate(deliveryLocation?.latitude, deliveryLocation?.longitude)) {
+            const distanceMeters = geolib.getDistance(
                 { latitude: courier.latitude, longitude: courier.longitude },
                 { latitude: deliveryLocation.latitude, longitude: deliveryLocation.longitude }
             );
-            score += distanceToDelivery / 100;
-        } else if (branchLocation && branchLocation.latitude && branchLocation.longitude) {
-            score += 500;
+            const distanceKm = distanceMeters / 1000;
+            if (distanceKm <= 5) return (distanceKm / 5) * 50;
+            return 50 + Math.min((distanceKm - 5) / 10, 0.5) * 100;
         }
 
-        score += (courier.activeOrderCount || 0) * 200;
-        score += (courier.dailyDeliveryCount || 0) * 10;
-
-        return score;
+        return 50; // Neutral
     }
 
-    async assignBestCourier(branchId, deliveryLocation) {
+    /**
+     * Performance score (0-100, HIGH = good performance)
+     * Uses rating + daily delivery fatigue factor
+     */
+    _calcPerformanceScore(courier) {
+        // Rating component (0-50)
+        const ratingScore = (Math.min(courier.rating || 0, this.MAX_RATING) / this.MAX_RATING) * 50;
+
+        // Daily delivery fatigue (0-50)
+        const deliveriesToday = courier.dailyDeliveryCount || 0;
+        let deliveryScore;
+        if (deliveriesToday <= 5) deliveryScore = 50;       // Optimal
+        else if (deliveriesToday <= 10) deliveryScore = 40;  // Good
+        else if (deliveriesToday <= 15) deliveryScore = 30;  // Getting tired
+        else deliveryScore = 20;                              // Very tired
+
+        return ratingScore + deliveryScore;
+    }
+
+    /**
+     * Calculate full weighted score for a courier
+     * Lower total = better courier match
+     */
+    calculateCourierScore(courier, deliveryLocation, branchLocation, deliveryDistanceInfo, branchDistanceInfo) {
+        const distanceToBranchScore = this._calcDistanceToBranchScore(courier, branchLocation, branchDistanceInfo);
+        const availabilityScore = this._calcAvailabilityScore(courier, branchLocation, branchDistanceInfo);
+        const workloadScore = this._calcWorkloadScore(courier.activeOrderCount);
+        const deliveryProximityScore = this._calcDeliveryProximityScore(courier, deliveryLocation, deliveryDistanceInfo);
+        const performanceScore = this._calcPerformanceScore(courier);
+
+        const totalScore =
+            (distanceToBranchScore * this.weights.distanceToBranch) +
+            (availabilityScore * this.weights.availability) +
+            (workloadScore * this.weights.workload) +
+            (deliveryProximityScore * this.weights.deliveryProximity) +
+            ((100 - performanceScore) * this.weights.performance); // Performance inverted
+
+        return {
+            totalScore,
+            details: {
+                distanceToBranch: distanceToBranchScore,
+                availability: availabilityScore,
+                workload: workloadScore,
+                deliveryProximity: deliveryProximityScore,
+                performance: performanceScore
+            }
+        };
+    }
+
+    _isValidCoordinate(lat, lon) {
+        return lat && lon && lat !== 0 && lon !== 0 &&
+            lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180;
+    }
+
+    // ==================== ASSIGNMENT TRACKING (FIX-2) ====================
+
+    /**
+     * Get pending (not yet in Firestore) assignment count for a courier
+     */
+    _getPendingCount(courierId) {
+        return this.pendingAssignments.get(courierId) || 0;
+    }
+
+    /**
+     * Track a new assignment — increments counter, auto-decrements after TTL
+     */
+    _trackAssignment(courierId) {
+        const current = this.pendingAssignments.get(courierId) || 0;
+        this.pendingAssignments.set(courierId, current + 1);
+
+        // Auto-decrement after TTL (Firestore should have caught up by then)
+        setTimeout(() => {
+            const count = this.pendingAssignments.get(courierId) || 0;
+            if (count <= 1) {
+                this.pendingAssignments.delete(courierId);
+            } else {
+                this.pendingAssignments.set(courierId, count - 1);
+            }
+        }, this.ASSIGNMENT_TRACKING_TTL_MS);
+    }
+
+    // ==================== MUTEX (FIX-3) ====================
+
+    /**
+     * Serializes assignBestCourier calls so concurrent requests
+     * don't read the same stale Firestore state
+     */
+    _enqueue(fn) {
+        const result = this._assignmentQueue.then(fn, fn);
+        this._assignmentQueue = result.catch(() => {}); // prevent unhandled rejection chain
+        return result;
+    }
+
+    // ==================== MAIN ASSIGNMENT ====================
+
+    /**
+     * Public entry: queued to prevent race conditions between concurrent calls
+     */
+    assignBestCourier(branchId, deliveryLocation) {
+        return this._enqueue(() => this._assignBestCourierInternal(branchId, deliveryLocation));
+    }
+
+    async _assignBestCourierInternal(branchId, deliveryLocation) {
         if (!this.db) {
             console.log('[SmartDispatch] Firebase disabled - skipping auto-assignment');
             return null;
@@ -262,23 +477,33 @@ class SmartDispatchService {
 
             const branchLocation = await this.getBranchLocation(branchId);
 
-            // Google Maps mesafe verilerini al (paralel)
+            // Google Maps distances (parallel: to delivery + to branch)
             let deliveryDistances = null;
+            let branchDistances = null;
+
             try {
-                const destination = {
+                const deliveryDest = {
                     latitude: deliveryLocation?.latitude || 0,
                     longitude: deliveryLocation?.longitude || 0
                 };
-                const distResult = await this.googleMaps.getBatchDistances(couriers, destination);
-                deliveryDistances = distResult.results;
+                const branchDest = branchLocation || { latitude: 0, longitude: 0 };
 
-                if (distResult.fallbackCount === 0) {
-                    console.log('[SmartDispatch] Google Maps verileri alındı (tüm kuryeler API)');
+                const [deliveryResult, branchResult] = await Promise.all([
+                    this.googleMaps.getBatchDistances(couriers, deliveryDest),
+                    branchLocation ? this.googleMaps.getBatchDistances(couriers, branchDest) : Promise.resolve(null)
+                ]);
+
+                deliveryDistances = deliveryResult.results;
+                branchDistances = branchResult?.results || null;
+
+                const totalFallback = deliveryResult.fallbackCount + (branchResult?.fallbackCount || 0);
+                if (totalFallback === 0) {
+                    console.log('[SmartDispatch] Google Maps: all couriers resolved via API');
                 } else {
-                    console.log(`[SmartDispatch] Google Maps: ${distResult.fallbackCount} fallback`);
+                    console.log(`[SmartDispatch] Google Maps: ${totalFallback} fallback(s)`);
                 }
             } catch (gmError) {
-                console.warn('[SmartDispatch] Google Maps hata, geolib kullanılacak:', gmError.message);
+                console.warn('[SmartDispatch] Google Maps error, using geolib fallback:', gmError.message);
             }
 
             const scoredCouriers = await Promise.all(
@@ -286,17 +511,39 @@ class SmartDispatchService {
                     const activeOrders = await this.getActiveOrderCount(courier.id);
                     courier.activeOrderCount = activeOrders;
 
-                    const distanceInfo = deliveryDistances ? deliveryDistances.get(courier.id) : null;
-                    const score = this.calculateCourierScore(courier, deliveryLocation, branchLocation, distanceInfo);
+                    const deliveryDistInfo = deliveryDistances ? deliveryDistances.get(courier.id) : null;
+                    const branchDistInfo = branchDistances ? branchDistances.get(courier.id) : null;
 
-                    return { courier, score, source: distanceInfo?.source || 'geolib' };
+                    const { totalScore, details } = this.calculateCourierScore(
+                        courier, deliveryLocation, branchLocation, deliveryDistInfo, branchDistInfo
+                    );
+
+                    return { courier, score: totalScore, details, source: deliveryDistInfo?.source || 'geolib' };
                 })
             );
 
-            scoredCouriers.sort((a, b) => a.score - b.score);
+            // [FIX-4] Sort by score, wide tie-breaker threshold (5 points)
+            scoredCouriers.sort((a, b) => {
+                const diff = a.score - b.score;
+                if (Math.abs(diff) < this.TIE_BREAKER_THRESHOLD) return Math.random() - 0.5;
+                return diff;
+            });
+
             const bestMatch = scoredCouriers[0];
 
-            console.log(`[SmartDispatch] Best courier: ${bestMatch.courier.name} (score: ${bestMatch.score.toFixed(0)}, source: ${bestMatch.source})`);
+            console.log(`[SmartDispatch] Best courier: ${bestMatch.courier.name} (score: ${bestMatch.score.toFixed(1)}, ` +
+                `D:${bestMatch.details.distanceToBranch.toFixed(0)} A:${bestMatch.details.availability.toFixed(0)} ` +
+                `W:${bestMatch.details.workload.toFixed(0)} P:${bestMatch.details.deliveryProximity.toFixed(0)} ` +
+                `R:${bestMatch.details.performance.toFixed(0)}, source: ${bestMatch.source})`);
+
+            if (scoredCouriers.length > 1) {
+                const runner = scoredCouriers[1];
+                console.log(`[SmartDispatch] Runner-up: ${runner.courier.name} (score: ${runner.score.toFixed(1)})`);
+            }
+
+            // [FIX-2] Track assignment with counter (not single entry)
+            this._trackAssignment(bestMatch.courier.id);
+
             return bestMatch.courier;
         } catch (error) {
             console.error('[SmartDispatch] Assignment error:', error.message);
@@ -496,7 +743,10 @@ app.use('/api/v2/orders', (req, res, next) => {
     // Initialize smartDispatch for API
     req.smartDispatch = smartDispatchService;
     next();
-}, createOrdersApi(platformRegistry, smartDispatchService));
+}, createOrdersApi(platformRegistry, smartDispatchService, {
+    sendPushNotification,
+    notifyCourierNewOrder
+}));
 
 app.use('/api/v2/platforms', createPlatformsApi(platformRegistry, db));
 

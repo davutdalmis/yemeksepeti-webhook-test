@@ -155,6 +155,7 @@ class BasePlatformConnector {
     }
 
     // Siparişe kurye ata (status değiştirmez - mevcut status korunur)
+    // Atomically increments courier's activeOrderCount
     async assignCourier(orderId, courierId, courierName) {
         if (!this.db) return { success: false, reason: 'firebase_disabled' };
 
@@ -173,7 +174,26 @@ class BasePlatformConnector {
                 assignedAt: admin.firestore.FieldValue.serverTimestamp()
             };
 
+            // Update order document(s)
             await Promise.all(ordersSnapshot.docs.map(doc => doc.ref.update(updateData)));
+
+            // Atomically increment courier's activeOrderCount
+            try {
+                const courierQuery = await this.db.collectionGroup('couriers')
+                    .where(admin.firestore.FieldPath.documentId(), '==', courierId)
+                    .limit(1)
+                    .get();
+
+                if (!courierQuery.empty) {
+                    await courierQuery.docs[0].ref.update({
+                        activeOrderCount: admin.firestore.FieldValue.increment(1)
+                    });
+                    console.log(`[${this.platformId}] Courier activeOrderCount incremented: ${courierName}`);
+                }
+            } catch (counterError) {
+                // Non-fatal: order is still assigned even if counter update fails
+                console.warn(`[${this.platformId}] Failed to increment activeOrderCount for ${courierName}:`, counterError.message);
+            }
 
             console.log(`[${this.platformId}] Courier assigned: ${courierName} -> ${orderId}`);
             return { success: true, orderId };
