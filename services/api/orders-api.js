@@ -322,11 +322,14 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
 
     /**
      * POST /api/orders/:platformId/:orderId/assign-courier
-     * Siparişe kurye ata
+     * Siparişe kurye ata (WPF'den fire-and-forget olarak çağrılır)
+     * Body: { courierId, courierName } (manuel atama) veya
+     *       { deliveryLatitude, deliveryLongitude } (otomatik atama - opsiyonel, yoksa Firebase'den okur)
+     * autoAssign default true - body'de courierId yoksa otomatik atar
      */
     router.post('/:platformId/:orderId/assign-courier', async (req, res) => {
         const { platformId, orderId } = req.params;
-        const { courierId, courierName, autoAssign } = req.body;
+        const { courierId, courierName, autoAssign, deliveryLatitude, deliveryLongitude } = req.body || {};
         const branchId = req.branchId;
 
         try {
@@ -342,14 +345,33 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
             let assignedCourierId = courierId;
             let assignedCourierName = courierName;
 
-            // Auto-assign using smart dispatch
-            if (autoAssign && smartDispatch) {
-                const order = await connector.getOrder(orderId);
-                if (order) {
-                    const deliveryLocation = {
-                        latitude: order.Customer?.Address?.Latitude || order.Latitude || 0,
-                        longitude: order.Customer?.Address?.Longitude || order.Longitude || 0
+            // Auto-assign using smart dispatch (default: true when no courierId provided)
+            const shouldAutoAssign = !assignedCourierId && (autoAssign !== false) && smartDispatch && branchId;
+            if (shouldAutoAssign) {
+                // Use coordinates from request body first, then fall back to order data
+                let deliveryLocation = null;
+
+                if (deliveryLatitude && deliveryLongitude) {
+                    deliveryLocation = {
+                        latitude: deliveryLatitude,
+                        longitude: deliveryLongitude
                     };
+                } else {
+                    // Fall back to reading order from connector
+                    const order = await connector.getOrder(orderId);
+                    if (order) {
+                        deliveryLocation = {
+                            latitude: order.Customer?.Address?.Latitude ||
+                                      order.Latitude ||
+                                      order.deliveryLatitude || 0,
+                            longitude: order.Customer?.Address?.Longitude ||
+                                       order.Longitude ||
+                                       order.deliveryLongitude || 0
+                        };
+                    }
+                }
+
+                if (deliveryLocation) {
                     const bestCourier = await smartDispatch.assignBestCourier(branchId, deliveryLocation);
                     if (bestCourier) {
                         assignedCourierId = bestCourier.id;
@@ -370,6 +392,20 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
 
             if (result.success) {
                 console.log(`[OrdersAPI] Courier assigned: ${platformId}/${orderId} -> ${assignedCourierName}`);
+
+                // Send push notification to assigned courier
+                if (notifyCourierNewOrder) {
+                    try {
+                        const order = await connector.getOrder(orderId);
+                        if (order) {
+                            await notifyCourierNewOrder({ id: assignedCourierId, name: assignedCourierName }, order, platformId);
+                            console.log(`[OrdersAPI] Push notification sent to courier: ${assignedCourierName}`);
+                        }
+                    } catch (notifError) {
+                        console.warn(`[OrdersAPI] Push notification failed for ${assignedCourierName}:`, notifError.message);
+                    }
+                }
+
                 res.json({
                     success: true,
                     orderId,
