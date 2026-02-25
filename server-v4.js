@@ -758,17 +758,36 @@ app.post('/order/:remoteId', authenticateWebhook, async (req, res) => {
     const branchId = req.headers['x-branch-id'] || req.query.branchId || process.env.DEFAULT_BRANCH_ID;
 
     console.log('[YemekSepeti] ========== NEW ORDER ==========');
+    console.log('[YemekSepeti] Remote ID:', remoteId);
+    console.log('[YemekSepeti] Raw order keys:', Object.keys(order));
+    console.log('[YemekSepeti] Raw order.token:', order.token);
+    console.log('[YemekSepeti] Raw order.code:', order.code);
+    console.log('[YemekSepeti] Raw order.products count:', order.products?.length || 0);
+    console.log('[YemekSepeti] Raw order.customer:', order.customer ? `${order.customer.firstName} ${order.customer.lastName}` : 'NULL');
+    console.log('[YemekSepeti] Raw order.price:', JSON.stringify(order.price));
+    console.log('[YemekSepeti] Raw payload (first 2000 chars):', JSON.stringify(order).substring(0, 2000));
 
     try {
         // Use connector for transformation
         const connector = platformRegistry.getConnector('yemeksepeti');
+        console.log('[YemekSepeti] Connector available:', !!connector);
         const transformedOrder = connector ? connector.transformOrder(order, branchId) : order;
         transformedOrder.RemoteOrderId = `${remoteId}_${order.token}_${Date.now()}`;
+
+        console.log('[YemekSepeti] Transformed - Items:', transformedOrder.Items?.length || 0);
+        console.log('[YemekSepeti] Transformed - Customer:', transformedOrder.Customer?.FirstName || 'NULL');
+        console.log('[YemekSepeti] Transformed - TotalAmount:', transformedOrder.TotalAmount);
+        console.log('[YemekSepeti] Transformed - PaymentMethod:', transformedOrder.PaymentMethod);
+        if (transformedOrder.Items?.length > 0) {
+            transformedOrder.Items.forEach((item, idx) => {
+                console.log(`[YemekSepeti]   ${idx + 1}. ${item.Name} x${item.Quantity} = ${item.TotalPrice} TL`);
+            });
+        }
 
         // Legacy queue (WPF polling)
         const orderId = order.token;
         orders.set(orderId, { order: transformedOrder, status: 'NEW', createdAt: new Date() });
-        console.log('[YemekSepeti] Added to legacy queue');
+        console.log('[YemekSepeti] Added to legacy queue (key:', orderId, ')');
 
         // Firebase direct write
         const firebaseResult = await writeOrderToFirebaseUnified(transformedOrder, 'yemeksepeti', branchId);
