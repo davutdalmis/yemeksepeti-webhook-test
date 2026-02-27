@@ -40,8 +40,8 @@ class YemekSepetiConnector extends BasePlatformConnector {
         // Address building - DH API sends deliveryMainArea inside delivery object
         const latitude = rawOrder.latitude || rawDelivery?.latitude || deliveryAddress?.latitude || 0;
         const longitude = rawOrder.longitude || rawDelivery?.longitude || deliveryAddress?.longitude || 0;
-        const deliveryMainArea = rawDelivery?.deliveryMainArea || rawOrder.deliveryMainArea || '';
-        const deliveryArea = rawDelivery?.deliveryArea || rawOrder.deliveryArea || '';
+        const deliveryMainArea = deliveryAddress?.deliveryMainArea || rawDelivery?.deliveryMainArea || rawOrder.deliveryMainArea || '';
+        const deliveryArea = deliveryAddress?.deliveryArea || rawDelivery?.deliveryArea || rawOrder.deliveryArea || '';
         const deliveryInstructions = rawDelivery?.deliveryInstructions || rawOrder.deliveryInstructions || deliveryAddress?.deliveryInstructions || '';
 
         const street = deliveryAddress?.street || rawDelivery?.street || rawOrder.street || '';
