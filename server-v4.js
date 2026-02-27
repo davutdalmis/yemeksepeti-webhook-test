@@ -45,6 +45,37 @@ const io = new Server(server, {
 
 app.use(express.json());
 
+// ==================== REQUEST LOG (DEBUG) ====================
+const requestLog = [];
+const MAX_REQUEST_LOG = 200;
+
+app.use((req, res, next) => {
+    // Log all non-polling requests (polling is too noisy)
+    const isPolling = req.path.includes('pending-orders') || req.path.includes('/poll/');
+    const isHealth = req.path === '/health' || req.path === '/';
+
+    if (!isPolling && !isHealth) {
+        const entry = {
+            time: new Date().toISOString(),
+            method: req.method,
+            path: req.path,
+            ip: req.ip || req.connection?.remoteAddress,
+            headers: {
+                'content-type': req.headers['content-type'],
+                'user-agent': req.headers['user-agent']?.substring(0, 100),
+                'x-webhook-secret': req.headers['x-webhook-secret'] ? '***SET***' : undefined,
+                'x-api-key': req.headers['x-api-key'] ? req.headers['x-api-key'].substring(0, 8) + '...' : undefined
+            },
+            bodyKeys: req.body ? Object.keys(req.body) : [],
+            bodyPreview: req.body ? JSON.stringify(req.body).substring(0, 200) : null
+        };
+        requestLog.push(entry);
+        if (requestLog.length > MAX_REQUEST_LOG) requestLog.shift();
+        console.log(`[REQUEST] ${req.method} ${req.path} from ${entry.ip}`);
+    }
+    next();
+});
+
 // ==================== IN-MEMORY QUEUES (GERİYE UYUMLULUK) ====================
 const orders = new Map();
 const cancellations = new Map();
@@ -1144,6 +1175,32 @@ app.get('/socket/status', (req, res) => {
         totalConnections: io.sockets.sockets.size
     });
 });
+
+// ==================== REQUEST LOG ENDPOINT ====================
+
+app.get('/debug/requests', (req, res) => {
+    const apiKey = req.headers['x-api-key'];
+    if (apiKey !== API_KEYS.YEMEKSEPETI_POLLING_KEY && apiKey !== API_KEYS.ADMIN_API_KEY) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const filter = req.query.filter; // optional: 'order', 'webhook', 'all'
+    let logs = [...requestLog];
+
+    if (filter && filter !== 'all') {
+        logs = logs.filter(l => l.path.toLowerCase().includes(filter.toLowerCase()));
+    }
+
+    res.json({
+        total: logs.length,
+        serverStartTime: serverStartTime,
+        currentTime: new Date().toISOString(),
+        queueSize: orders.size,
+        logs: logs.slice(-50) // last 50 entries
+    });
+});
+
+const serverStartTime = new Date().toISOString();
 
 // ==================== CLEANUP ====================
 
