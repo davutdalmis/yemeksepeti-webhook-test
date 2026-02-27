@@ -24,6 +24,10 @@ const orders = new Map();
 const cancellations = new Map(); // YemekSepeti iptal bildirimleri
 const getirYemekWebhooks = [];
 
+// API Keys from environment variables (with test defaults)
+const YEMEKSEPETI_POLLING_API_KEY = process.env.YEMEKSEPETI_POLLING_API_KEY || 'bafetto-yemeksepeti-2025-secure-key';
+const GETIRYEMEK_POLLING_API_KEY = process.env.GETIRYEMEK_POLLING_API_KEY || 'bafetto-pos-getiryemek-2024-stable-key-d0025f3ffa8172ac';
+
 // ==================== SOCKET.IO COURIER TRACKING ====================
 
 // Bağlı kuryeler: { courierId: socketId }
@@ -48,6 +52,9 @@ io.on('connection', (socket) => {
         // Şube odasına katıl
         socket.join(`branch:${branchId}`);
         connectedCouriers.set(courierId, socket.id);
+
+        // Kuryeye onay gönder
+        socket.emit('courier:connected', { courierId, branchId, name });
 
         // POS'lara kurye online bilgisi gönder
         io.to(`branch:${branchId}`).emit('courier:online', {
@@ -104,9 +111,35 @@ io.on('connection', (socket) => {
         courierLocations.set(courierId, locationData);
 
         // Aynı şubedeki tüm POS'lara yayınla
-        io.to(`branch:${socket.branchId}`).emit('courier:location', locationData);
+        io.to(`branch:${socket.branchId}`).emit('courier:location:update', locationData);
 
         console.log(`[Socket.io] Konum: ${socket.courierName} → ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`);
+    });
+
+    // Kurye toplu konum güncellemesi (batch)
+    // Android format: { courierId: "abc", locations: [{latitude, longitude, ...}] }
+    socket.on('courier:location:batch', (data) => {
+        if (!socket.branchId) return;
+
+        const courierId = data.courierId || socket.courierId;
+        const locations = data.locations || (Array.isArray(data) ? data : []);
+        if (!courierId || !locations.length) return;
+
+        locations.forEach((loc) => {
+            const locationData = {
+                courierId,
+                latitude: loc.latitude,
+                longitude: loc.longitude,
+                speed: loc.speed || 0,
+                heading: loc.heading || 0,
+                timestamp: new Date().toISOString()
+            };
+
+            courierLocations.set(courierId, locationData);
+            io.to(`branch:${socket.branchId}`).emit('courier:location:update', locationData);
+        });
+
+        console.log(`[Socket.io] Toplu konum: ${socket.courierName} → ${locations.length} güncelleme`);
     });
 
     // Bağlantı kopması
@@ -289,9 +322,10 @@ app.post('/order/:remoteId', (req, res) => {
     const latitude = order.latitude || deliveryAddress?.latitude || 0;
     const longitude = order.longitude || deliveryAddress?.longitude || 0;
 
-    // Mahalle/semt bilgisi üst seviyede
-    const deliveryMainArea = order.deliveryMainArea || '';
-    const deliveryInstructions = order.deliveryInstructions || deliveryAddress?.deliveryInstructions || '';
+    // Mahalle/semt bilgisi - delivery alt objesinde veya üst seviyede olabilir
+    const deliveryMainArea = order.delivery?.deliveryMainArea || order.deliveryMainArea || '';
+    const deliveryArea = order.delivery?.deliveryArea || order.deliveryArea || '';
+    const deliveryInstructions = order.delivery?.deliveryInstructions || order.deliveryInstructions || deliveryAddress?.deliveryInstructions || '';
 
     // Full address oluştur - YemekSepeti Türkiye formatı
     // Hem deliveryAddress içinden hem üst seviyeden değerleri al (fallback)
@@ -351,7 +385,7 @@ app.post('/order/:remoteId', (req, res) => {
         fullAddress += ` (${deliveryInstructions})`;
     }
 
-    console.log('[YemekSepeti] Parsed Address Fields:', { street, streetNumber, city, district, building, floor });
+    console.log('[YemekSepeti] Parsed Address Fields:', { street, streetNumber, city, district, building, floor, deliveryMainArea, deliveryArea });
 
     console.log('[YemekSepeti] Delivery Address Object:', JSON.stringify(deliveryAddress, null, 2));
     console.log('[YemekSepeti] Coordinates:', latitude, longitude);
@@ -400,7 +434,9 @@ app.post('/order/:remoteId', (req, res) => {
             Options: (p.selectedToppings || []).map(o => ({
                 Name: o.name || '',
                 Value: o.value || '',
-                Price: parseFloat(o.price) || 0
+                Price: parseFloat(o.price) || 0,
+                IsRemoval: (o.type || '').toLowerCase() === 'remove' || (o.type || '').toLowerCase() === 'removed',
+                IsAddition: (o.type || '').toLowerCase() === 'add' || (o.type || '').toLowerCase() === 'added' || (o.type || '').toLowerCase() === 'extra'
             }))
         })),
         TotalAmount: parseFloat(order.price?.grandTotal) || 0,
@@ -411,6 +447,26 @@ app.post('/order/:remoteId', (req, res) => {
         CourierType: 'VENDOR',
         Note: order.comments?.customerComment || '',
         PlatformOrderId: order.id || null,
+        Payment: order.payment ? {
+            Type: order.payment.type || null,
+            RemoteCode: order.payment.remoteCode || null,
+            Status: order.payment.status || null
+        } : null,
+        Delivery: {
+            DeliveryMainArea: deliveryMainArea,
+            DeliveryArea: deliveryArea,
+            Street: street,
+            Address: deliveryAddress ? {
+                Street: deliveryAddress.street || '',
+                Neighborhood: deliveryAddress.neighborhood || deliveryMainArea || '',
+                District: deliveryAddress.district || deliveryArea || '',
+                FullAddress: fullAddress,
+                Building: deliveryAddress.building || '',
+                Floor: deliveryAddress.floor || '',
+                DoorNumber: deliveryAddress.flatNumber || '',
+                AddressDescription: deliveryInstructions
+            } : null
+        },
         CallbackUrls: order.callbackUrls || {
             orderAcceptedUrl: `${baseUrl}/test-callbacks/order-accepted/${order.token}`,
             orderRejectedUrl: `${baseUrl}/test-callbacks/order-rejected/${order.token}`,
@@ -549,7 +605,7 @@ app.get('/menuimport/:remoteId', (req, res) => {
 
 app.get('/api/yemeksepeti/pending-orders', (req, res) => {
     const apiKey = req.headers['x-api-key'];
-    if (apiKey !== 'bafetto-yemeksepeti-2025-secure-key') {
+    if (apiKey !== YEMEKSEPETI_POLLING_API_KEY) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
 
@@ -577,7 +633,7 @@ app.get('/api/yemeksepeti/pending-orders', (req, res) => {
 
 app.delete('/api/yemeksepeti/orders/:orderId', (req, res) => {
     const apiKey = req.headers['x-api-key'];
-    if (apiKey !== 'bafetto-yemeksepeti-2025-secure-key') {
+    if (apiKey !== YEMEKSEPETI_POLLING_API_KEY) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
 
@@ -607,7 +663,7 @@ app.delete('/api/yemeksepeti/orders/:orderId', (req, res) => {
 // YemiGO iptal bildirimlerini bu endpoint'ten polling ile alır
 app.get('/api/yemeksepeti/cancellations', (req, res) => {
     const apiKey = req.headers['x-api-key'];
-    if (apiKey !== 'bafetto-yemeksepeti-2025-secure-key') {
+    if (apiKey !== YEMEKSEPETI_POLLING_API_KEY) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
 
@@ -631,7 +687,7 @@ app.get('/api/yemeksepeti/cancellations', (req, res) => {
 // İptal bildirimini sil (YemiGO işledikten sonra)
 app.delete('/api/yemeksepeti/cancellations/:cancellationId', (req, res) => {
     const apiKey = req.headers['x-api-key'];
-    if (apiKey !== 'bafetto-yemeksepeti-2025-secure-key') {
+    if (apiKey !== YEMEKSEPETI_POLLING_API_KEY) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
 
@@ -710,7 +766,7 @@ app.get('/poll/webhooks', (req, res) => {
     const apiKey = req.headers['x-api-key'];
     const restaurantSecretKey = req.query.restaurantSecretKey;
 
-    if (apiKey !== 'bafetto-pos-getiryemek-2024-stable-key-d0025f3ffa8172ac') {
+    if (apiKey !== GETIRYEMEK_POLLING_API_KEY) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
 
@@ -724,7 +780,7 @@ app.get('/poll/webhooks', (req, res) => {
 
 app.delete('/api/getiryemek/webhooks/:webhookId', (req, res) => {
     const apiKey = req.headers['x-api-key'];
-    if (apiKey !== 'bafetto-pos-getiryemek-2024-stable-key-d0025f3ffa8172ac') {
+    if (apiKey !== GETIRYEMEK_POLLING_API_KEY) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
 
