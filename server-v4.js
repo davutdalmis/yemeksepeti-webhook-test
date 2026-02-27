@@ -983,19 +983,8 @@ app.get('/api/yemeksepeti/pending-orders', (req, res) => {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
-    // Multi-tenant isolation: filter by branchId (= posVendorId from WPF)
-    const filterBranchId = req.query.branchId || req.headers['x-branch-id'] || '';
-
     let newOrders = Array.from(orders.entries())
         .filter(([key, item]) => item.status === 'NEW' && new Date(item.createdAt) >= today);
-
-    // If branchId filter provided, only return orders for that branch
-    if (filterBranchId) {
-        newOrders = newOrders.filter(([key, item]) => {
-            const orderBranchId = item.order.branchId || '';
-            return orderBranchId === filterBranchId || orderBranchId === '';
-        });
-    }
 
     const result = newOrders.map(([key, item]) => ({ ...item.order, _railwayKey: key, CreatedAt: item.createdAt.toISOString() }));
 
