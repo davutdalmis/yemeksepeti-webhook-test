@@ -984,6 +984,10 @@ app.get('/api/yemeksepeti/pending-orders', (req, res) => {
 
     const result = newOrders.map(([key, item]) => ({ ...item.order, _railwayKey: key, CreatedAt: item.createdAt.toISOString() }));
 
+    if (result.length > 0) {
+        console.log(`[YemekSepeti POLL] ${result.length} orders returned to ${req.ip} (branchId query: ${req.query.branchId || 'NONE'})`);
+    }
+
     res.json({ success: true, count: result.length, orders: result });
 });
 
@@ -994,18 +998,23 @@ app.delete('/api/yemeksepeti/orders/:orderId', (req, res) => {
     }
 
     const orderId = req.params.orderId;
+    console.log(`[YemekSepeti DELETE] Order delete request: ${orderId} from ${req.ip}`);
+
     if (orders.has(orderId)) {
+        console.log(`[YemekSepeti DELETE] Deleted by key: ${orderId}`);
         orders.delete(orderId);
         return res.json({ success: true });
     }
 
     for (const [key, item] of orders.entries()) {
         if (item.order.OrderId === orderId || item.order.OrderToken === orderId) {
+            console.log(`[YemekSepeti DELETE] Deleted by OrderId/Token match: key=${key}, orderId=${orderId}`);
             orders.delete(key);
             return res.json({ success: true });
         }
     }
 
+    console.log(`[YemekSepeti DELETE] Order not found: ${orderId}`);
     res.status(404).json({ success: false, message: 'Order not found' });
 });
 
