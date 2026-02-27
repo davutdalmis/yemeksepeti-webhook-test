@@ -726,8 +726,9 @@ app.post('/order/:remoteId', async (req, res) => {
     const deliveryAddress = order.delivery?.address || order.customer?.address || null;
     const latitude = order.latitude || deliveryAddress?.latitude || 0;
     const longitude = order.longitude || deliveryAddress?.longitude || 0;
-    const deliveryMainArea = order.deliveryMainArea || '';
-    const deliveryInstructions = order.deliveryInstructions || deliveryAddress?.deliveryInstructions || '';
+    const deliveryMainArea = order.delivery?.deliveryMainArea || order.deliveryMainArea || '';
+    const deliveryArea = order.delivery?.deliveryArea || order.deliveryArea || '';
+    const deliveryInstructions = order.delivery?.deliveryInstructions || order.deliveryInstructions || deliveryAddress?.deliveryInstructions || '';
 
     const street = deliveryAddress?.street || order.street || '';
     const streetNumber = deliveryAddress?.number || order.number || '';
@@ -810,7 +811,9 @@ app.post('/order/:remoteId', async (req, res) => {
             Options: (p.selectedToppings || []).map(o => ({
                 Name: o.name || '',
                 Value: o.value || '',
-                Price: parseFloat(o.price) || 0
+                Price: parseFloat(o.price) || 0,
+                IsRemoval: (o.type || '').toLowerCase() === 'remove' || (o.type || '').toLowerCase() === 'removed',
+                IsAddition: (o.type || '').toLowerCase() === 'add' || (o.type || '').toLowerCase() === 'added' || (o.type || '').toLowerCase() === 'extra'
             }))
         })),
         TotalAmount: parseFloat(order.price?.grandTotal) || 0,
@@ -821,6 +824,26 @@ app.post('/order/:remoteId', async (req, res) => {
         CourierType: 'VENDOR',
         Note: order.comments?.customerComment || '',
         PlatformOrderId: order.id || null,
+        Payment: order.payment ? {
+            Type: order.payment.type || null,
+            RemoteCode: order.payment.remoteCode || null,
+            Status: order.payment.status || null
+        } : null,
+        Delivery: {
+            DeliveryMainArea: deliveryMainArea,
+            DeliveryArea: deliveryArea,
+            Street: street,
+            Address: deliveryAddress ? {
+                Street: deliveryAddress.street || '',
+                Neighborhood: deliveryAddress.neighborhood || deliveryMainArea || '',
+                District: deliveryAddress.district || deliveryArea || '',
+                FullAddress: fullAddress,
+                Building: deliveryAddress.building || '',
+                Floor: deliveryAddress.floor || '',
+                DoorNumber: deliveryAddress.flatNumber || '',
+                AddressDescription: deliveryInstructions
+            } : null
+        },
         CallbackUrls: order.callbackUrls || {
             orderAcceptedUrl: `${baseUrl}/test-callbacks/order-accepted/${order.token}`,
             orderRejectedUrl: `${baseUrl}/test-callbacks/order-rejected/${order.token}`,
