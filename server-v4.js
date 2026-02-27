@@ -755,10 +755,12 @@ app.use('/api/v2/platforms', createPlatformsApi(platformRegistry, db));
 app.post('/order/:remoteId', authenticateWebhook, async (req, res) => {
     const { remoteId } = req.params;
     const order = req.body;
-    const branchId = req.headers['x-branch-id'] || req.query.branchId || process.env.DEFAULT_BRANCH_ID;
+    // remoteId = POS Vendor ID = Firestore branch document ID (e.g. QgNkbMyFVgDWGqbHG1ZS)
+    // DH sends webhooks to /order/{remoteId} where remoteId maps directly to branchId
+    const branchId = remoteId || req.headers['x-branch-id'] || req.query.branchId || process.env.DEFAULT_BRANCH_ID;
 
     console.log('[YemekSepeti] ========== NEW ORDER ==========');
-    console.log('[YemekSepeti] Remote ID:', remoteId);
+    console.log('[YemekSepeti] Remote ID:', remoteId, '→ branchId:', branchId);
     console.log('[YemekSepeti] Raw order keys:', Object.keys(order));
     console.log('[YemekSepeti] Raw order.token:', order.token);
     console.log('[YemekSepeti] Raw order.code:', order.code);
@@ -981,11 +983,23 @@ app.get('/api/yemeksepeti/pending-orders', (req, res) => {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
-    const newOrders = Array.from(orders.entries())
-        .filter(([key, item]) => item.status === 'NEW' && new Date(item.createdAt) >= today)
-        .map(([key, item]) => ({ ...item.order, _railwayKey: key, CreatedAt: item.createdAt.toISOString() }));
+    // Multi-tenant isolation: filter by branchId (= posVendorId from WPF)
+    const filterBranchId = req.query.branchId || req.headers['x-branch-id'] || '';
 
-    res.json({ success: true, count: newOrders.length, orders: newOrders });
+    let newOrders = Array.from(orders.entries())
+        .filter(([key, item]) => item.status === 'NEW' && new Date(item.createdAt) >= today);
+
+    // If branchId filter provided, only return orders for that branch
+    if (filterBranchId) {
+        newOrders = newOrders.filter(([key, item]) => {
+            const orderBranchId = item.order.branchId || '';
+            return orderBranchId === filterBranchId || orderBranchId === '';
+        });
+    }
+
+    const result = newOrders.map(([key, item]) => ({ ...item.order, _railwayKey: key, CreatedAt: item.createdAt.toISOString() }));
+
+    res.json({ success: true, count: result.length, orders: result });
 });
 
 app.delete('/api/yemeksepeti/orders/:orderId', (req, res) => {
