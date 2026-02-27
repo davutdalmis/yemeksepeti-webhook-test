@@ -730,6 +730,15 @@ app.post('/order/:remoteId', async (req, res) => {
     const deliveryArea = order.delivery?.deliveryArea || order.deliveryArea || '';
     const deliveryInstructions = order.delivery?.deliveryInstructions || order.deliveryInstructions || deliveryAddress?.deliveryInstructions || '';
 
+    // DEBUG: Delivery objesi detayları
+    console.log('[YemekSepeti] DEBUG delivery object keys:', order.delivery ? Object.keys(order.delivery) : 'NO DELIVERY');
+    console.log('[YemekSepeti] DEBUG delivery.deliveryMainArea:', JSON.stringify(order.delivery?.deliveryMainArea));
+    console.log('[YemekSepeti] DEBUG delivery.deliveryArea:', JSON.stringify(order.delivery?.deliveryArea));
+    console.log('[YemekSepeti] DEBUG top-level deliveryMainArea:', JSON.stringify(order.deliveryMainArea));
+    console.log('[YemekSepeti] DEBUG delivery.address:', JSON.stringify(order.delivery?.address));
+    console.log('[YemekSepeti] DEBUG RESOLVED deliveryMainArea:', JSON.stringify(deliveryMainArea));
+    console.log('[YemekSepeti] DEBUG RESOLVED deliveryArea:', JSON.stringify(deliveryArea));
+
     const street = deliveryAddress?.street || order.street || '';
     const streetNumber = deliveryAddress?.number || order.number || '';
     const city = deliveryAddress?.city || order.city || '';
@@ -862,6 +871,11 @@ app.post('/order/:remoteId', async (req, res) => {
         createdAt: new Date()
     });
     console.log('[YemekSepeti] ✅ Added to queue (WPF polling)');
+    console.log('[YemekSepeti] DEBUG Transformed Customer.Address.Neighborhood:', transformedOrder.Customer?.Address?.Neighborhood);
+    console.log('[YemekSepeti] DEBUG Transformed Delivery.DeliveryMainArea:', transformedOrder.Delivery?.DeliveryMainArea);
+    console.log('[YemekSepeti] DEBUG Transformed Delivery.Address.Neighborhood:', transformedOrder.Delivery?.Address?.Neighborhood);
+    console.log('[YemekSepeti] DEBUG Transformed PaymentMethod:', transformedOrder.PaymentMethod);
+    console.log('[YemekSepeti] DEBUG Transformed Payment.Type:', transformedOrder.Payment?.Type);
 
     // YENİ YOL: Firebase'e direkt yaz (kurye app için)
     const firebaseResult = await writeOrderToFirebase(transformedOrder, 'yemeksepeti', branchId);
