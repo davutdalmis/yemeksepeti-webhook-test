@@ -28,23 +28,32 @@ class YemekSepetiConnector extends BasePlatformConnector {
 
     transformOrder(rawOrder, branchId) {
         const now = new Date();
-        const deliveryAddress = rawOrder.delivery?.address || rawOrder.customer?.address || null;
+        const rawDelivery = rawOrder.delivery || null;
+        const deliveryAddress = rawDelivery?.address || rawOrder.customer?.address || null;
 
-        // Address building
-        const latitude = rawOrder.latitude || deliveryAddress?.latitude || 0;
-        const longitude = rawOrder.longitude || deliveryAddress?.longitude || 0;
-        const deliveryMainArea = rawOrder.deliveryMainArea || '';
-        const deliveryInstructions = rawOrder.deliveryInstructions || deliveryAddress?.deliveryInstructions || '';
+        // DEBUG: Log raw delivery & payment from DH API
+        console.log(`[YS-CONNECTOR DEBUG] Raw delivery object:`, JSON.stringify(rawDelivery, null, 2)?.substring(0, 500));
+        console.log(`[YS-CONNECTOR DEBUG] Raw payment object:`, JSON.stringify(rawOrder.payment));
+        console.log(`[YS-CONNECTOR DEBUG] Raw delivery.deliveryMainArea: '${rawDelivery?.deliveryMainArea}', rawOrder.deliveryMainArea: '${rawOrder.deliveryMainArea}'`);
+        console.log(`[YS-CONNECTOR DEBUG] deliveryAddress:`, JSON.stringify(deliveryAddress, null, 2)?.substring(0, 500));
 
-        const street = deliveryAddress?.street || rawOrder.street || '';
-        const streetNumber = deliveryAddress?.number || rawOrder.number || '';
-        const city = deliveryAddress?.city || rawOrder.city || '';
-        const district = deliveryAddress?.district || rawOrder.district || '';
-        const building = deliveryAddress?.building || rawOrder.building || '';
-        const entrance = deliveryAddress?.entrance || rawOrder.entrance || '';
-        const floor = deliveryAddress?.floor || rawOrder.floor || '';
-        const flatNumber = deliveryAddress?.flatNumber || rawOrder.flatNumber || '';
-        const intercom = deliveryAddress?.intercom || rawOrder.intercom || '';
+        // Address building - DH API sends deliveryMainArea inside delivery object
+        const latitude = rawOrder.latitude || rawDelivery?.latitude || deliveryAddress?.latitude || 0;
+        const longitude = rawOrder.longitude || rawDelivery?.longitude || deliveryAddress?.longitude || 0;
+        const deliveryMainArea = rawDelivery?.deliveryMainArea || rawOrder.deliveryMainArea || '';
+        const deliveryArea = rawDelivery?.deliveryArea || rawOrder.deliveryArea || '';
+        const deliveryInstructions = rawDelivery?.deliveryInstructions || rawOrder.deliveryInstructions || deliveryAddress?.deliveryInstructions || '';
+
+        const street = deliveryAddress?.street || rawDelivery?.street || rawOrder.street || '';
+        const streetNumber = deliveryAddress?.number || rawDelivery?.number || rawOrder.number || '';
+        const city = deliveryAddress?.city || rawDelivery?.city || rawOrder.city || '';
+        const district = deliveryAddress?.district || rawDelivery?.district || rawOrder.district || '';
+        const neighborhood = deliveryAddress?.neighborhood || '';
+        const building = deliveryAddress?.building || rawDelivery?.building || rawOrder.building || '';
+        const entrance = deliveryAddress?.entrance || rawDelivery?.entrance || rawOrder.entrance || '';
+        const floor = deliveryAddress?.floor || rawDelivery?.floor || rawOrder.floor || '';
+        const flatNumber = deliveryAddress?.flatNumber || rawDelivery?.flatNumber || rawOrder.flatNumber || '';
+        const intercom = deliveryAddress?.intercom || rawDelivery?.intercom || rawOrder.intercom || '';
 
         // Build full address
         const addressParts = [];
@@ -93,7 +102,7 @@ class YemekSepetiConnector extends BasePlatformConnector {
                     FullAddress: fullAddress,
                     City: city,
                     District: district || deliveryMainArea || '',
-                    Neighborhood: deliveryMainArea || '',
+                    Neighborhood: neighborhood || deliveryMainArea || '',
                     Street: street,
                     StreetNumber: streetNumber,
                     BuildingNo: building,
@@ -108,6 +117,44 @@ class YemekSepetiConnector extends BasePlatformConnector {
                 }
             } : null,
 
+            // Delivery object - WPF reads delivery.deliveryMainArea, delivery.address etc.
+            Delivery: {
+                deliveryMainArea: deliveryMainArea,
+                deliveryArea: deliveryArea,
+                street: rawDelivery?.street || '',
+                number: rawDelivery?.number || '',
+                building: rawDelivery?.building || '',
+                entrance: rawDelivery?.entrance || '',
+                floor: rawDelivery?.floor || '',
+                city: rawDelivery?.city || '',
+                postcode: rawDelivery?.postcode || '',
+                latitude: latitude,
+                longitude: longitude,
+                deliveryInstructions: deliveryInstructions,
+                address: deliveryAddress ? {
+                    latitude: deliveryAddress.latitude || 0,
+                    longitude: deliveryAddress.longitude || 0,
+                    street: deliveryAddress.street || '',
+                    city: deliveryAddress.city || '',
+                    district: deliveryAddress.district || '',
+                    neighborhood: deliveryAddress.neighborhood || '',
+                    area: deliveryAddress.area || '',
+                    postcode: deliveryAddress.postcode || '',
+                    fullAddress: deliveryAddress.fullAddress || fullAddress,
+                    building: deliveryAddress.building || '',
+                    floor: deliveryAddress.floor || '',
+                    doorNumber: deliveryAddress.doorNumber || deliveryAddress.flatNumber || '',
+                    addressDescription: deliveryAddress.addressDescription || deliveryAddress.deliveryInstructions || ''
+                } : null
+            },
+
+            // Payment object - WPF reads payment.type (Turkish text from DH API)
+            Payment: rawOrder.payment ? {
+                type: rawOrder.payment.type || '',
+                remoteCode: rawOrder.payment.remoteCode || '',
+                status: rawOrder.payment.status || ''
+            } : null,
+
             // Items
             Items: (rawOrder.products || []).map(p => ({
                 Name: p.name || '',
@@ -118,7 +165,8 @@ class YemekSepetiConnector extends BasePlatformConnector {
                 Options: (p.selectedToppings || []).map(o => ({
                     Name: o.name || '',
                     Value: o.value || '',
-                    Price: parseFloat(o.price) || 0
+                    Price: parseFloat(o.price) || 0,
+                    Type: o.type || ''
                 }))
             })),
 
@@ -128,7 +176,7 @@ class YemekSepetiConnector extends BasePlatformConnector {
             DiscountAmount: parseFloat(rawOrder.price?.discount) || 0,
 
             // Delivery info
-            PaymentMethod: rawOrder.payment?.type || 'ONLINE',
+            PaymentMethod: rawOrder.payment?.type || rawOrder.paymentMethod || 'ONLINE',
             DeliveryType: rawOrder.expeditionType === 'pickup' ? 'PICKUP' : 'DELIVERY',
             CourierType: 'VENDOR',
             Note: rawOrder.comments?.customerComment || '',
