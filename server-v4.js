@@ -837,11 +837,7 @@ app.put('/remoteId/:remoteId/remoteOrder/:remoteOrderId/posOrderStatus', authent
             await connector.cancelOrder(orderToken, statusUpdate.reason || 'UNKNOWN');
         }
 
-        // Update legacy queue
-        if (orders.has(orderToken)) {
-            const orderData = orders.get(orderToken);
-            orderData.status = 'CANCELLED';
-        }
+        // Legacy queue - artık status değiştirmiyoruz, WPF kendi yönetir
     }
 
     res.status(200).json({ success: true });
@@ -984,7 +980,7 @@ app.get('/api/yemeksepeti/pending-orders', (req, res) => {
     today.setHours(0, 0, 0, 0);
 
     let newOrders = Array.from(orders.entries())
-        .filter(([key, item]) => item.status === 'NEW' && new Date(item.createdAt) >= today);
+        .filter(([key, item]) => new Date(item.createdAt) >= today);
 
     const result = newOrders.map(([key, item]) => ({ ...item.order, _railwayKey: key, CreatedAt: item.createdAt.toISOString() }));
 
