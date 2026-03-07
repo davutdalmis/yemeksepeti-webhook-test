@@ -1007,16 +1007,22 @@ app.get('/api/yemeksepeti/pending-orders', (req, res) => {
         return res.status(401).json({ error: 'Unauthorized' });
     }
 
+    const branchId = req.query.branchId;
+    if (!branchId) {
+        return res.status(400).json({ error: 'branchId query parameter is required' });
+    }
+
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
     let newOrders = Array.from(orders.entries())
-        .filter(([key, item]) => new Date(item.createdAt) >= today);
+        .filter(([key, item]) => new Date(item.createdAt) >= today)
+        .filter(([key, item]) => item.order.branchId === branchId);
 
     const result = newOrders.map(([key, item]) => ({ ...item.order, _railwayKey: key, CreatedAt: item.createdAt.toISOString() }));
 
     if (result.length > 0) {
-        console.log(`[YemekSepeti POLL] ${result.length} orders returned to ${req.ip} (branchId query: ${req.query.branchId || 'NONE'})`);
+        console.log(`[YemekSepeti POLL] ${result.length} orders returned to ${req.ip} (branchId: ${branchId})`);
     }
 
     res.json({ success: true, count: result.length, orders: result });
