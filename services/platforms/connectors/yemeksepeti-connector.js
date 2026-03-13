@@ -178,7 +178,7 @@ class YemekSepetiConnector extends BasePlatformConnector {
             // Amounts
             TotalAmount: parseFloat(rawOrder.price?.grandTotal) || 0,
             DeliveryFee: parseFloat(rawOrder.price?.deliveryFee) || 0,
-            DiscountAmount: parseFloat(rawOrder.price?.discount) || 0,
+            DiscountAmount: parseFloat(rawOrder.price?.discountAmountTotal) || 0,
 
             // Delivery info
             PaymentMethod: rawOrder.payment?.type || rawOrder.paymentMethod || 'ONLINE',
