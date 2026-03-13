@@ -93,8 +93,11 @@ class YemekSepetiConnector extends BasePlatformConnector {
             VendorId: rawOrder.vendorId || '',
             ChainCode: this.config.chainCode,
             OrderDate: rawOrder.createdAt || now.toISOString(),
-            ScheduledDeliveryTime: rawOrder.scheduledDeliveryTime || null,
-            IsScheduled: rawOrder.isScheduled || false,
+            // DH API: preOrder=true ve delivery.expectedDeliveryTime ileri tarihli siparişleri belirtir
+            IsScheduled: rawOrder.preOrder === true,
+            ScheduledDeliveryTime: rawOrder.preOrder === true
+                ? (rawOrder.delivery?.expectedDeliveryTime || rawOrder.expiryDate || null)
+                : null,
             branchId: branchId,
 
             // Customer info
