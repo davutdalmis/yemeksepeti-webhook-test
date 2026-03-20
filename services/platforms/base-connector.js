@@ -66,12 +66,10 @@ class BasePlatformConnector {
         try {
             const orderId = order.OrderId || order.id || `${this.platformId}_${Date.now()}`;
 
-            // Duplicate check
-            const existingOrder = await this.db.collectionGroup(this.collectionName)
-                .where('OrderId', '==', orderId)
-                .get();
+            // Duplicate check (direct doc lookup — faster than query)
+            const existingDoc = await this.db.collection(this.collectionName).doc(orderId).get();
 
-            if (!existingOrder.empty) {
+            if (existingDoc.exists) {
                 console.log(`[${this.platformId}] Order already exists: ${orderId}`);
                 return { success: true, reason: 'duplicate_skipped', orderId };
             }
@@ -89,22 +87,8 @@ class BasePlatformConnector {
                 ReceivedAt: admin.firestore.FieldValue.serverTimestamp()
             };
 
-            // Branch path'i bul ve yaz
-            if (branchId) {
-                const branchQuery = await this.db.collectionGroup('branches')
-                    .where('id', '==', branchId)
-                    .limit(1)
-                    .get();
-
-                if (!branchQuery.empty) {
-                    const branchRef = branchQuery.docs[0].ref;
-                    await branchRef.collection(this.collectionName).doc(orderId).set(firebaseOrder);
-                } else {
-                    await this.db.collection(this.collectionName).doc(orderId).set(firebaseOrder);
-                }
-            } else {
-                await this.db.collection(this.collectionName).doc(orderId).set(firebaseOrder);
-            }
+            // Flat collection'a yaz (branchId field ile filtrelenir)
+            await this.db.collection(this.collectionName).doc(orderId).set(firebaseOrder);
 
             console.log(`[${this.platformId}] Order written to Firebase: ${orderId}`);
             return { success: true, orderId };
@@ -120,11 +104,10 @@ class BasePlatformConnector {
         if (!this.db) return { success: false, reason: 'firebase_disabled' };
 
         try {
-            const ordersSnapshot = await this.db.collectionGroup(this.collectionName)
-                .where('OrderId', '==', orderId)
-                .get();
+            const orderRef = this.db.collection(this.collectionName).doc(orderId);
+            const orderDoc = await orderRef.get();
 
-            if (ordersSnapshot.empty) {
+            if (!orderDoc.exists) {
                 return { success: false, reason: 'order_not_found' };
             }
 
@@ -134,7 +117,7 @@ class BasePlatformConnector {
                 ...additionalData
             };
 
-            await Promise.all(ordersSnapshot.docs.map(doc => doc.ref.update(updateData)));
+            await orderRef.update(updateData);
 
             console.log(`[${this.platformId}] Order status updated: ${orderId} -> ${status}`);
             return { success: true, orderId, status };
@@ -160,21 +143,20 @@ class BasePlatformConnector {
         if (!this.db) return { success: false, reason: 'firebase_disabled' };
 
         try {
-            // Step 1: Resolve doc refs OUTSIDE transaction (collectionGroup not allowed inside)
-            const ordersSnapshot = await this.db.collectionGroup(this.collectionName)
-                .where('OrderId', '==', orderId)
-                .get();
+            // Step 1: Resolve doc ref directly (flat collection)
+            const orderRef = this.db.collection(this.collectionName).doc(orderId);
+            const orderDoc = await orderRef.get();
 
-            if (ordersSnapshot.empty) {
+            if (!orderDoc.exists) {
                 return { success: false, reason: 'order_not_found' };
             }
 
-            const orderRefs = ordersSnapshot.docs.map(doc => doc.ref);
+            const orderRefs = [orderRef];
 
             // Resolve courier refs (new + old if reassignment)
             let courierRef = null;
             let oldCourierRef = null;
-            const orderData = ordersSnapshot.docs[0].data();
+            const orderData = orderDoc.data();
             const oldCourierId = orderData.assignedCourierId;
 
             try {
