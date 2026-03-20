@@ -5,7 +5,7 @@
 const express = require('express');
 const admin = require('firebase-admin');
 
-function createOrdersApi(registry, smartDispatch, { sendPushNotification, notifyCourierNewOrder, db, dispatchMetrics, dispatchQueue } = {}) {
+function createOrdersApi(registry, smartDispatch, { sendPushNotification, notifyCourierNewOrder, db, dispatchMetrics, dispatchQueue, io } = {}) {
     const router = express.Router();
 
     // API Key authentication middleware
@@ -68,6 +68,13 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
             }
 
             console.log(`[OrdersAPI] Order accepted: ${platformId}/${orderId}`);
+
+            // Push event: sipariş kabul edildi
+            if (io && branchId) {
+                io.to(`branch:${branchId}`).emit('order:status_changed', {
+                    orderId, platform: platformId, status: 'ACCEPTED', timestamp: new Date().toISOString()
+                });
+            }
 
             // Auto-assign courier after successful accept
             let courierInfo = null;
@@ -168,6 +175,14 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
 
             if (result.success) {
                 console.log(`[OrdersAPI] Order rejected: ${platformId}/${orderId} - ${reason}`);
+
+                // Push event: sipariş reddedildi
+                if (io && branchId) {
+                    io.to(`branch:${branchId}`).emit('order:cancelled', {
+                        orderId, platform: platformId, reason: reason || 'REJECTED', timestamp: new Date().toISOString()
+                    });
+                }
+
                 res.json({
                     success: true,
                     orderId,
@@ -215,6 +230,14 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
 
             if (result.success) {
                 console.log(`[OrdersAPI] Order ready: ${platformId}/${orderId}`);
+
+                // Push event: sipariş hazır
+                if (io && branchId) {
+                    io.to(`branch:${branchId}`).emit('order:status_changed', {
+                        orderId, platform: platformId, status: 'READY', timestamp: new Date().toISOString()
+                    });
+                }
+
                 res.json({
                     success: true,
                     orderId,
@@ -287,6 +310,14 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
             }
 
             console.log(`[OrdersAPI] Order picked up: ${platformId}/${orderId} (platform API: ${platformResult.success})`);
+
+            // Push event: kurye siparişi aldı
+            if (io && branchId) {
+                io.to(`branch:${branchId}`).emit('order:status_changed', {
+                    orderId, platform: platformId, status: 'PICKED_UP', timestamp: new Date().toISOString()
+                });
+            }
+
             res.json({
                 success: true,
                 orderId,
@@ -381,6 +412,14 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
             }
 
             console.log(`[OrdersAPI] Order delivered: ${platformId}/${orderId} (platform API: ${platformResult.success})`);
+
+            // Push event: sipariş teslim edildi
+            if (io && branchId) {
+                io.to(`branch:${branchId}`).emit('order:status_changed', {
+                    orderId, platform: platformId, status: 'DELIVERED', timestamp: new Date().toISOString()
+                });
+            }
+
             res.json({
                 success: true,
                 orderId,

@@ -29,6 +29,12 @@ const GoogleMapsDistanceService = require('./services/google-maps-distance');
 const DispatchMetrics = require('./services/dispatch/dispatch-metrics');
 const DispatchQueue = require('./services/dispatch/dispatch-queue');
 const DispatchAlerts = require('./services/dispatch/dispatch-alerts');
+const { getRedisClient, isRedisAvailable, getRedisStatus } = require('./services/redis-client');
+const { createAdapter } = require('@socket.io/redis-adapter');
+const OrderStore = require('./services/redis-orders');
+const CancellationStore = require('./services/redis-cancellations');
+const WebhookStore = require('./services/redis-webhooks');
+const CourierStateStore = require('./services/redis-courier-state');
 
 const app = express();
 const server = http.createServer(app);
@@ -47,16 +53,49 @@ const io = new Server(server, {
     pingInterval: 25000
 });
 
+// Socket.IO Redis Adapter — multi-instance broadcasting
+if (process.env.REDIS_URL) {
+    const pubClient = getRedisClient().duplicate();
+    const subClient = getRedisClient().duplicate();
+    io.adapter(createAdapter(pubClient, subClient));
+    console.log('[Socket.io] Redis adapter enabled — multi-instance broadcasting active');
+} else {
+    console.log('[Socket.io] No Redis — using default in-memory adapter');
+}
+
 app.set('trust proxy', 1); // Railway runs behind a proxy
 app.use(express.json());
 
-app.use(rateLimit({
+// Global rate limit (genel güvenlik ağı)
+const globalLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 15000,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Server rate limit exceeded' }
+});
+
+// Polling endpoint'leri için ayrı limit (yüksek — her şube sık polling yapıyor)
+const pollingLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 10000,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => req.ip,
+    message: { error: 'Polling rate limit exceeded' }
+});
+
+// Webhook endpoint'leri için ayrı limit (daha düşük — platform webhook'ları)
+const webhookLimiter = rateLimit({
     windowMs: 60 * 1000,
     max: 5000,
     standardHeaders: true,
     legacyHeaders: false,
-    message: { error: 'Server rate limit exceeded' }
-}));
+    keyGenerator: (req) => req.ip,
+    message: { error: 'Webhook rate limit exceeded' }
+});
+
+app.use(globalLimiter);
 
 // ==================== REQUEST LOG (DEBUG) ====================
 const requestLog = [];
@@ -90,13 +129,24 @@ app.use((req, res, next) => {
 });
 
 // ==================== IN-MEMORY QUEUES (GERİYE UYUMLULUK) ====================
-const orders = new Map();
-const cancellations = new Map();
-const getirYemekWebhooks = [];
+const orderStore = new OrderStore(getRedisClient(), isRedisAvailable, {
+    maxPerBranch: 500,
+    maxTotal: 10000
+});
+const cancellationStore = new CancellationStore(getRedisClient(), isRedisAvailable);
+const webhookStore = new WebhookStore(getRedisClient(), isRedisAvailable);
 
-// ==================== IN-MEMORY LIMITS ====================
-const MAX_ORDERS_PER_BRANCH = 500;
-const MAX_ORDERS_TOTAL = 10000;
+// ==================== LAZY CLEANUP ====================
+const LAZY_CLEANUP_THRESHOLD = 30 * 60 * 1000; // 30 dakika
+let lastLazyCleanup = Date.now();
+const LAZY_CLEANUP_INTERVAL = 60 * 1000; // En fazla 60sn'de bir lazy cleanup yap
+
+async function lazyCleanupOrders(branchId) {
+    const now = Date.now();
+    if (now - lastLazyCleanup < LAZY_CLEANUP_INTERVAL) return;
+    lastLazyCleanup = now;
+    await orderStore.cleanupBranch(branchId, LAZY_CLEANUP_THRESHOLD);
+}
 
 // ==================== API KEY CONFIGURATION ====================
 const API_KEYS = {
@@ -203,6 +253,8 @@ async function initializePlatformHub() {
     smartDispatchService = new SmartDispatchService(db, platformRegistry);
     smartDispatchService.setMetrics(dispatchMetrics);
     smartDispatchService.setAlerts(dispatchAlerts);
+    smartDispatchService.setCourierState(courierState);
+    smartDispatchService.setRedis(getRedisClient(), isRedisAvailable);
 
     // Initialize Dispatch Queue (retry for failed assignments)
     dispatchQueue = new DispatchQueue(db, smartDispatchService, platformRegistry, dispatchMetrics);
@@ -220,9 +272,9 @@ class SmartDispatchService {
         this.registry = registry;
         this.googleMaps = new GoogleMapsDistanceService();
 
-        // [FIX-2] Assignment tracking: counter-based, supports multiple assignments per courier
-        // Key: courierId, Value: number (pending assignment count within TTL window)
-        this.pendingAssignments = new Map();
+        // [FIX-2] Assignment tracking via Redis-backed CourierStateStore
+        // courierState is injected via setCourierState() after construction
+        this._courierState = null;
 
         // [FIX-3] Mutex: serializes assignBestCourier calls to prevent race conditions
         this._assignmentQueue = Promise.resolve();
@@ -237,9 +289,12 @@ class SmartDispatchService {
         };
         this.weights = { ...this.defaultWeights };
 
-        // Dynamic weights cache: branchId → { weights, expiresAt }
-        this._weightCache = new Map();
+        // Dynamic weights cache: Redis-backed with in-memory fallback
+        this._weightCache = new Map(); // fallback when Redis unavailable
         this._WEIGHT_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+        this._WEIGHT_CACHE_TTL_S = 300; // 5 minutes in seconds (for Redis SETEX)
+        this._redisClient = null;
+        this._isRedisAvailable = null;
 
         // Dispatch metrics & alerts (injected later via setMetrics/setAlerts)
         this.dispatchMetrics = null;
@@ -264,43 +319,76 @@ class SmartDispatchService {
         this.dispatchAlerts = dispatchAlerts;
     }
 
+    setCourierState(courierStateStore) {
+        this._courierState = courierStateStore;
+    }
+
+    setRedis(redisClient, isRedisAvailableFn) {
+        this._redisClient = redisClient;
+        this._isRedisAvailable = isRedisAvailableFn;
+    }
+
     /**
-     * Get dispatch weights for a branch — reads from Firestore with 5min TTL cache
+     * Get dispatch weights for a branch — Redis cache (shared across instances) with in-memory fallback
      * Falls back to defaults if not found or invalid
      */
     async getWeightsForBranch(branchId) {
         if (!this.db || !branchId) return this.defaultWeights;
 
-        // Check cache
-        const cached = this._weightCache.get(branchId);
-        if (cached && Date.now() < cached.expiresAt) {
-            return cached.weights;
+        const redisKey = `dispatch:weights:${branchId}`;
+        const useRedis = this._redisClient && this._isRedisAvailable && this._isRedisAvailable();
+
+        // Check Redis cache first (shared across instances)
+        if (useRedis) {
+            try {
+                const cached = await this._redisClient.get(redisKey);
+                if (cached) {
+                    return JSON.parse(cached);
+                }
+            } catch (err) {
+                console.warn('[SmartDispatch] Redis weight cache read failed, checking memory:', err.message);
+            }
         }
 
+        // Fallback: check in-memory cache
+        if (!useRedis) {
+            const cached = this._weightCache.get(branchId);
+            if (cached && Date.now() < cached.expiresAt) {
+                return cached.weights;
+            }
+        }
+
+        // Cache miss — load from Firestore
+        let weights = this.defaultWeights;
         try {
             const doc = await this.db.doc(`branches/${branchId}/settings/dispatchWeights`).get();
 
             if (doc.exists) {
                 const data = doc.data();
-                const weights = this._validateWeights(data);
-                if (weights) {
-                    this._weightCache.set(branchId, {
-                        weights,
-                        expiresAt: Date.now() + this._WEIGHT_CACHE_TTL_MS
-                    });
-                    return weights;
+                const validated = this._validateWeights(data);
+                if (validated) {
+                    weights = validated;
                 }
             }
         } catch (error) {
             console.warn('[SmartDispatch] Failed to load branch weights, using defaults:', error.message);
         }
 
-        // Cache defaults too to avoid repeated reads
+        // Store in Redis (primary) or in-memory (fallback)
+        if (useRedis) {
+            try {
+                await this._redisClient.setex(redisKey, this._WEIGHT_CACHE_TTL_S, JSON.stringify(weights));
+            } catch (err) {
+                console.warn('[SmartDispatch] Redis weight cache write failed:', err.message);
+            }
+        }
+        // Always update in-memory cache as fallback
         this._weightCache.set(branchId, {
-            weights: this.defaultWeights,
+            weights,
             expiresAt: Date.now() + this._WEIGHT_CACHE_TTL_MS
         });
-        return this.defaultWeights;
+
+        return weights;
     }
 
     /**
@@ -379,7 +467,7 @@ class SmartDispatchService {
     }
 
     async getActiveOrderCount(courierId) {
-        if (!this.db) return this._getPendingCount(courierId);
+        if (!this.db) return await this._getPendingCount(courierId);
 
         try {
             const platforms = ['yemekSepetiOrders', 'getirYemekOrders', 'trendyolGoOrders'];
@@ -396,12 +484,12 @@ class SmartDispatchService {
             }
 
             // [FIX-2] Add ALL pending assignments not yet reflected in Firestore
-            totalActive += this._getPendingCount(courierId);
+            totalActive += await this._getPendingCount(courierId);
 
             return totalActive;
         } catch (error) {
             // On error, still return pending count as best-effort
-            return this._getPendingCount(courierId);
+            return await this._getPendingCount(courierId);
         }
     }
 
@@ -566,27 +654,23 @@ class SmartDispatchService {
 
     /**
      * Get pending (not yet in Firestore) assignment count for a courier
+     * Now async — reads from Redis-backed CourierStateStore
      */
-    _getPendingCount(courierId) {
-        return this.pendingAssignments.get(courierId) || 0;
+    async _getPendingCount(courierId) {
+        if (this._courierState) {
+            return await this._courierState.getPendingCount(courierId);
+        }
+        return 0;
     }
 
     /**
-     * Track a new assignment — increments counter, auto-decrements after TTL
+     * Track a new assignment — increments counter in Redis with PEXPIRE TTL
+     * In memory mode: auto-decrements via setTimeout (same as original behavior)
      */
-    _trackAssignment(courierId) {
-        const current = this.pendingAssignments.get(courierId) || 0;
-        this.pendingAssignments.set(courierId, current + 1);
-
-        // Auto-decrement after TTL (Firestore should have caught up by then)
-        setTimeout(() => {
-            const count = this.pendingAssignments.get(courierId) || 0;
-            if (count <= 1) {
-                this.pendingAssignments.delete(courierId);
-            } else {
-                this.pendingAssignments.set(courierId, count - 1);
-            }
-        }, this.ASSIGNMENT_TRACKING_TTL_MS);
+    async _trackAssignment(courierId) {
+        if (this._courierState) {
+            await this._courierState.incrementPending(courierId, this.ASSIGNMENT_TRACKING_TTL_MS);
+        }
     }
 
     // ==================== MUTEX (FIX-3) ====================
@@ -709,7 +793,7 @@ class SmartDispatchService {
             }
 
             // [FIX-2] Track assignment with counter (not single entry)
-            this._trackAssignment(bestMatch.courier.id);
+            await this._trackAssignment(bestMatch.courier.id);
 
             // Record metric
             if (this.dispatchMetrics) {
@@ -819,8 +903,7 @@ async function writeOrderToFirebaseUnified(order, platformId, branchId) {
 }
 
 // ==================== SOCKET.IO COURIER TRACKING ====================
-const connectedCouriers = new Map();
-const courierLocations = new Map();
+const courierState = new CourierStateStore(getRedisClient(), isRedisAvailable);
 
 // Socket.IO authentication middleware
 io.use((socket, next) => {
@@ -836,7 +919,7 @@ io.use((socket, next) => {
 io.on('connection', (socket) => {
     console.log(`[Socket.io] New connection: ${socket.id}`);
 
-    socket.on('courier:connect', (data) => {
+    socket.on('courier:connect', async (data) => {
         const { courierId, branchId, name } = data;
         if (!courierId || !branchId) return;
         console.log(`[Socket.io] Courier connected: ${name} (${courierId})`);
@@ -847,7 +930,7 @@ io.on('connection', (socket) => {
         socket.userType = 'courier';
 
         socket.join(`branch:${branchId}`);
-        connectedCouriers.set(courierId, socket.id);
+        await courierState.setConnected(courierId, socket.id, branchId);
 
         io.to(`branch:${branchId}`).emit('courier:online', {
             courierId, name, timestamp: new Date().toISOString()
@@ -859,7 +942,7 @@ io.on('connection', (socket) => {
         });
     });
 
-    socket.on('pos:connect', (data) => {
+    socket.on('pos:connect', async (data) => {
         const { branchId, posName } = data;
         if (!branchId) return;
         console.log(`[Socket.io] POS connected: ${posName}`);
@@ -869,16 +952,16 @@ io.on('connection', (socket) => {
         socket.userType = 'pos';
         socket.join(`branch:${branchId}`);
 
+        const connected = await courierState.getConnectedByBranch(branchId);
         const branchCouriers = [];
-        for (const [courierId, socketId] of connectedCouriers.entries()) {
+        for (const { courierId, socketId } of connected) {
             const courierSocket = io.sockets.sockets.get(socketId);
-            if (courierSocket && courierSocket.branchId === branchId) {
-                branchCouriers.push({
-                    courierId,
-                    name: courierSocket.courierName,
-                    location: courierLocations.get(courierId) || null
-                });
-            }
+            const location = await courierState.getLocation(courierId);
+            branchCouriers.push({
+                courierId,
+                name: courierSocket ? courierSocket.courierName : 'Unknown',
+                location: location || null
+            });
         }
         socket.emit('couriers:list', branchCouriers);
     });
@@ -894,17 +977,17 @@ io.on('connection', (socket) => {
         console.log(`[Socket.io] POS order listener: ${posName} joined branch:${branchId}`);
     });
 
-    socket.on('courier:location', (data) => {
+    socket.on('courier:location', async (data) => {
         const { courierId, latitude, longitude, speed, heading } = data;
         if (!courierId || !socket.branchId) return;
 
-        const locationData = { courierId, latitude, longitude, speed: speed || 0, heading: heading || 0, timestamp: new Date().toISOString() };
-        courierLocations.set(courierId, locationData);
+        const locationData = { courierId, branchId: socket.branchId, latitude, longitude, speed: speed || 0, heading: heading || 0, timestamp: new Date().toISOString() };
+        await courierState.setLocation(courierId, locationData);
         io.to(`branch:${socket.branchId}`).emit('courier:location:update', locationData);
     });
 
     // Handle batch location updates from courier app (offline queue sync)
-    socket.on('courier:location:batch', (data) => {
+    socket.on('courier:location:batch', async (data) => {
         const { courierId, locations } = data;
         if (!courierId || !socket.branchId || !Array.isArray(locations)) return;
 
@@ -912,22 +995,23 @@ io.on('connection', (socket) => {
         for (const loc of locations) {
             const locationData = {
                 courierId,
+                branchId: socket.branchId,
                 latitude: loc.latitude || loc.lat,
                 longitude: loc.longitude || loc.lng,
                 speed: loc.speed || 0,
                 heading: loc.heading || 0,
                 timestamp: loc.timestamp ? new Date(loc.timestamp).toISOString() : new Date().toISOString()
             };
-            courierLocations.set(courierId, locationData);
+            await courierState.setLocation(courierId, locationData);
             io.to(`branch:${socket.branchId}`).emit('courier:location:update', locationData);
         }
     });
 
-    socket.on('disconnect', () => {
+    socket.on('disconnect', async () => {
         if (socket.userType === 'courier' && socket.courierId) {
             console.log(`[Socket.io] Courier disconnected: ${socket.courierName}`);
-            connectedCouriers.delete(socket.courierId);
-            courierLocations.delete(socket.courierId);
+            await courierState.removeConnected(socket.courierId);
+            await courierState.removeLocation(socket.courierId);
             if (socket.branchId) {
                 io.to(`branch:${socket.branchId}`).emit('courier:offline', {
                     courierId: socket.courierId, name: socket.courierName, timestamp: new Date().toISOString()
@@ -948,14 +1032,15 @@ app.use('/api/v2/orders', (req, res, next) => {
     notifyCourierNewOrder,
     db,
     dispatchMetrics,
-    dispatchQueue
+    dispatchQueue,
+    io
 }));
 
 app.use('/api/v2/platforms', createPlatformsApi(platformRegistry, db));
 
 // ==================== YEMEKSEPETI WEBHOOKS (LEGACY COMPATIBILITY) ====================
 
-app.post('/order/:remoteId', authenticatePlatformWebhook, async (req, res) => {
+app.post('/order/:remoteId', webhookLimiter, authenticatePlatformWebhook, async (req, res) => {
     const { remoteId } = req.params;
     const order = req.body;
     // remoteId = POS Vendor ID = Firestore branch document ID (e.g. QgNkbMyFVgDWGqbHG1ZS)
@@ -1012,29 +1097,16 @@ app.post('/order/:remoteId', authenticatePlatformWebhook, async (req, res) => {
         // Legacy queue (WPF polling)
         const orderId = order.token;
 
+        // Lazy cleanup: 30dk'dan eski siparişleri temizle (en fazla 60sn'de bir)
+        await lazyCleanupOrders(branchId);
+
         // Per-branch cap
-        const branchOrders = [...orders.entries()]
-            .filter(([_, item]) => item.order?.branchId === branchId);
-        if (branchOrders.length >= MAX_ORDERS_PER_BRANCH) {
-            const oldest = branchOrders.sort((a, b) =>
-                new Date(a[1].createdAt) - new Date(b[1].createdAt))[0];
-            if (oldest) {
-                orders.delete(oldest[0]);
-                console.log(`[Cleanup] Branch ${branchId} cap (${MAX_ORDERS_PER_BRANCH}), evicted oldest`);
-            }
-        }
+        await orderStore.evictOldestInBranch(branchId);
 
         // Global cap
-        if (orders.size >= MAX_ORDERS_TOTAL) {
-            const oldestGlobal = [...orders.entries()]
-                .sort((a, b) => new Date(a[1].createdAt) - new Date(b[1].createdAt))[0];
-            if (oldestGlobal) {
-                orders.delete(oldestGlobal[0]);
-                console.log(`[Cleanup] Global cap (${MAX_ORDERS_TOTAL}), evicted oldest`);
-            }
-        }
+        await orderStore.evictOldestGlobal();
 
-        orders.set(orderId, { order: transformedOrder, status: 'NEW', createdAt: new Date() });
+        await orderStore.set(orderId, { order: transformedOrder, status: 'NEW', createdAt: new Date() });
         console.log('[YemekSepeti] Added to legacy queue (key:', orderId, ')');
 
         // Firebase direct write
@@ -1117,7 +1189,7 @@ app.put('/remoteId/:remoteId/remoteOrder/:remoteOrderId/posOrderStatus', authent
 
 // ==================== GETIRYEMEK WEBHOOKS (LEGACY COMPATIBILITY) ====================
 
-app.post('/webhook/newOrder', authenticatePlatformWebhook, async (req, res) => {
+app.post('/webhook/newOrder', webhookLimiter, authenticatePlatformWebhook, async (req, res) => {
     const order = req.body;
     const restaurantSecretKey = req.headers['x-restaurant-secret-key'] || API_KEYS.GETIRYEMEK_DEFAULT_RESTAURANT_SECRET;
     const branchId = req.headers['x-branch-id'] || req.query.branchId;
@@ -1135,13 +1207,14 @@ app.post('/webhook/newOrder', authenticatePlatformWebhook, async (req, res) => {
 
         // Legacy queue
         const webhookId = Date.now() + '_' + Math.random().toString(36).substr(2, 9);
-        getirYemekWebhooks.push({
+        const webhook = {
             id: webhookId,
             type: 'newOrder',
             data: order,
             restaurantSecretKey,
             timestamp: new Date()
-        });
+        };
+        await webhookStore.add(webhook);
 
         // Firebase direct write
         const firebaseResult = await writeOrderToFirebaseUnified(transformedOrder, 'getiryemek', branchId);
@@ -1183,19 +1256,20 @@ app.post('/webhook/newOrder', authenticatePlatformWebhook, async (req, res) => {
     }
 });
 
-app.post('/webhook/cancelOrder', authenticatePlatformWebhook, async (req, res) => {
+app.post('/webhook/cancelOrder', webhookLimiter, authenticatePlatformWebhook, async (req, res) => {
     const order = req.body;
     const restaurantSecretKey = req.headers['x-restaurant-secret-key'];
 
     console.log('[GetirYemek] Cancel Order:', order.id);
 
-    getirYemekWebhooks.push({
+    const cancelWebhook = {
         id: Date.now() + '_' + Math.random().toString(36).substr(2, 9),
         type: 'cancelOrder',
         data: { foodOrder: order },
         restaurantSecretKey,
         timestamp: new Date()
-    });
+    };
+    await webhookStore.add(cancelWebhook);
 
     const connector = platformRegistry.getConnector('getiryemek');
     if (connector && order.id) {
@@ -1219,33 +1293,35 @@ app.post('/webhook/cancelOrder', authenticatePlatformWebhook, async (req, res) =
     res.status(200).send('OK');
 });
 
-app.post('/webhook/courierArrival', authenticatePlatformWebhook, (req, res) => {
+app.post('/webhook/courierArrival', webhookLimiter, authenticatePlatformWebhook, async (req, res) => {
     const notification = req.body;
-    getirYemekWebhooks.push({
+    const arrivalWebhook = {
         id: Date.now() + '_' + Math.random().toString(36).substr(2, 9),
         type: 'courierArrival',
         data: notification,
         restaurantSecretKey: req.headers['x-restaurant-secret-key'],
         timestamp: new Date()
-    });
+    };
+    await webhookStore.add(arrivalWebhook);
     res.status(200).send('OK');
 });
 
-app.post('/webhook/restaurantStatus', authenticatePlatformWebhook, (req, res) => {
+app.post('/webhook/restaurantStatus', webhookLimiter, authenticatePlatformWebhook, async (req, res) => {
     const notification = req.body;
-    getirYemekWebhooks.push({
+    const statusWebhook = {
         id: Date.now() + '_' + Math.random().toString(36).substr(2, 9),
         type: 'restaurantStatus',
         data: notification,
         restaurantSecretKey: req.headers['x-restaurant-secret-key'],
         timestamp: new Date()
-    });
+    };
+    await webhookStore.add(statusWebhook);
     res.status(200).send('OK');
 });
 
 // ==================== TRENDYOLGO WEBHOOKS ====================
 
-app.post('/webhook/trendyolgo/order', authenticatePlatformWebhook, async (req, res) => {
+app.post('/webhook/trendyolgo/order', webhookLimiter, authenticatePlatformWebhook, async (req, res) => {
     const order = req.body;
     const branchId = req.headers['x-branch-id'] || req.query.branchId;
     if (!branchId) {
@@ -1298,9 +1374,37 @@ app.post('/webhook/trendyolgo/order', authenticatePlatformWebhook, async (req, r
     }
 });
 
+// TrendyolGo Cancel Webhook
+app.post('/webhook/trendyolgo/cancel', webhookLimiter, authenticatePlatformWebhook, async (req, res) => {
+    const order = req.body;
+    const branchId = req.headers['x-branch-id'] || req.query.branchId;
+
+    try {
+        const connector = platformRegistry.getConnector('trendyolgo');
+        if (connector && order.id) {
+            await connector.cancelOrder(order.id, order.cancelReason || 'UNKNOWN');
+        }
+
+        if (io && branchId) {
+            io.to(`branch:${branchId}`).emit('order:cancelled', {
+                orderId: order.id,
+                platform: 'trendyolgo',
+                reason: order.cancelReason || 'UNKNOWN',
+                timestamp: new Date().toISOString()
+            });
+        }
+
+        console.log(`[TrendyolGo] Order cancelled: ${order.id} (branch: ${branchId})`);
+        res.status(200).json({ success: true });
+    } catch (error) {
+        console.error('[TrendyolGo] Cancel webhook error:', error.message);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
 // ==================== LEGACY POLLING ENDPOINTS ====================
 
-app.get('/api/yemeksepeti/pending-orders', (req, res) => {
+app.get('/api/yemeksepeti/pending-orders', pollingLimiter, async (req, res) => {
     const apiKey = req.headers['x-api-key'];
     if (apiKey !== API_KEYS.YEMEKSEPETI_POLLING_KEY) {
         return res.status(401).json({ error: 'Unauthorized' });
@@ -1314,11 +1418,17 @@ app.get('/api/yemeksepeti/pending-orders', (req, res) => {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
-    let newOrders = Array.from(orders.entries())
-        .filter(([key, item]) => new Date(item.createdAt) >= today)
-        .filter(([key, item]) => item.order.branchId === branchId);
-
-    const result = newOrders.map(([key, item]) => ({ ...item.order, _railwayKey: key, CreatedAt: item.createdAt.toISOString() }));
+    // O(k) lookup via OrderStore branch index
+    const branchOrders = await orderStore.getBranchOrders(branchId);
+    const result = [];
+    for (const { orderId, orderData } of branchOrders) {
+        if (new Date(orderData.createdAt) >= today) {
+            const createdAt = orderData.createdAt instanceof Date
+                ? orderData.createdAt.toISOString()
+                : new Date(orderData.createdAt).toISOString();
+            result.push({ ...orderData.order, _railwayKey: orderId, CreatedAt: createdAt });
+        }
+    }
 
     if (result.length > 0) {
         console.log(`[YemekSepeti POLL] ${result.length} orders returned to ${req.ip} (branchId: ${branchId})`);
@@ -1327,7 +1437,7 @@ app.get('/api/yemeksepeti/pending-orders', (req, res) => {
     res.json({ success: true, count: result.length, orders: result });
 });
 
-app.delete('/api/yemeksepeti/orders/:orderId', (req, res) => {
+app.delete('/api/yemeksepeti/orders/:orderId', async (req, res) => {
     const apiKey = req.headers['x-api-key'];
     if (apiKey !== API_KEYS.YEMEKSEPETI_POLLING_KEY) {
         return res.status(401).json({ error: 'Unauthorized' });
@@ -1336,49 +1446,58 @@ app.delete('/api/yemeksepeti/orders/:orderId', (req, res) => {
     const orderId = req.params.orderId;
     console.log(`[YemekSepeti DELETE] Order delete request: ${orderId} from ${req.ip}`);
 
-    if (orders.has(orderId)) {
+    // Try direct key match first
+    const found = await orderStore.has(orderId);
+    if (found) {
+        await orderStore.delete(orderId);
         console.log(`[YemekSepeti DELETE] Deleted by key: ${orderId}`);
-        orders.delete(orderId);
         return res.json({ success: true });
     }
 
-    for (const [key, item] of orders.entries()) {
-        if (item.order.OrderId === orderId || item.order.OrderToken === orderId) {
-            console.log(`[YemekSepeti DELETE] Deleted by OrderId/Token match: key=${key}, orderId=${orderId}`);
-            orders.delete(key);
-            return res.json({ success: true });
-        }
+    // Fallback: scan by OrderId or OrderToken field
+    const byOrderId = await orderStore.findByField('OrderId', orderId);
+    if (byOrderId) {
+        await orderStore.delete(byOrderId.orderId);
+        console.log(`[YemekSepeti DELETE] Deleted by OrderId match: key=${byOrderId.orderId}, orderId=${orderId}`);
+        return res.json({ success: true });
+    }
+
+    const byToken = await orderStore.findByField('OrderToken', orderId);
+    if (byToken) {
+        await orderStore.delete(byToken.orderId);
+        console.log(`[YemekSepeti DELETE] Deleted by Token match: key=${byToken.orderId}, orderId=${orderId}`);
+        return res.json({ success: true });
     }
 
     console.log(`[YemekSepeti DELETE] Order not found: ${orderId}`);
     res.status(404).json({ success: false, message: 'Order not found' });
 });
 
-app.get('/api/yemeksepeti/cancellations', (req, res) => {
+app.get('/api/yemeksepeti/cancellations', pollingLimiter, async (req, res) => {
     const apiKey = req.headers['x-api-key'];
     if (apiKey !== API_KEYS.YEMEKSEPETI_POLLING_KEY) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    const pendingCancellations = Array.from(cancellations.values());
+    const pendingCancellations = await cancellationStore.getAll();
     res.json({ success: true, count: pendingCancellations.length, cancellations: pendingCancellations });
 });
 
-app.delete('/api/yemeksepeti/cancellations/:cancellationId', (req, res) => {
+app.delete('/api/yemeksepeti/cancellations/:cancellationId', async (req, res) => {
     const apiKey = req.headers['x-api-key'];
     if (apiKey !== API_KEYS.YEMEKSEPETI_POLLING_KEY) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    if (cancellations.has(req.params.cancellationId)) {
-        cancellations.delete(req.params.cancellationId);
+    const deleted = await cancellationStore.delete(req.params.cancellationId);
+    if (deleted) {
         res.json({ success: true });
     } else {
         res.status(404).json({ success: false });
     }
 });
 
-app.get('/poll/webhooks', (req, res) => {
+app.get('/poll/webhooks', pollingLimiter, async (req, res) => {
     const apiKey = req.headers['x-api-key'];
     if (apiKey !== API_KEYS.GETIRYEMEK_POLLING_KEY) {
         return res.status(401).json({ error: 'Unauthorized' });
@@ -1386,21 +1505,20 @@ app.get('/poll/webhooks', (req, res) => {
 
     const restaurantSecretKey = req.query.restaurantSecretKey;
     const filteredWebhooks = restaurantSecretKey
-        ? getirYemekWebhooks.filter(w => w.restaurantSecretKey === restaurantSecretKey)
-        : getirYemekWebhooks;
+        ? await webhookStore.getByRestaurantKey(restaurantSecretKey)
+        : await webhookStore.getAll();
 
     res.json({ success: true, webhooks: filteredWebhooks });
 });
 
-app.delete('/api/getiryemek/webhooks/:webhookId', (req, res) => {
+app.delete('/api/getiryemek/webhooks/:webhookId', async (req, res) => {
     const apiKey = req.headers['x-api-key'];
     if (apiKey !== API_KEYS.GETIRYEMEK_POLLING_KEY) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    const index = getirYemekWebhooks.findIndex(w => w.id === req.params.webhookId);
-    if (index !== -1) {
-        getirYemekWebhooks.splice(index, 1);
+    const removed = await webhookStore.deleteById(req.params.webhookId);
+    if (removed) {
         res.json({ success: true });
     } else {
         res.status(404).json({ success: false });
@@ -1409,14 +1527,41 @@ app.delete('/api/getiryemek/webhooks/:webhookId', (req, res) => {
 
 // ==================== HEALTH & INFO ====================
 
-app.get('/health', (req, res) => {
+app.get('/health', async (req, res) => {
+    const redisStatus = getRedisStatus();
+    const redisConnected = redisStatus.connected === true;
+
+    // Multi-instance readiness: all critical state must be in Redis
+    const instanceLocalState = [];
+    if (!redisConnected) {
+        instanceLocalState.push('orderStore (memory fallback)');
+        instanceLocalState.push('cancellationStore (memory fallback)');
+        instanceLocalState.push('webhookStore (memory fallback)');
+        instanceLocalState.push('courierState (memory fallback)');
+        instanceLocalState.push('dispatchWeightCache (memory fallback)');
+    }
+    // These are always instance-local but acceptable
+    const acceptableLocal = [
+        'requestLog (debug, per-instance)',
+        'lastLazyCleanup (idempotent)',
+        'rateLimiters (per-instance acceptable)',
+        'consecutiveFailures (per-instance alerts)'
+    ];
+
     res.json({
         status: 'ok',
         service: 'YemiGO Platform Hub Server',
         version: '4.0.0',
         firebase: firebaseInitialized ? 'connected' : 'disabled',
         platforms: platformRegistry.getAllPlatforms().length,
-        connectors: platformRegistry.connectors.size
+        connectors: platformRegistry.connectors.size,
+        ordersTotal: await orderStore.size(),
+        indexedBranches: await orderStore.indexedBranchCount(),
+        redis: redisStatus,
+        multiInstance: {
+            ready: redisConnected,
+            warnings: redisConnected ? acceptableLocal : instanceLocalState.concat(acceptableLocal)
+        }
     });
 });
 
@@ -1444,12 +1589,11 @@ app.get('/api/health/branch/:branchId', async (req, res) => {
     }
 
     // 3. Socket.IO bağlantı durumu
-    const branchCouriers = [...courierLocations.entries()]
-        .filter(([_, loc]) => loc.branchId === branchId);
+    const branchCouriers = await courierState.getLocationsByBranch(branchId);
 
-    // 4. Kuyruk boyutları (in-memory)
-    const branchOrders = [...orders.values()].filter(o => o.branchId === branchId);
-    const branchCancellations = [...cancellations.values()].filter(c => c.branchId === branchId);
+    // 4. Kuyruk boyutları
+    const branchOrderCount = await orderStore.getBranchOrderCount(branchId);
+    const branchCancellations = await cancellationStore.getByBranch(branchId);
 
     res.json({
         branchId,
@@ -1461,17 +1605,18 @@ app.get('/api/health/branch/:branchId', async (req, res) => {
             socketServerConnected: true
         },
         queues: {
-            orders: branchOrders.length,
+            orders: branchOrderCount,
             cancellations: branchCancellations.length
         }
     });
 });
 
-app.get('/', (req, res) => {
+app.get('/', async (req, res) => {
+    const allEntries = await orderStore.getAllEntries();
     const ordersByStatus = {};
-    orders.forEach(item => {
+    for (const [, item] of allEntries) {
         ordersByStatus[item.status] = (ordersByStatus[item.status] || 0) + 1;
-    });
+    }
 
     res.json({
         service: 'YemiGO Platform Hub Server',
@@ -1485,12 +1630,22 @@ app.get('/', (req, res) => {
             platforms: platformRegistry.getAllPlatforms().map(p => ({ id: p.id, name: p.name, enabled: p.enabled })),
             connectors: Array.from(platformRegistry.connectors.keys())
         },
+        rateLimits: {
+            global: '15000/min',
+            polling: '10000/min',
+            webhook: '5000/min'
+        },
         queues: {
-            yemeksepeti: { totalOrders: orders.size, ordersByStatus },
-            getiryemek: { pendingWebhooks: getirYemekWebhooks.length }
+            yemeksepeti: { totalOrders: allEntries.length, ordersByStatus },
+            getiryemek: { pendingWebhooks: await webhookStore.size(), indexedKeys: await webhookStore.indexedKeyCount() },
+            cleanup: {
+                lastLazyCleanup: new Date(lastLazyCleanup).toISOString(),
+                lazyThresholdMin: LAZY_CLEANUP_THRESHOLD / 60000,
+                scheduledIntervalMin: 5
+            }
         },
         sockets: {
-            connectedCouriers: connectedCouriers.size,
+            connectedCouriers: await courierState.connectedCount(),
             totalConnections: io.sockets.sockets.size
         },
         api: {
@@ -1506,16 +1661,18 @@ app.get('/', (req, res) => {
     });
 });
 
-app.get('/socket/status', (req, res) => {
+app.get('/socket/status', async (req, res) => {
+    const allConnected = await courierState.getAllConnected();
     const couriers = [];
-    for (const [courierId, socketId] of connectedCouriers.entries()) {
+    for (const { courierId, socketId } of allConnected) {
         const courierSocket = io.sockets.sockets.get(socketId);
+        const location = await courierState.getLocation(courierId);
         if (courierSocket) {
             couriers.push({
                 courierId,
                 name: courierSocket.courierName,
                 branchId: courierSocket.branchId,
-                location: courierLocations.get(courierId) || null
+                location: location || null
             });
         }
     }
@@ -1530,7 +1687,7 @@ app.get('/socket/status', (req, res) => {
 
 // ==================== REQUEST LOG ENDPOINT ====================
 
-app.get('/debug/requests', (req, res) => {
+app.get('/debug/requests', async (req, res) => {
     const apiKey = req.headers['x-api-key'];
     if (apiKey !== API_KEYS.YEMEKSEPETI_POLLING_KEY && apiKey !== API_KEYS.ADMIN_API_KEY) {
         return res.status(401).json({ error: 'Unauthorized' });
@@ -1543,11 +1700,12 @@ app.get('/debug/requests', (req, res) => {
         logs = logs.filter(l => l.path.toLowerCase().includes(filter.toLowerCase()));
     }
 
+    const queueSize = await orderStore.size();
     res.json({
         total: logs.length,
         serverStartTime: serverStartTime,
         currentTime: new Date().toISOString(),
-        queueSize: orders.size,
+        queueSize,
         logs: logs.slice(-50) // last 50 entries
     });
 });
@@ -1556,49 +1714,36 @@ const serverStartTime = new Date().toISOString();
 
 // ==================== CLEANUP ====================
 
-function cleanupOldOrders() {
+async function cleanupOldOrders() {
     const yesterday = new Date();
     yesterday.setDate(yesterday.getDate() - 1);
     yesterday.setHours(0, 0, 0, 0);
 
     let deleted = 0;
 
-    for (const [key, item] of orders.entries()) {
-        if (new Date(item.createdAt) < yesterday) {
-            orders.delete(key);
-            deleted++;
-        }
-    }
+    // Orders via OrderStore
+    const ordersCleaned = await orderStore.deleteOlderThan(yesterday);
+    deleted += ordersCleaned;
 
-    for (const [key, item] of cancellations.entries()) {
-        if (new Date(item.createdAt) < yesterday) {
-            cancellations.delete(key);
-            deleted++;
-        }
-    }
+    const cancellationsCleaned = await cancellationStore.deleteOlderThan(yesterday);
+    deleted += cancellationsCleaned;
 
-    for (let i = getirYemekWebhooks.length - 1; i >= 0; i--) {
-        if (new Date(getirYemekWebhooks[i].timestamp) < yesterday) {
-            getirYemekWebhooks.splice(i, 1);
-            deleted++;
-        }
-    }
+    const webhooksCleaned = await webhookStore.deleteOlderThan(yesterday);
+    deleted += webhooksCleaned;
 
     // Stale courier locations (30 min no update = stale)
-    const thirtyMinAgo = new Date(Date.now() - 30 * 60 * 1000);
-    for (const [courierId, loc] of courierLocations.entries()) {
-        if (new Date(loc.timestamp) < thirtyMinAgo) {
-            courierLocations.delete(courierId);
-            deleted++;
-        }
-    }
+    const staleCleaned = await courierState.deleteStaleLocations(30 * 60 * 1000);
+    deleted += staleCleaned;
 
     if (deleted > 0) {
         console.log(`[Cleanup] Deleted ${deleted} old items`);
     }
 
-    if (orders.size > 0 || cancellations.size > 0) {
-        console.log(`[Cleanup] Remaining: orders=${orders.size}, cancellations=${cancellations.size}, getirWebhooks=${getirYemekWebhooks.length}`);
+    const remainingOrders = await orderStore.size();
+    const remainingCancellations = await cancellationStore.size();
+    const remainingWebhooks = await webhookStore.size();
+    if (remainingOrders > 0 || remainingCancellations > 0) {
+        console.log(`[Cleanup] Remaining: orders=${remainingOrders}, cancellations=${remainingCancellations}, getirWebhooks=${remainingWebhooks}`);
     }
 }
 
@@ -1617,6 +1762,11 @@ async function startServer() {
     // Initialize Platform Hub
     await initializePlatformHub();
 
+    // Initialize Redis client (graceful fallback to in-memory if REDIS_URL not set)
+    getRedisClient();
+    const redisStatus = getRedisStatus();
+    console.log(`[Startup] Redis: ${redisStatus.mode} (connected: ${redisStatus.connected})`);
+
     server.listen(PORT, () => {
         console.log('');
         console.log('================================================================================');
@@ -1624,6 +1774,7 @@ async function startServer() {
         console.log('================================================================================');
         console.log(`  Port: ${PORT}`);
         console.log(`  Firebase: ${firebaseInitialized ? '✅ CONNECTED' : '⚠️ DISABLED'}`);
+        console.log(`  Redis: ${redisStatus.mode === 'redis' ? '✅ CONNECTED' : '⚡ IN-MEMORY FALLBACK'}`);
         console.log(`  Socket.io: ✅ Ready`);
         console.log('');
         console.log('  PLATFORM CONNECTORS:');
