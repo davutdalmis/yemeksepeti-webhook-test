@@ -16,6 +16,7 @@ const http = require('http');
 const { Server } = require('socket.io');
 const admin = require('firebase-admin');
 const geolib = require('geolib');
+const rateLimit = require('express-rate-limit');
 
 // Modular imports
 const PlatformRegistry = require('./services/platforms/platform-registry');
@@ -47,6 +48,14 @@ const io = new Server(server, {
 });
 
 app.use(express.json());
+
+app.use(rateLimit({
+    windowMs: 60 * 1000,
+    max: 5000,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Server rate limit exceeded' }
+}));
 
 // ==================== REQUEST LOG (DEBUG) ====================
 const requestLog = [];
@@ -84,6 +93,10 @@ const orders = new Map();
 const cancellations = new Map();
 const getirYemekWebhooks = [];
 
+// ==================== IN-MEMORY LIMITS ====================
+const MAX_ORDERS_PER_BRANCH = 500;
+const MAX_ORDERS_TOTAL = 10000;
+
 // ==================== API KEY CONFIGURATION ====================
 const API_KEYS = {
     YEMEKSEPETI_POLLING_KEY: process.env.YEMEKSEPETI_POLLING_API_KEY || null,
@@ -99,7 +112,7 @@ const SOCKET_AUTH_TOKEN = process.env.SOCKET_AUTH_TOKEN || null;
 
 // Webhook authentication middleware
 function authenticateWebhook(req, res, next) {
-    if (!WEBHOOK_SECRET) return next(); // Skip if not configured
+    if (!WEBHOOK_SECRET) return res.status(503).json({ error: 'Webhook authentication not configured' });
     const secret = req.headers['x-webhook-secret'] || req.query.secret;
     if (secret !== WEBHOOK_SECRET) {
         console.warn(`[Security] Unauthorized webhook attempt from ${req.ip} to ${req.path}`);
@@ -939,7 +952,11 @@ app.post('/order/:remoteId', authenticateWebhook, async (req, res) => {
     const order = req.body;
     // remoteId = POS Vendor ID = Firestore branch document ID (e.g. QgNkbMyFVgDWGqbHG1ZS)
     // DH sends webhooks to /order/{remoteId} where remoteId maps directly to branchId
-    const branchId = remoteId || req.headers['x-branch-id'] || req.query.branchId || process.env.DEFAULT_BRANCH_ID;
+    const branchId = remoteId || req.headers['x-branch-id'] || req.query.branchId;
+    if (!branchId) {
+        console.error('[YemekSepeti] ❌ branchId belirlenemedi — sipariş reddedildi (multi-tenant güvenlik)');
+        return res.status(400).json({ error: 'branchId is required' });
+    }
 
     // Şube doğrulama (soft validation — sadece loglama, siparişi engellemez)
     try {
@@ -986,6 +1003,29 @@ app.post('/order/:remoteId', authenticateWebhook, async (req, res) => {
 
         // Legacy queue (WPF polling)
         const orderId = order.token;
+
+        // Per-branch cap
+        const branchOrders = [...orders.entries()]
+            .filter(([_, item]) => item.order?.branchId === branchId);
+        if (branchOrders.length >= MAX_ORDERS_PER_BRANCH) {
+            const oldest = branchOrders.sort((a, b) =>
+                new Date(a[1].createdAt) - new Date(b[1].createdAt))[0];
+            if (oldest) {
+                orders.delete(oldest[0]);
+                console.log(`[Cleanup] Branch ${branchId} cap (${MAX_ORDERS_PER_BRANCH}), evicted oldest`);
+            }
+        }
+
+        // Global cap
+        if (orders.size >= MAX_ORDERS_TOTAL) {
+            const oldestGlobal = [...orders.entries()]
+                .sort((a, b) => new Date(a[1].createdAt) - new Date(b[1].createdAt))[0];
+            if (oldestGlobal) {
+                orders.delete(oldestGlobal[0]);
+                console.log(`[Cleanup] Global cap (${MAX_ORDERS_TOTAL}), evicted oldest`);
+            }
+        }
+
         orders.set(orderId, { order: transformedOrder, status: 'NEW', createdAt: new Date() });
         console.log('[YemekSepeti] Added to legacy queue (key:', orderId, ')');
 
@@ -1072,7 +1112,11 @@ app.put('/remoteId/:remoteId/remoteOrder/:remoteOrderId/posOrderStatus', authent
 app.post('/webhook/newOrder', authenticateWebhook, async (req, res) => {
     const order = req.body;
     const restaurantSecretKey = req.headers['x-restaurant-secret-key'] || API_KEYS.GETIRYEMEK_DEFAULT_RESTAURANT_SECRET;
-    const branchId = req.headers['x-branch-id'] || req.query.branchId || process.env.DEFAULT_BRANCH_ID;
+    const branchId = req.headers['x-branch-id'] || req.query.branchId;
+    if (!branchId) {
+        console.error('[GetirYemek] ❌ branchId belirlenemedi — sipariş reddedildi (multi-tenant güvenlik)');
+        return res.status(400).json({ error: 'branchId is required' });
+    }
 
     console.log('[GetirYemek] ========== NEW ORDER ==========');
 
@@ -1151,7 +1195,10 @@ app.post('/webhook/cancelOrder', authenticateWebhook, async (req, res) => {
     }
 
     // Socket.IO: sipariş iptal bildirimi
-    const branchId = req.headers['x-branch-id'] || req.query.branchId || process.env.DEFAULT_BRANCH_ID;
+    const branchId = req.headers['x-branch-id'] || req.query.branchId;
+    if (!branchId) {
+        console.error('[GetirYemek] ❌ branchId belirlenemedi — iptal yayını atlandı (multi-tenant güvenlik)');
+    }
     if (branchId) {
         io.to(`branch:${branchId}`).emit('order:cancelled', {
             orderId: order.id,
@@ -1192,7 +1239,11 @@ app.post('/webhook/restaurantStatus', authenticateWebhook, (req, res) => {
 
 app.post('/webhook/trendyolgo/order', authenticateWebhook, async (req, res) => {
     const order = req.body;
-    const branchId = req.headers['x-branch-id'] || req.query.branchId || process.env.DEFAULT_BRANCH_ID;
+    const branchId = req.headers['x-branch-id'] || req.query.branchId;
+    if (!branchId) {
+        console.error('[TrendyolGo] ❌ branchId belirlenemedi — sipariş reddedildi (multi-tenant güvenlik)');
+        return res.status(400).json({ error: 'branchId is required' });
+    }
 
     console.log('[TrendyolGo] ========== NEW ORDER ==========');
 
@@ -1537,9 +1588,13 @@ function cleanupOldOrders() {
     if (deleted > 0) {
         console.log(`[Cleanup] Deleted ${deleted} old items`);
     }
+
+    if (orders.size > 0 || cancellations.size > 0) {
+        console.log(`[Cleanup] Remaining: orders=${orders.size}, cancellations=${cancellations.size}, getirWebhooks=${getirYemekWebhooks.length}`);
+    }
 }
 
-setInterval(cleanupOldOrders, 15 * 60 * 1000); // 15 dakikada bir
+setInterval(cleanupOldOrders, 5 * 60 * 1000); // 5 dakikada bir
 setTimeout(cleanupOldOrders, 30000);
 
 // ==================== SERVER START ====================
@@ -1547,6 +1602,11 @@ setTimeout(cleanupOldOrders, 30000);
 const PORT = process.env.PORT || 3000;
 
 async function startServer() {
+    if (!WEBHOOK_SECRET) {
+        console.error('FATAL: WEBHOOK_SECRET environment variable is required.');
+        process.exit(1);
+    }
+
     // Initialize Platform Hub
     await initializePlatformHub();
 
