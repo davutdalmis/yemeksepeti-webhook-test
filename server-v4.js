@@ -110,7 +110,7 @@ const API_KEYS = {
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || null;
 const SOCKET_AUTH_TOKEN = process.env.SOCKET_AUTH_TOKEN || null;
 
-// Webhook authentication middleware
+// Webhook authentication middleware (internal API'ler için)
 function authenticateWebhook(req, res, next) {
     if (!WEBHOOK_SECRET) return res.status(503).json({ error: 'Webhook authentication not configured' });
     const secret = req.headers['x-webhook-secret'] || req.query.secret;
@@ -118,6 +118,13 @@ function authenticateWebhook(req, res, next) {
         console.warn(`[Security] Unauthorized webhook attempt from ${req.ip} to ${req.path}`);
         return res.status(401).json({ error: 'Unauthorized webhook' });
     }
+    next();
+}
+
+// Platform webhook'ları için auth (DH/GetirYemek/TrendyolGo kendi secret'larını göndermez)
+function authenticatePlatformWebhook(req, res, next) {
+    // Platform webhook'ları doğrudan gelir, x-webhook-secret göndermezler
+    // Gelecekte platform-bazlı doğrulama eklenebilir (IP whitelist, HMAC vs.)
     next();
 }
 
@@ -947,7 +954,7 @@ app.use('/api/v2/platforms', createPlatformsApi(platformRegistry, db));
 
 // ==================== YEMEKSEPETI WEBHOOKS (LEGACY COMPATIBILITY) ====================
 
-app.post('/order/:remoteId', authenticateWebhook, async (req, res) => {
+app.post('/order/:remoteId', authenticatePlatformWebhook, async (req, res) => {
     const { remoteId } = req.params;
     const order = req.body;
     // remoteId = POS Vendor ID = Firestore branch document ID (e.g. QgNkbMyFVgDWGqbHG1ZS)
@@ -1075,7 +1082,7 @@ app.post('/order/:remoteId', authenticateWebhook, async (req, res) => {
 });
 
 // YemekSepeti Status Update
-app.put('/remoteId/:remoteId/remoteOrder/:remoteOrderId/posOrderStatus', authenticateWebhook, async (req, res) => {
+app.put('/remoteId/:remoteId/remoteOrder/:remoteOrderId/posOrderStatus', authenticatePlatformWebhook, async (req, res) => {
     const { remoteOrderId } = req.params;
     const statusUpdate = req.body;
 
@@ -1109,7 +1116,7 @@ app.put('/remoteId/:remoteId/remoteOrder/:remoteOrderId/posOrderStatus', authent
 
 // ==================== GETIRYEMEK WEBHOOKS (LEGACY COMPATIBILITY) ====================
 
-app.post('/webhook/newOrder', authenticateWebhook, async (req, res) => {
+app.post('/webhook/newOrder', authenticatePlatformWebhook, async (req, res) => {
     const order = req.body;
     const restaurantSecretKey = req.headers['x-restaurant-secret-key'] || API_KEYS.GETIRYEMEK_DEFAULT_RESTAURANT_SECRET;
     const branchId = req.headers['x-branch-id'] || req.query.branchId;
@@ -1175,7 +1182,7 @@ app.post('/webhook/newOrder', authenticateWebhook, async (req, res) => {
     }
 });
 
-app.post('/webhook/cancelOrder', authenticateWebhook, async (req, res) => {
+app.post('/webhook/cancelOrder', authenticatePlatformWebhook, async (req, res) => {
     const order = req.body;
     const restaurantSecretKey = req.headers['x-restaurant-secret-key'];
 
@@ -1211,7 +1218,7 @@ app.post('/webhook/cancelOrder', authenticateWebhook, async (req, res) => {
     res.status(200).send('OK');
 });
 
-app.post('/webhook/courierArrival', authenticateWebhook, (req, res) => {
+app.post('/webhook/courierArrival', authenticatePlatformWebhook, (req, res) => {
     const notification = req.body;
     getirYemekWebhooks.push({
         id: Date.now() + '_' + Math.random().toString(36).substr(2, 9),
@@ -1223,7 +1230,7 @@ app.post('/webhook/courierArrival', authenticateWebhook, (req, res) => {
     res.status(200).send('OK');
 });
 
-app.post('/webhook/restaurantStatus', authenticateWebhook, (req, res) => {
+app.post('/webhook/restaurantStatus', authenticatePlatformWebhook, (req, res) => {
     const notification = req.body;
     getirYemekWebhooks.push({
         id: Date.now() + '_' + Math.random().toString(36).substr(2, 9),
@@ -1237,7 +1244,7 @@ app.post('/webhook/restaurantStatus', authenticateWebhook, (req, res) => {
 
 // ==================== TRENDYOLGO WEBHOOKS ====================
 
-app.post('/webhook/trendyolgo/order', authenticateWebhook, async (req, res) => {
+app.post('/webhook/trendyolgo/order', authenticatePlatformWebhook, async (req, res) => {
     const order = req.body;
     const branchId = req.headers['x-branch-id'] || req.query.branchId;
     if (!branchId) {
@@ -1603,8 +1610,7 @@ const PORT = process.env.PORT || 3000;
 
 async function startServer() {
     if (!WEBHOOK_SECRET) {
-        console.error('FATAL: WEBHOOK_SECRET environment variable is required.');
-        process.exit(1);
+        console.warn('WARNING: WEBHOOK_SECRET not set — internal API authentication disabled. Platform webhooks still accepted.');
     }
 
     // Initialize Platform Hub
