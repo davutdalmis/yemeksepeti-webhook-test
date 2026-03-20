@@ -155,11 +155,12 @@ class BasePlatformConnector {
     }
 
     // Siparişe kurye ata (status değiştirmez - mevcut status korunur)
-    // Atomically increments courier's activeOrderCount
+    // Firestore Transaction ile atomik atama — çift atama riskini önler
     async assignCourier(orderId, courierId, courierName) {
         if (!this.db) return { success: false, reason: 'firebase_disabled' };
 
         try {
+            // Step 1: Resolve doc refs OUTSIDE transaction (collectionGroup not allowed inside)
             const ordersSnapshot = await this.db.collectionGroup(this.collectionName)
                 .where('OrderId', '==', orderId)
                 .get();
@@ -168,38 +169,107 @@ class BasePlatformConnector {
                 return { success: false, reason: 'order_not_found' };
             }
 
-            const updateData = {
-                assignedCourierId: courierId,
-                assignedCourierName: courierName,
-                assignedAt: admin.firestore.FieldValue.serverTimestamp()
-            };
+            const orderRefs = ordersSnapshot.docs.map(doc => doc.ref);
 
-            // Update order document(s)
-            await Promise.all(ordersSnapshot.docs.map(doc => doc.ref.update(updateData)));
+            // Resolve courier refs (new + old if reassignment)
+            let courierRef = null;
+            let oldCourierRef = null;
+            const orderData = ordersSnapshot.docs[0].data();
+            const oldCourierId = orderData.assignedCourierId;
 
-            // Atomically increment courier's activeOrderCount
             try {
                 const courierQuery = await this.db.collectionGroup('couriers')
-                    .where(admin.firestore.FieldPath.documentId(), '==', courierId)
-                    .limit(1)
+                    .where('branchId', '==', orderData.branchId)
+                    .where('isActive', '==', true)
                     .get();
 
-                if (!courierQuery.empty) {
-                    await courierQuery.docs[0].ref.update({
-                        activeOrderCount: admin.firestore.FieldValue.increment(1)
-                    });
-                    console.log(`[${this.platformId}] Courier activeOrderCount incremented: ${courierName}`);
+                const newCourierDoc = courierQuery.docs.find(doc => doc.id === courierId);
+                if (newCourierDoc) {
+                    courierRef = newCourierDoc.ref;
                 }
-            } catch (counterError) {
-                // Non-fatal: order is still assigned even if counter update fails
-                console.warn(`[${this.platformId}] Failed to increment activeOrderCount for ${courierName}:`, counterError.message);
+
+                // Resolve old courier ref for reassignment (decrement their count)
+                if (oldCourierId && oldCourierId !== courierId) {
+                    const oldCourierDoc = courierQuery.docs.find(doc => doc.id === oldCourierId);
+                    if (oldCourierDoc) {
+                        oldCourierRef = oldCourierDoc.ref;
+                    }
+                }
+            } catch (lookupError) {
+                console.warn(`[${this.platformId}] Courier lookup failed, proceeding without counter:`, lookupError.message);
             }
 
-            console.log(`[${this.platformId}] Courier assigned: ${courierName} -> ${orderId}`);
-            return { success: true, orderId };
+            // Step 2: Run transaction — atomically check guards + update
+            const result = await this.db.runTransaction(async (transaction) => {
+                // Read order inside transaction to check for concurrent assignment
+                const orderDoc = await transaction.get(orderRefs[0]);
+                if (!orderDoc.exists) {
+                    throw new Error('order_not_found');
+                }
+
+                const orderData = orderDoc.data();
+
+                // Reassignment: if already assigned to another courier, decrement old courier's count
+                // (no longer a guard — allows reassignment atomically)
+
+                // Guard: check courier capacity
+                if (courierRef) {
+                    const courierDoc = await transaction.get(courierRef);
+                    if (courierDoc.exists) {
+                        const courierData = courierDoc.data();
+                        const maxCapacity = courierData.maxCapacity || 5;
+                        const activeCount = courierData.activeOrderCount || 0;
+                        if (activeCount >= maxCapacity) {
+                            throw new Error(`courier_at_capacity:${activeCount}/${maxCapacity}`);
+                        }
+                    }
+                }
+
+                // All guards passed — write
+                const updateData = {
+                    assignedCourierId: courierId,
+                    assignedCourierName: courierName,
+                    assignedAt: admin.firestore.FieldValue.serverTimestamp()
+                };
+
+                // Update all order docs (usually 1, but could be more)
+                for (const ref of orderRefs) {
+                    transaction.update(ref, updateData);
+                }
+
+                // Increment new courier's activeOrderCount
+                if (courierRef) {
+                    transaction.update(courierRef, {
+                        activeOrderCount: admin.firestore.FieldValue.increment(1)
+                    });
+                }
+
+                // Decrement old courier's activeOrderCount (reassignment)
+                if (oldCourierRef) {
+                    transaction.update(oldCourierRef, {
+                        activeOrderCount: admin.firestore.FieldValue.increment(-1)
+                    });
+                }
+
+                return { success: true, orderId };
+            });
+
+            console.log(`[${this.platformId}] Courier assigned (atomic): ${courierName} -> ${orderId}`);
+            return result;
         } catch (error) {
-            console.error(`[${this.platformId}] Assign courier error:`, error.message);
-            return { success: false, reason: error.message };
+            const reason = error.message || 'unknown_error';
+
+            if (reason.startsWith('already_assigned:')) {
+                console.warn(`[${this.platformId}] Order ${orderId} already assigned to ${reason.split(':')[1]}`);
+                return { success: false, reason: 'already_assigned', assignedTo: reason.split(':')[1] };
+            }
+            if (reason.startsWith('courier_at_capacity:')) {
+                console.warn(`[${this.platformId}] Courier ${courierName} at capacity: ${reason.split(':')[1]}`);
+                return { success: false, reason: 'courier_at_capacity' };
+            }
+
+            console.error(`[${this.platformId}] Assign courier error:`, reason);
+            return { success: false, reason };
         }
     }
 

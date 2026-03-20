@@ -3,8 +3,9 @@
 // ==================================================================================
 
 const express = require('express');
+const admin = require('firebase-admin');
 
-function createOrdersApi(registry, smartDispatch, { sendPushNotification, notifyCourierNewOrder } = {}) {
+function createOrdersApi(registry, smartDispatch, { sendPushNotification, notifyCourierNewOrder, db, dispatchMetrics, dispatchQueue } = {}) {
     const router = express.Router();
 
     // API Key authentication middleware
@@ -102,6 +103,15 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
                             }
                         } else {
                             console.log(`[OrdersAPI] No courier available for auto-assign: ${platformId}/${orderId}`);
+                            // Enqueue for retry if dispatch queue is available
+                            if (dispatchQueue) {
+                                await dispatchQueue.enqueue({
+                                    orderId,
+                                    platformId,
+                                    branchId,
+                                    deliveryLocation
+                                });
+                            }
                         }
                     }
                 } catch (assignError) {
@@ -231,6 +241,7 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
     /**
      * POST /api/orders/:platformId/:orderId/pickup
      * Sipariş teslim alındı (kurye aldı)
+     * Platform API + Firestore status + orderStatusHistory kaydı
      */
     router.post('/:platformId/:orderId/pickup', async (req, res) => {
         const { platformId, orderId } = req.params;
@@ -246,24 +257,43 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
                 });
             }
 
+            // Call platform API (non-blocking for Firestore update)
             const branchConfig = registry.getBranchPlatformConfig(branchId, platformId) || {};
-            const result = await connector.markOrderPickedUp(orderId, branchConfig);
-
-            if (result.success) {
-                console.log(`[OrdersAPI] Order picked up: ${platformId}/${orderId}`);
-                res.json({
-                    success: true,
-                    orderId,
-                    platform: platformId,
-                    status: 'PICKED_UP'
-                });
-            } else {
-                res.status(400).json({
-                    success: false,
-                    error: result.reason,
-                    code: 'PICKUP_FAILED'
-                });
+            let platformResult = { success: true };
+            try {
+                platformResult = await connector.markOrderPickedUp(orderId, branchConfig);
+            } catch (platformError) {
+                console.warn(`[OrdersAPI] Platform pickup API failed (continuing with Firestore): ${platformError.message}`);
+                platformResult = { success: false, reason: platformError.message };
             }
+
+            // Always update Firestore status regardless of platform API result
+            await connector.updateOrderStatus(orderId, 'PICKED_UP', {
+                pickedUpAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+
+            // Record in orderStatusHistory
+            if (db) {
+                try {
+                    await db.collection('orderStatusHistory').doc(orderId).collection('events').add({
+                        status: 'PICKED_UP',
+                        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+                        source: 'orders-api',
+                        platformApiSuccess: platformResult.success
+                    });
+                } catch (historyError) {
+                    console.warn(`[OrdersAPI] Status history write failed (non-fatal):`, historyError.message);
+                }
+            }
+
+            console.log(`[OrdersAPI] Order picked up: ${platformId}/${orderId} (platform API: ${platformResult.success})`);
+            res.json({
+                success: true,
+                orderId,
+                platform: platformId,
+                status: 'PICKED_UP',
+                platformApiSuccess: platformResult.success
+            });
         } catch (error) {
             console.error(`[OrdersAPI] Pickup error:`, error.message);
             res.status(500).json({
@@ -277,6 +307,7 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
     /**
      * POST /api/orders/:platformId/:orderId/deliver
      * Sipariş teslim edildi
+     * Platform API + isDelivered + activeOrderCount decrement + orderStatusHistory
      */
     router.post('/:platformId/:orderId/deliver', async (req, res) => {
         const { platformId, orderId } = req.params;
@@ -292,24 +323,71 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
                 });
             }
 
+            // Call platform API (non-blocking for Firestore update)
             const branchConfig = registry.getBranchPlatformConfig(branchId, platformId) || {};
-            const result = await connector.markOrderDelivered(orderId, branchConfig);
-
-            if (result.success) {
-                console.log(`[OrdersAPI] Order delivered: ${platformId}/${orderId}`);
-                res.json({
-                    success: true,
-                    orderId,
-                    platform: platformId,
-                    status: 'DELIVERED'
-                });
-            } else {
-                res.status(400).json({
-                    success: false,
-                    error: result.reason,
-                    code: 'DELIVER_FAILED'
-                });
+            let platformResult = { success: true };
+            try {
+                platformResult = await connector.markOrderDelivered(orderId, branchConfig);
+            } catch (platformError) {
+                console.warn(`[OrdersAPI] Platform deliver API failed (continuing with Firestore): ${platformError.message}`);
+                platformResult = { success: false, reason: platformError.message };
             }
+
+            // Get order to find assigned courier before updating
+            const order = await connector.getOrder(orderId);
+            const assignedCourierId = order?.assignedCourierId;
+
+            // Update order status in Firestore
+            await connector.updateOrderStatus(orderId, 'DELIVERED', {
+                isDelivered: true,
+                deliveredAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+
+            // Decrement courier's activeOrderCount
+            if (assignedCourierId && db) {
+                try {
+                    const courierQuery = await db.collectionGroup('couriers')
+                        .where('branchId', '==', branchId || order?.branchId)
+                        .where('isActive', '==', true)
+                        .get();
+
+                    const courierDoc = courierQuery.docs.find(doc => doc.id === assignedCourierId);
+                    if (courierDoc) {
+                        const currentCount = courierDoc.data().activeOrderCount || 0;
+                        await courierDoc.ref.update({
+                            activeOrderCount: Math.max(0, currentCount - 1),
+                            dailyDeliveryCount: admin.firestore.FieldValue.increment(1)
+                        });
+                        console.log(`[OrdersAPI] Courier ${assignedCourierId} activeOrderCount decremented`);
+                    }
+                } catch (counterError) {
+                    console.warn(`[OrdersAPI] Failed to decrement courier counter (non-fatal):`, counterError.message);
+                }
+            }
+
+            // Record in orderStatusHistory
+            if (db) {
+                try {
+                    await db.collection('orderStatusHistory').doc(orderId).collection('events').add({
+                        status: 'DELIVERED',
+                        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+                        source: 'orders-api',
+                        courierId: assignedCourierId || null,
+                        platformApiSuccess: platformResult.success
+                    });
+                } catch (historyError) {
+                    console.warn(`[OrdersAPI] Status history write failed (non-fatal):`, historyError.message);
+                }
+            }
+
+            console.log(`[OrdersAPI] Order delivered: ${platformId}/${orderId} (platform API: ${platformResult.success})`);
+            res.json({
+                success: true,
+                orderId,
+                platform: platformId,
+                status: 'DELIVERED',
+                platformApiSuccess: platformResult.success
+            });
         } catch (error) {
             console.error(`[OrdersAPI] Deliver error:`, error.message);
             res.status(500).json({

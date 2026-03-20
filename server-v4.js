@@ -25,6 +25,9 @@ const TrendyolGoConnector = require('./services/platforms/connectors/trendyolgo-
 const createOrdersApi = require('./services/api/orders-api');
 const createPlatformsApi = require('./services/api/platforms-api');
 const GoogleMapsDistanceService = require('./services/google-maps-distance');
+const DispatchMetrics = require('./services/dispatch/dispatch-metrics');
+const DispatchQueue = require('./services/dispatch/dispatch-queue');
+const DispatchAlerts = require('./services/dispatch/dispatch-alerts');
 
 const app = express();
 const server = http.createServer(app);
@@ -152,6 +155,9 @@ initializeFirebase();
 // ==================== PLATFORM REGISTRY INITIALIZATION ====================
 const platformRegistry = new PlatformRegistry(db);
 let smartDispatchService = null;
+let dispatchMetrics = null;
+let dispatchAlerts = null;
+let dispatchQueue = null;
 
 async function initializePlatformHub() {
     console.log('[PlatformHub] Initializing...');
@@ -168,8 +174,18 @@ async function initializePlatformHub() {
     platformRegistry.registerConnector('getiryemek', getiryemekConnector);
     platformRegistry.registerConnector('trendyolgo', trendyolgoConnector);
 
+    // Initialize Dispatch Metrics & Alerts
+    dispatchMetrics = new DispatchMetrics(db);
+    dispatchAlerts = new DispatchAlerts(db);
+
     // Initialize Smart Dispatch
     smartDispatchService = new SmartDispatchService(db, platformRegistry);
+    smartDispatchService.setMetrics(dispatchMetrics);
+    smartDispatchService.setAlerts(dispatchAlerts);
+
+    // Initialize Dispatch Queue (retry for failed assignments)
+    dispatchQueue = new DispatchQueue(db, smartDispatchService, platformRegistry, dispatchMetrics);
+    dispatchQueue.start();
 
     console.log('[PlatformHub] Initialized with connectors:', Array.from(platformRegistry.connectors.keys()));
 }
@@ -190,14 +206,23 @@ class SmartDispatchService {
         // [FIX-3] Mutex: serializes assignBestCourier calls to prevent race conditions
         this._assignmentQueue = Promise.resolve();
 
-        // Scoring weights (matching WPF DispatchWeights defaults)
-        this.weights = {
+        // Default scoring weights (matching WPF DispatchWeights defaults)
+        this.defaultWeights = {
             distanceToBranch: 0.25,
             availability: 0.25,
             workload: 0.20,
             deliveryProximity: 0.15,
             performance: 0.15
         };
+        this.weights = { ...this.defaultWeights };
+
+        // Dynamic weights cache: branchId → { weights, expiresAt }
+        this._weightCache = new Map();
+        this._WEIGHT_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+        // Dispatch metrics & alerts (injected later via setMetrics/setAlerts)
+        this.dispatchMetrics = null;
+        this.dispatchAlerts = null;
 
         // Constants
         this.MAX_DISTANCE_KM = 10.0;
@@ -208,6 +233,76 @@ class SmartDispatchService {
 
         // [FIX-4] Tie-breaker threshold: 5 points (covers typical location differences)
         this.TIE_BREAKER_THRESHOLD = 5.0;
+    }
+
+    setMetrics(dispatchMetrics) {
+        this.dispatchMetrics = dispatchMetrics;
+    }
+
+    setAlerts(dispatchAlerts) {
+        this.dispatchAlerts = dispatchAlerts;
+    }
+
+    /**
+     * Get dispatch weights for a branch — reads from Firestore with 5min TTL cache
+     * Falls back to defaults if not found or invalid
+     */
+    async getWeightsForBranch(branchId) {
+        if (!this.db || !branchId) return this.defaultWeights;
+
+        // Check cache
+        const cached = this._weightCache.get(branchId);
+        if (cached && Date.now() < cached.expiresAt) {
+            return cached.weights;
+        }
+
+        try {
+            const doc = await this.db.doc(`branches/${branchId}/settings/dispatchWeights`).get();
+
+            if (doc.exists) {
+                const data = doc.data();
+                const weights = this._validateWeights(data);
+                if (weights) {
+                    this._weightCache.set(branchId, {
+                        weights,
+                        expiresAt: Date.now() + this._WEIGHT_CACHE_TTL_MS
+                    });
+                    return weights;
+                }
+            }
+        } catch (error) {
+            console.warn('[SmartDispatch] Failed to load branch weights, using defaults:', error.message);
+        }
+
+        // Cache defaults too to avoid repeated reads
+        this._weightCache.set(branchId, {
+            weights: this.defaultWeights,
+            expiresAt: Date.now() + this._WEIGHT_CACHE_TTL_MS
+        });
+        return this.defaultWeights;
+    }
+
+    /**
+     * Validate weights object — must have all 5 keys, values must be numbers summing to ~1.0
+     */
+    _validateWeights(data) {
+        const requiredKeys = ['distanceToBranch', 'availability', 'workload', 'deliveryProximity', 'performance'];
+        const weights = {};
+
+        for (const key of requiredKeys) {
+            if (typeof data[key] !== 'number' || data[key] < 0 || data[key] > 1) {
+                return null; // Invalid
+            }
+            weights[key] = data[key];
+        }
+
+        const sum = Object.values(weights).reduce((a, b) => a + b, 0);
+        if (Math.abs(sum - 1.0) > 0.05) {
+            console.warn(`[SmartDispatch] Weights sum ${sum.toFixed(2)} != 1.0, using defaults`);
+            return null;
+        }
+
+        return weights;
     }
 
     async getBranchLocation(branchId) {
@@ -414,7 +509,8 @@ class SmartDispatchService {
      * Calculate full weighted score for a courier
      * Lower total = better courier match
      */
-    calculateCourierScore(courier, deliveryLocation, branchLocation, deliveryDistanceInfo, branchDistanceInfo) {
+    calculateCourierScore(courier, deliveryLocation, branchLocation, deliveryDistanceInfo, branchDistanceInfo, weights) {
+        const w = weights || this.defaultWeights;
         const distanceToBranchScore = this._calcDistanceToBranchScore(courier, branchLocation, branchDistanceInfo);
         const availabilityScore = this._calcAvailabilityScore(courier, branchLocation, branchDistanceInfo);
         const workloadScore = this._calcWorkloadScore(courier.activeOrderCount);
@@ -422,11 +518,11 @@ class SmartDispatchService {
         const performanceScore = this._calcPerformanceScore(courier);
 
         const totalScore =
-            (distanceToBranchScore * this.weights.distanceToBranch) +
-            (availabilityScore * this.weights.availability) +
-            (workloadScore * this.weights.workload) +
-            (deliveryProximityScore * this.weights.deliveryProximity) +
-            ((100 - performanceScore) * this.weights.performance); // Performance inverted
+            (distanceToBranchScore * w.distanceToBranch) +
+            (availabilityScore * w.availability) +
+            (workloadScore * w.workload) +
+            (deliveryProximityScore * w.deliveryProximity) +
+            ((100 - performanceScore) * w.performance); // Performance inverted
 
         return {
             totalScore,
@@ -499,11 +595,29 @@ class SmartDispatchService {
             return null;
         }
 
+        const scoreStart = Date.now();
+
         try {
+            // Load dynamic weights for branch (cached with 5min TTL)
+            const weights = await this.getWeightsForBranch(branchId);
+
             const couriers = await this.getAvailableCouriers(branchId);
             if (couriers.length === 0) {
                 console.log('[SmartDispatch] No available couriers for branch:', branchId);
+                // Record metric: no courier
+                if (this.dispatchMetrics) {
+                    await this.dispatchMetrics.recordAssignment(branchId, null, Date.now() - scoreStart, false, { reason: 'no_couriers' });
+                }
+                // Alert: record failure + check capacity
+                if (this.dispatchAlerts) {
+                    await this.dispatchAlerts.recordAttempt(branchId, false);
+                }
                 return null;
+            }
+
+            // Alert: check if all couriers at capacity
+            if (this.dispatchAlerts) {
+                await this.dispatchAlerts.checkAllAtCapacity(branchId, couriers);
             }
 
             const branchLocation = await this.getBranchLocation(branchId);
@@ -546,7 +660,7 @@ class SmartDispatchService {
                     const branchDistInfo = branchDistances ? branchDistances.get(courier.id) : null;
 
                     const { totalScore, details } = this.calculateCourierScore(
-                        courier, deliveryLocation, branchLocation, deliveryDistInfo, branchDistInfo
+                        courier, deliveryLocation, branchLocation, deliveryDistInfo, branchDistInfo, weights
                     );
 
                     return { courier, score: totalScore, details, source: deliveryDistInfo?.source || 'geolib' };
@@ -561,11 +675,12 @@ class SmartDispatchService {
             });
 
             const bestMatch = scoredCouriers[0];
+            const scoreTimeMs = Date.now() - scoreStart;
 
             console.log(`[SmartDispatch] Best courier: ${bestMatch.courier.name} (score: ${bestMatch.score.toFixed(1)}, ` +
                 `D:${bestMatch.details.distanceToBranch.toFixed(0)} A:${bestMatch.details.availability.toFixed(0)} ` +
                 `W:${bestMatch.details.workload.toFixed(0)} P:${bestMatch.details.deliveryProximity.toFixed(0)} ` +
-                `R:${bestMatch.details.performance.toFixed(0)}, source: ${bestMatch.source})`);
+                `R:${bestMatch.details.performance.toFixed(0)}, source: ${bestMatch.source}, ${scoreTimeMs}ms)`);
 
             if (scoredCouriers.length > 1) {
                 const runner = scoredCouriers[1];
@@ -575,9 +690,31 @@ class SmartDispatchService {
             // [FIX-2] Track assignment with counter (not single entry)
             this._trackAssignment(bestMatch.courier.id);
 
+            // Record metric
+            if (this.dispatchMetrics) {
+                await this.dispatchMetrics.recordAssignment(branchId, bestMatch.courier.id, scoreTimeMs, true, {
+                    score: bestMatch.score
+                });
+            }
+
+            // Alert: record success
+            if (this.dispatchAlerts) {
+                await this.dispatchAlerts.recordAttempt(branchId, true);
+            }
+
             return bestMatch.courier;
         } catch (error) {
             console.error('[SmartDispatch] Assignment error:', error.message);
+            // Record metric
+            if (this.dispatchMetrics) {
+                await this.dispatchMetrics.recordAssignment(branchId, null, Date.now() - scoreStart, false, {
+                    reason: error.message
+                });
+            }
+            // Alert: record failure
+            if (this.dispatchAlerts) {
+                await this.dispatchAlerts.recordAttempt(branchId, false);
+            }
             return null;
         }
     }
@@ -725,6 +862,17 @@ io.on('connection', (socket) => {
         socket.emit('couriers:list', branchCouriers);
     });
 
+    // POS order listener — joins branch room for order events
+    socket.on('pos:order_connect', (data) => {
+        const { branchId, posName } = data;
+        if (!branchId) return;
+        socket.branchId = branchId;
+        socket.posName = posName;
+        socket.userType = 'pos_order';
+        socket.join(`branch:${branchId}`);
+        console.log(`[Socket.io] POS order listener: ${posName} joined branch:${branchId}`);
+    });
+
     socket.on('courier:location', (data) => {
         const { courierId, latitude, longitude, speed, heading } = data;
         if (!courierId || !socket.branchId) return;
@@ -776,7 +924,10 @@ app.use('/api/v2/orders', (req, res, next) => {
     next();
 }, createOrdersApi(platformRegistry, smartDispatchService, {
     sendPushNotification,
-    notifyCourierNewOrder
+    notifyCourierNewOrder,
+    db,
+    dispatchMetrics,
+    dispatchQueue
 }));
 
 app.use('/api/v2/platforms', createPlatformsApi(platformRegistry, db));
@@ -789,6 +940,22 @@ app.post('/order/:remoteId', authenticateWebhook, async (req, res) => {
     // remoteId = POS Vendor ID = Firestore branch document ID (e.g. QgNkbMyFVgDWGqbHG1ZS)
     // DH sends webhooks to /order/{remoteId} where remoteId maps directly to branchId
     const branchId = remoteId || req.headers['x-branch-id'] || req.query.branchId || process.env.DEFAULT_BRANCH_ID;
+
+    // Şube doğrulama (soft validation — sadece loglama, siparişi engellemez)
+    try {
+        const branchRef = db.collection('branches').doc(branchId);
+        const branchSnap = await branchRef.get();
+        if (!branchSnap.exists) {
+            console.error(`[YemekSepeti] ALERT: Branch ${branchId} does NOT exist in Firestore!`);
+        } else {
+            const branchData = branchSnap.data();
+            if (branchData.yemekSepeti_isEnabled === false) {
+                console.warn(`[YemekSepeti] WARNING: YemekSepeti DISABLED for branch ${branchId}`);
+            }
+        }
+    } catch (err) {
+        console.error(`[YemekSepeti] Branch validation error:`, err.message);
+    }
 
     console.log('[YemekSepeti] ========== NEW ORDER ==========');
     console.log('[YemekSepeti] Remote ID:', remoteId, '→ branchId:', branchId);
@@ -835,8 +1002,25 @@ app.post('/order/:remoteId', authenticateWebhook, async (req, res) => {
                 if (courier) {
                     await connector?.assignCourier(firebaseResult.orderId, courier.id, courier.name);
                     await notifyCourierNewOrder(courier, transformedOrder, 'YemekSepeti');
+                } else if (dispatchQueue) {
+                    // No courier available — enqueue for retry
+                    await dispatchQueue.enqueue({
+                        orderId: firebaseResult.orderId,
+                        platformId: 'yemeksepeti',
+                        branchId,
+                        deliveryLocation
+                    });
                 }
             }
+
+            // Socket.IO: yeni sipariş bildirimi
+            io.to(`branch:${branchId}`).emit('order:new', {
+                orderId: firebaseResult.orderId,
+                platform: 'yemeksepeti',
+                customerName: `${transformedOrder.Customer?.FirstName || ''} ${transformedOrder.Customer?.LastName || ''}`.trim(),
+                totalAmount: transformedOrder.TotalAmount || 0,
+                timestamp: new Date().toISOString()
+            });
         }
 
         console.log('[YemekSepeti] ============================');
@@ -867,6 +1051,15 @@ app.put('/remoteId/:remoteId/remoteOrder/:remoteOrderId/posOrderStatus', authent
         if (connector) {
             await connector.cancelOrder(orderToken, statusUpdate.reason || 'UNKNOWN');
         }
+
+        // Socket.IO: sipariş iptal bildirimi
+        const branchId = req.params.remoteId;
+        io.to(`branch:${branchId}`).emit('order:cancelled', {
+            orderId: orderToken,
+            platform: 'yemeksepeti',
+            reason: statusUpdate.reason || 'UNKNOWN',
+            timestamp: new Date().toISOString()
+        });
 
         // Legacy queue - artık status değiştirmiyoruz, WPF kendi yönetir
     }
@@ -909,7 +1102,25 @@ app.post('/webhook/newOrder', authenticateWebhook, async (req, res) => {
             if (courier) {
                 await connector?.assignCourier(firebaseResult.orderId, courier.id, courier.name);
                 await notifyCourierNewOrder(courier, transformedOrder, 'GetirYemek');
+            } else if (dispatchQueue) {
+                await dispatchQueue.enqueue({
+                    orderId: firebaseResult.orderId,
+                    platformId: 'getiryemek',
+                    branchId,
+                    deliveryLocation
+                });
             }
+        }
+
+        if (firebaseResult.success) {
+            // Socket.IO: yeni sipariş bildirimi
+            io.to(`branch:${branchId}`).emit('order:new', {
+                orderId: firebaseResult.orderId,
+                platform: 'getiryemek',
+                customerName: `${transformedOrder.Customer?.FirstName || ''} ${transformedOrder.Customer?.LastName || ''}`.trim(),
+                totalAmount: transformedOrder.TotalAmount || 0,
+                timestamp: new Date().toISOString()
+            });
         }
 
         console.log('[GetirYemek] ============================');
@@ -937,6 +1148,17 @@ app.post('/webhook/cancelOrder', authenticateWebhook, async (req, res) => {
     const connector = platformRegistry.getConnector('getiryemek');
     if (connector && order.id) {
         await connector.cancelOrder(order.id);
+    }
+
+    // Socket.IO: sipariş iptal bildirimi
+    const branchId = req.headers['x-branch-id'] || req.query.branchId || process.env.DEFAULT_BRANCH_ID;
+    if (branchId) {
+        io.to(`branch:${branchId}`).emit('order:cancelled', {
+            orderId: order.id,
+            platform: 'getiryemek',
+            reason: order.cancelReason || 'UNKNOWN',
+            timestamp: new Date().toISOString()
+        });
     }
 
     res.status(200).send('OK');
@@ -988,7 +1210,25 @@ app.post('/webhook/trendyolgo/order', authenticateWebhook, async (req, res) => {
             if (courier) {
                 await connector?.assignCourier(firebaseResult.orderId, courier.id, courier.name);
                 await notifyCourierNewOrder(courier, transformedOrder, 'TrendyolGo');
+            } else if (dispatchQueue) {
+                await dispatchQueue.enqueue({
+                    orderId: firebaseResult.orderId,
+                    platformId: 'trendyolgo',
+                    branchId,
+                    deliveryLocation
+                });
             }
+        }
+
+        if (firebaseResult.success) {
+            // Socket.IO: yeni sipariş bildirimi
+            io.to(`branch:${branchId}`).emit('order:new', {
+                orderId: firebaseResult.orderId,
+                platform: 'trendyolgo',
+                customerName: `${transformedOrder.Customer?.FirstName || ''} ${transformedOrder.Customer?.LastName || ''}`.trim(),
+                totalAmount: transformedOrder.TotalAmount || 0,
+                timestamp: new Date().toISOString()
+            });
         }
 
         console.log('[TrendyolGo] ============================');
@@ -1118,6 +1358,53 @@ app.get('/health', (req, res) => {
         firebase: firebaseInitialized ? 'connected' : 'disabled',
         platforms: platformRegistry.getAllPlatforms().length,
         connectors: platformRegistry.connectors.size
+    });
+});
+
+// Branch-specific health endpoint (scaling observability)
+app.get('/api/health/branch/:branchId', async (req, res) => {
+    const { branchId } = req.params;
+
+    // 1. Platform durumları
+    const platforms = {};
+    for (const platformId of ['yemeksepeti', 'getiryemek', 'trendyolgo']) {
+        const enabled = platformRegistry.isPlatformEnabledForBranch(branchId, platformId);
+        platforms[platformId] = { enabled };
+    }
+
+    // 2. Aktif sipariş sayıları (connector'lardan)
+    for (const [platformId, connector] of platformRegistry.connectors.entries()) {
+        if (platforms[platformId]?.enabled && connector.getActiveOrders) {
+            try {
+                const activeOrders = await connector.getActiveOrders(branchId);
+                platforms[platformId].activeOrderCount = activeOrders.length;
+            } catch {
+                platforms[platformId].activeOrderCount = -1;
+            }
+        }
+    }
+
+    // 3. Socket.IO bağlantı durumu
+    const branchCouriers = [...courierLocations.entries()]
+        .filter(([_, loc]) => loc.branchId === branchId);
+
+    // 4. Kuyruk boyutları (in-memory)
+    const branchOrders = [...orders.values()].filter(o => o.branchId === branchId);
+    const branchCancellations = [...cancellations.values()].filter(c => c.branchId === branchId);
+
+    res.json({
+        branchId,
+        timestamp: new Date().toISOString(),
+        status: 'ok',
+        platforms,
+        realtime: {
+            connectedCouriers: branchCouriers.length,
+            socketServerConnected: true
+        },
+        queues: {
+            orders: branchOrders.length,
+            cancellations: branchCancellations.length
+        }
     });
 });
 
