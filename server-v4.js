@@ -47,6 +47,7 @@ const io = new Server(server, {
     pingInterval: 25000
 });
 
+app.set('trust proxy', 1); // Railway runs behind a proxy
 app.use(express.json());
 
 app.use(rateLimit({
