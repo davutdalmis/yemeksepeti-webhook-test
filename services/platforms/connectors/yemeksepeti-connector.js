@@ -169,7 +169,7 @@ class YemekSepetiConnector extends BasePlatformConnector {
                 Quantity: parseInt(p.quantity) || 0,
                 UnitPrice: parseFloat(p.unitPrice) || 0,
                 TotalPrice: parseFloat(p.paidPrice) || 0,
-                Note: p.description || '',
+                Note: p.comment || p.description || '',
                 Options: (p.selectedToppings || []).map(o => ({
                     Name: o.name || '',
                     Value: o.value || '',
