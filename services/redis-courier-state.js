@@ -198,6 +198,24 @@ class CourierStateStore {
     }
 
     /**
+     * Get all courier locations (for Firestore sync)
+     * Returns array of locationData objects
+     */
+    async getAllLocations() {
+        if (this._useRedis()) {
+            try {
+                const all = await this._redis.hgetall('courier:locations');
+                if (!all || Object.keys(all).length === 0) return [];
+                return Object.values(all).map(raw => JSON.parse(raw));
+            } catch (err) {
+                console.error('[CourierState] Redis getAllLocations error:', err.message);
+            }
+        }
+
+        return Array.from(this._locations.values());
+    }
+
+    /**
      * Get locations for a specific branch
      * Returns array of [courierId, locationData]
      */

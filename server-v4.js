@@ -29,12 +29,14 @@ const GoogleMapsDistanceService = require('./services/google-maps-distance');
 const DispatchMetrics = require('./services/dispatch/dispatch-metrics');
 const DispatchQueue = require('./services/dispatch/dispatch-queue');
 const DispatchAlerts = require('./services/dispatch/dispatch-alerts');
-const { getRedisClient, isRedisAvailable, getRedisStatus } = require('./services/redis-client');
+const { getRedisClient, isRedisAvailable, getRedisStatus, getRedisFailoverInfo } = require('./services/redis-client');
 const { createAdapter } = require('@socket.io/redis-adapter');
 const OrderStore = require('./services/redis-orders');
 const CancellationStore = require('./services/redis-cancellations');
 const WebhookStore = require('./services/redis-webhooks');
 const CourierStateStore = require('./services/redis-courier-state');
+const MetricsCollector = require('./services/metrics');
+const { CircuitBreaker } = require('./services/circuit-breaker');
 
 const app = express();
 const server = http.createServer(app);
@@ -270,7 +272,23 @@ class SmartDispatchService {
     constructor(db, registry) {
         this.db = db;
         this.registry = registry;
+
+        // Circuit breakers for external service calls (must init before googleMaps)
+        this.firestoreBreaker = new CircuitBreaker('firestore-read', {
+            failureThreshold: 5,
+            resetTimeoutMs: 60000,
+            jitterFactor: 0.3,
+            halfOpenSuccessThreshold: 2
+        });
+        this.googleMapsBreaker = new CircuitBreaker('google-maps', {
+            failureThreshold: 3,
+            resetTimeoutMs: 30000,
+            jitterFactor: 0.3,
+            halfOpenSuccessThreshold: 1
+        });
+
         this.googleMaps = new GoogleMapsDistanceService();
+        this.googleMaps.setCircuitBreaker(this.googleMapsBreaker);
 
         // [FIX-2] Assignment tracking via Redis-backed CourierStateStore
         // courierState is injected via setCourierState() after construction
@@ -328,6 +346,13 @@ class SmartDispatchService {
         this._isRedisAvailable = isRedisAvailableFn;
     }
 
+    getCircuitBreakerStatuses() {
+        return [
+            this.firestoreBreaker.getStatus(),
+            this.googleMapsBreaker.getStatus()
+        ];
+    }
+
     /**
      * Get dispatch weights for a branch — Redis cache (shared across instances) with in-memory fallback
      * Falls back to defaults if not found or invalid
@@ -358,21 +383,23 @@ class SmartDispatchService {
             }
         }
 
-        // Cache miss — load from Firestore
+        // Cache miss — load from Firestore (through circuit breaker)
         let weights = this.defaultWeights;
-        try {
-            const doc = await this.db.doc(`branches/${branchId}/settings/dispatchWeights`).get();
-
-            if (doc.exists) {
-                const data = doc.data();
-                const validated = this._validateWeights(data);
-                if (validated) {
-                    weights = validated;
+        const loadedWeights = await this.firestoreBreaker.execute(
+            async () => {
+                const doc = await this.db.doc(`branches/${branchId}/settings/dispatchWeights`).get();
+                if (doc.exists) {
+                    const data = doc.data();
+                    return this._validateWeights(data) || this.defaultWeights;
                 }
+                return this.defaultWeights;
+            },
+            () => {
+                console.warn('[SmartDispatch] Firestore CB open — using default weights');
+                return this.defaultWeights;
             }
-        } catch (error) {
-            console.warn('[SmartDispatch] Failed to load branch weights, using defaults:', error.message);
-        }
+        );
+        weights = loadedWeights;
 
         // Store in Redis (primary) or in-memory (fallback)
         if (useRedis) {
@@ -417,80 +444,80 @@ class SmartDispatchService {
     async getBranchLocation(branchId) {
         if (!this.db) return null;
 
-        try {
-            const allBranches = await this.db.collectionGroup('branches').where('id', '==', branchId).get();
-            if (!allBranches.empty) {
-                const data = allBranches.docs[0].data();
-                return {
-                    latitude: data.latitude || data.lat || 0,
-                    longitude: data.longitude || data.lng || 0
-                };
-            }
-            return null;
-        } catch (error) {
-            console.error('[SmartDispatch] Branch location error:', error.message);
-            return null;
-        }
+        return this.firestoreBreaker.execute(
+            async () => {
+                const allBranches = await this.db.collectionGroup('branches').where('id', '==', branchId).get();
+                if (!allBranches.empty) {
+                    const data = allBranches.docs[0].data();
+                    return {
+                        latitude: data.latitude || data.lat || 0,
+                        longitude: data.longitude || data.lng || 0
+                    };
+                }
+                return null;
+            },
+            () => null
+        );
     }
 
     async getAvailableCouriers(branchId) {
         if (!this.db) return [];
 
-        try {
-            const couriersSnapshot = await this.db.collectionGroup('couriers')
-                .where('branchId', '==', branchId)
-                .where('isOnDuty', '==', true)
-                .where('isActive', '==', true)
-                .get();
+        return this.firestoreBreaker.execute(
+            async () => {
+                const couriersSnapshot = await this.db.collectionGroup('couriers')
+                    .where('branchId', '==', branchId)
+                    .where('isOnDuty', '==', true)
+                    .where('isActive', '==', true)
+                    .get();
 
-            return couriersSnapshot.docs
-                .map(doc => {
-                    const data = doc.data();
-                    return {
-                        id: doc.id,
-                        name: data.name || data.fullName || '',
-                        phone: data.phone || '',
-                        latitude: data.latitude || data.currentLatitude || 0,
-                        longitude: data.longitude || data.currentLongitude || 0,
-                        activeOrderCount: data.activeOrderCount || 0,
-                        dailyDeliveryCount: data.dailyDeliveryCount || data.totalDeliveriesToday || 0,
-                        rating: data.rating || 0,
-                        isApproved: data.isApproved !== undefined ? data.isApproved : true,
-                        fcmToken: data.fcmToken || null
-                    };
-                })
-                .filter(c => c.isApproved); // Only approved couriers
-        } catch (error) {
-            console.error('[SmartDispatch] Get couriers error:', error.message);
-            return [];
-        }
+                return couriersSnapshot.docs
+                    .map(doc => {
+                        const data = doc.data();
+                        return {
+                            id: doc.id,
+                            name: data.name || data.fullName || '',
+                            phone: data.phone || '',
+                            latitude: data.latitude || data.currentLatitude || 0,
+                            longitude: data.longitude || data.currentLongitude || 0,
+                            activeOrderCount: data.activeOrderCount || 0,
+                            dailyDeliveryCount: data.dailyDeliveryCount || data.totalDeliveriesToday || 0,
+                            rating: data.rating || 0,
+                            isApproved: data.isApproved !== undefined ? data.isApproved : true,
+                            fcmToken: data.fcmToken || null
+                        };
+                    })
+                    .filter(c => c.isApproved);
+            },
+            () => []
+        );
     }
 
     async getActiveOrderCount(courierId) {
-        if (!this.db) return await this._getPendingCount(courierId);
+        const pendingCount = await this._getPendingCount(courierId);
+        if (!this.db) return pendingCount;
 
-        try {
-            const platforms = ['yemekSepetiOrders', 'getirYemekOrders', 'trendyolGoOrders'];
-            let totalActive = 0;
+        return this.firestoreBreaker.execute(
+            async () => {
+                const platforms = ['yemekSepetiOrders', 'getirYemekOrders', 'trendyolGoOrders'];
+                let totalActive = 0;
 
-            // [FIX-1] Include 'NEW' and 'PREPARING' statuses — orders assigned during
-            // webhook flow keep Status:'NEW', accept flow keeps Status:'ACCEPTED'
-            for (const platform of platforms) {
-                const ordersSnapshot = await this.db.collectionGroup(platform)
-                    .where('assignedCourierId', '==', courierId)
-                    .where('Status', 'in', ['NEW', 'PREPARING', 'ASSIGNED', 'ACCEPTED', 'PICKED_UP', 'ON_THE_WAY'])
-                    .get();
-                totalActive += ordersSnapshot.size;
-            }
+                // [FIX-1] Include 'NEW' and 'PREPARING' statuses — orders assigned during
+                // webhook flow keep Status:'NEW', accept flow keeps Status:'ACCEPTED'
+                for (const platform of platforms) {
+                    const ordersSnapshot = await this.db.collectionGroup(platform)
+                        .where('assignedCourierId', '==', courierId)
+                        .where('Status', 'in', ['NEW', 'PREPARING', 'ASSIGNED', 'ACCEPTED', 'PICKED_UP', 'ON_THE_WAY'])
+                        .get();
+                    totalActive += ordersSnapshot.size;
+                }
 
-            // [FIX-2] Add ALL pending assignments not yet reflected in Firestore
-            totalActive += await this._getPendingCount(courierId);
-
-            return totalActive;
-        } catch (error) {
-            // On error, still return pending count as best-effort
-            return await this._getPendingCount(courierId);
-        }
+                // [FIX-2] Add ALL pending assignments not yet reflected in Firestore
+                totalActive += pendingCount;
+                return totalActive;
+            },
+            () => pendingCount
+        );
     }
 
     // ==================== 5-FACTOR SCORING ====================
@@ -905,6 +932,17 @@ async function writeOrderToFirebaseUnified(order, platformId, branchId) {
 // ==================== SOCKET.IO COURIER TRACKING ====================
 const courierState = new CourierStateStore(getRedisClient(), isRedisAvailable);
 
+// ==================== METRICS ====================
+const metrics = new MetricsCollector({
+    orderStore, cancellationStore, webhookStore, courierState, io, getRedisStatus, getRedisFailoverInfo
+});
+
+// Wire circuit breaker metrics (smartDispatchService may be null if Firebase disabled)
+metrics.setCircuitBreakerProvider(() => {
+    if (!smartDispatchService) return [];
+    return smartDispatchService.getCircuitBreakerStatuses();
+});
+
 // Socket.IO authentication middleware
 io.use((socket, next) => {
     if (!SOCKET_AUTH_TOKEN) return next(); // Skip if not configured
@@ -917,6 +955,7 @@ io.use((socket, next) => {
 });
 
 io.on('connection', (socket) => {
+    metrics.increment('socket_events_total', { event: 'connect' });
     console.log(`[Socket.io] New connection: ${socket.id}`);
 
     socket.on('courier:connect', async (data) => {
@@ -1008,6 +1047,7 @@ io.on('connection', (socket) => {
     });
 
     socket.on('disconnect', async () => {
+        metrics.increment('socket_events_total', { event: 'disconnect' });
         if (socket.userType === 'courier' && socket.courierId) {
             console.log(`[Socket.io] Courier disconnected: ${socket.courierName}`);
             await courierState.removeConnected(socket.courierId);
@@ -1067,6 +1107,8 @@ app.post('/order/:remoteId', webhookLimiter, authenticatePlatformWebhook, async 
         console.error(`[YemekSepeti] Branch validation error:`, err.message);
     }
 
+    metrics.increment('orders_received_total', { platform: 'yemeksepeti' });
+    metrics.increment('webhook_requests_total', { platform: 'yemeksepeti' });
     console.log('[YemekSepeti] ========== NEW ORDER ==========');
     console.log('[YemekSepeti] Remote ID:', remoteId, '→ branchId:', branchId);
     console.log('[YemekSepeti] Raw order keys:', Object.keys(order));
@@ -1119,6 +1161,7 @@ app.post('/order/:remoteId', webhookLimiter, authenticatePlatformWebhook, async 
                     longitude: transformedOrder.Customer?.Address?.Longitude || 0
                 };
                 const courier = await smartDispatchService.assignBestCourier(branchId, deliveryLocation);
+                metrics.increment('dispatch_assignments_total', { status: courier ? 'success' : 'queued' });
                 if (courier) {
                     await connector?.assignCourier(firebaseResult.orderId, courier.id, courier.name);
                     await notifyCourierNewOrder(courier, transformedOrder, 'YemekSepeti');
@@ -1160,9 +1203,11 @@ app.put('/remoteId/:remoteId/remoteOrder/:remoteOrderId/posOrderStatus', authent
     const statusUpdate = req.body;
 
     console.log('[YemekSepeti] Status Update:', remoteOrderId, statusUpdate.status);
+    metrics.increment('webhook_requests_total', { platform: 'yemeksepeti' });
 
     const status = (statusUpdate.status || '').toLowerCase();
     if (status === 'cancelled' || status === 'rejected' || status === 'cancel') {
+        metrics.increment('orders_cancelled_total', { platform: 'yemeksepeti' });
         const connector = platformRegistry.getConnector('yemeksepeti');
         const parts = remoteOrderId.split('_');
         const orderToken = parts.length >= 2 ? parts[1] : remoteOrderId;
@@ -1198,6 +1243,8 @@ app.post('/webhook/newOrder', webhookLimiter, authenticatePlatformWebhook, async
         return res.status(400).json({ error: 'branchId is required' });
     }
 
+    metrics.increment('orders_received_total', { platform: 'getiryemek' });
+    metrics.increment('webhook_requests_total', { platform: 'getiryemek' });
     console.log('[GetirYemek] ========== NEW ORDER ==========');
 
     try {
@@ -1224,6 +1271,7 @@ app.post('/webhook/newOrder', webhookLimiter, authenticatePlatformWebhook, async
                 longitude: order.client?.deliveryAddress?.longitude || 0
             };
             const courier = await smartDispatchService.assignBestCourier(branchId, deliveryLocation);
+            metrics.increment('dispatch_assignments_total', { status: courier ? 'success' : 'queued' });
             if (courier) {
                 await connector?.assignCourier(firebaseResult.orderId, courier.id, courier.name);
                 await notifyCourierNewOrder(courier, transformedOrder, 'GetirYemek');
@@ -1260,6 +1308,8 @@ app.post('/webhook/cancelOrder', webhookLimiter, authenticatePlatformWebhook, as
     const order = req.body;
     const restaurantSecretKey = req.headers['x-restaurant-secret-key'];
 
+    metrics.increment('orders_cancelled_total', { platform: 'getiryemek' });
+    metrics.increment('webhook_requests_total', { platform: 'getiryemek' });
     console.log('[GetirYemek] Cancel Order:', order.id);
 
     const cancelWebhook = {
@@ -1329,6 +1379,8 @@ app.post('/webhook/trendyolgo/order', webhookLimiter, authenticatePlatformWebhoo
         return res.status(400).json({ error: 'branchId is required' });
     }
 
+    metrics.increment('orders_received_total', { platform: 'trendyolgo' });
+    metrics.increment('webhook_requests_total', { platform: 'trendyolgo' });
     console.log('[TrendyolGo] ========== NEW ORDER ==========');
 
     try {
@@ -1342,6 +1394,7 @@ app.post('/webhook/trendyolgo/order', webhookLimiter, authenticatePlatformWebhoo
                 longitude: order.longitude || 0
             };
             const courier = await smartDispatchService.assignBestCourier(branchId, deliveryLocation);
+            metrics.increment('dispatch_assignments_total', { status: courier ? 'success' : 'queued' });
             if (courier) {
                 await connector?.assignCourier(firebaseResult.orderId, courier.id, courier.name);
                 await notifyCourierNewOrder(courier, transformedOrder, 'TrendyolGo');
@@ -1379,6 +1432,9 @@ app.post('/webhook/trendyolgo/cancel', webhookLimiter, authenticatePlatformWebho
     const order = req.body;
     const branchId = req.headers['x-branch-id'] || req.query.branchId;
 
+    metrics.increment('orders_cancelled_total', { platform: 'trendyolgo' });
+    metrics.increment('webhook_requests_total', { platform: 'trendyolgo' });
+
     try {
         const connector = platformRegistry.getConnector('trendyolgo');
         if (connector && order.id) {
@@ -1405,6 +1461,7 @@ app.post('/webhook/trendyolgo/cancel', webhookLimiter, authenticatePlatformWebho
 // ==================== LEGACY POLLING ENDPOINTS ====================
 
 app.get('/api/yemeksepeti/pending-orders', pollingLimiter, async (req, res) => {
+    metrics.increment('polling_requests_total', { platform: 'yemeksepeti' });
     const apiKey = req.headers['x-api-key'];
     if (apiKey !== API_KEYS.YEMEKSEPETI_POLLING_KEY) {
         return res.status(401).json({ error: 'Unauthorized' });
@@ -1498,6 +1555,7 @@ app.delete('/api/yemeksepeti/cancellations/:cancellationId', async (req, res) =>
 });
 
 app.get('/poll/webhooks', pollingLimiter, async (req, res) => {
+    metrics.increment('polling_requests_total', { platform: 'getiryemek' });
     const apiKey = req.headers['x-api-key'];
     if (apiKey !== API_KEYS.GETIRYEMEK_POLLING_KEY) {
         return res.status(401).json({ error: 'Unauthorized' });
@@ -1525,6 +1583,19 @@ app.delete('/api/getiryemek/webhooks/:webhookId', async (req, res) => {
     }
 });
 
+// ==================== METRICS ====================
+
+app.get('/api/metrics', async (req, res) => {
+    try {
+        const output = await metrics.getMetrics();
+        res.set('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
+        res.send(output);
+    } catch (error) {
+        console.error('[Metrics] Error generating metrics:', error.message);
+        res.status(500).send('# ERROR generating metrics\n');
+    }
+});
+
 // ==================== HEALTH & INFO ====================
 
 app.get('/health', async (req, res) => {
@@ -1548,6 +1619,28 @@ app.get('/health', async (req, res) => {
         'consecutiveFailures (per-instance alerts)'
     ];
 
+    // Circuit breaker statuses
+    const circuitBreakers = smartDispatchService
+        ? smartDispatchService.getCircuitBreakerStatuses().map(cb => ({
+            name: cb.name,
+            state: cb.state,
+            failureCount: cb.failureCount,
+            tripCount: cb.tripCount
+        }))
+        : [];
+
+    // Enrich redis status with failover info
+    const redisInfo = { ...redisStatus };
+    const failoverInfo = getRedisFailoverInfo();
+    if (failoverInfo.inFailover) {
+        redisInfo.failover = {
+            active: true,
+            startedAt: failoverInfo.failoverStartedAt ? failoverInfo.failoverStartedAt.toISOString() : null,
+            durationSeconds: Math.round(failoverInfo.failoverDurationMs / 1000),
+            reconnectAttempts: failoverInfo.reconnectAttempts,
+        };
+    }
+
     res.json({
         status: 'ok',
         service: 'YemiGO Platform Hub Server',
@@ -1557,7 +1650,8 @@ app.get('/health', async (req, res) => {
         connectors: platformRegistry.connectors.size,
         ordersTotal: await orderStore.size(),
         indexedBranches: await orderStore.indexedBranchCount(),
-        redis: redisStatus,
+        redis: redisInfo,
+        circuitBreakers,
         multiInstance: {
             ready: redisConnected,
             warnings: redisConnected ? acceptableLocal : instanceLocalState.concat(acceptableLocal)
@@ -1749,6 +1843,46 @@ async function cleanupOldOrders() {
 
 setInterval(cleanupOldOrders, 5 * 60 * 1000); // 5 dakikada bir
 setTimeout(cleanupOldOrders, 30000);
+
+// ==================== COURIER LOCATION SYNC (Redis → Firestore) ====================
+
+async function syncCourierLocationsToFirestore() {
+    if (!db) return;
+
+    try {
+        const allLocations = await courierState.getAllLocations();
+        if (!allLocations || allLocations.length === 0) return;
+
+        const batch = db.batch();
+        let count = 0;
+
+        for (const loc of allLocations) {
+            if (!loc.courierId || !loc.latitude || !loc.longitude) continue;
+
+            const courierRef = db.collection('couriers').doc(loc.courierId);
+            // set(merge) kullan — doküman yoksa oluşturur, varsa sadece bu alanları günceller
+            // batch.update() tek NOT_FOUND'da tüm batch'i fail eder, set(merge) güvenli
+            batch.set(courierRef, {
+                currentLatitude: loc.latitude,
+                currentLongitude: loc.longitude,
+                lastLocationUpdate: admin.firestore.FieldValue.serverTimestamp()
+            }, { merge: true });
+
+            count++;
+            if (count >= 500) break; // Firestore batch limit
+        }
+
+        if (count > 0) {
+            await batch.commit();
+            console.log(`[LocationSync] Synced ${count} courier locations to Firestore`);
+        }
+    } catch (err) {
+        console.error('[LocationSync] Firestore sync error:', err.message);
+    }
+}
+
+setInterval(syncCourierLocationsToFirestore, 10000); // 10 saniyede bir
+setTimeout(syncCourierLocationsToFirestore, 15000); // İlk sync 15s sonra
 
 // ==================== SERVER START ====================
 

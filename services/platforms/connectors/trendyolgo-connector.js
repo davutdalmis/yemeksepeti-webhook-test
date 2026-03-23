@@ -78,6 +78,7 @@ class TrendyolGoConnector extends BasePlatformConnector {
 
             // Platform specific
             Status: this.mapTrendyolStatus(rawOrder.status),
+            isDelivered: false,
             CargoProvider: rawOrder.cargoProviderName || null,
             CargoTrackingNumber: rawOrder.cargoTrackingNumber || null,
             InvoiceLink: rawOrder.invoiceLink || null

@@ -166,7 +166,12 @@ class MemoryFallback {
 // ==================== Redis Client Singleton ====================
 
 let client = null;
-let mode = 'uninitialized'; // 'redis' | 'memory' | 'uninitialized'
+let mode = 'uninitialized'; // 'redis' | 'memory' | 'disconnected' | 'uninitialized'
+
+// Failover tracking
+let failoverStartedAt = null;   // Date when Redis connection was lost
+let reconnectAttempts = 0;      // Total reconnect attempts since last failover
+let totalFailovers = 0;         // Lifetime failover count
 
 function createClient() {
     const redisUrl = process.env.REDIS_URL;
@@ -186,11 +191,9 @@ function createClient() {
     client = new Redis(redisUrl, {
         maxRetriesPerRequest: 3,
         retryStrategy(times) {
-            if (times > 10) {
-                console.error('[Redis] Max reconnect attempts reached, giving up');
-                return null; // stop retrying
-            }
-            const delay = Math.min(times * 200, 5000); // exponential backoff, max 5s
+            // Never give up — exponential backoff with ceiling
+            reconnectAttempts = times;
+            const delay = Math.min(times * 500, 30000); // max 30s
             console.log(`[Redis] Reconnecting in ${delay}ms (attempt ${times})`);
             return delay;
         },
@@ -201,12 +204,18 @@ function createClient() {
 
     client.on('connect', () => {
         console.log('[Redis] Connected');
-        mode = 'redis';
     });
 
     client.on('ready', () => {
+        if (failoverStartedAt) {
+            const durationMs = Date.now() - failoverStartedAt.getTime();
+            const durationSec = Math.round(durationMs / 1000);
+            console.log(`[Redis] Recovered after ${durationSec}s failover (${reconnectAttempts} reconnect attempts)`);
+        }
         console.log('[Redis] Ready');
         mode = 'redis';
+        failoverStartedAt = null;
+        reconnectAttempts = 0;
     });
 
     client.on('error', (err) => {
@@ -214,12 +223,25 @@ function createClient() {
     });
 
     client.on('close', () => {
-        console.log('[Redis] Connection closed');
+        console.log('[Redis] Connection closed — stores falling back to memory');
+        if (mode === 'redis') {
+            // Transition from connected to disconnected
+            mode = 'disconnected';
+            failoverStartedAt = new Date();
+            reconnectAttempts = 0;
+            totalFailovers++;
+        }
     });
 
     client.on('end', () => {
-        console.log('[Redis] Connection ended — falling back to memory');
-        // Don't replace client here — ioredis will auto-reconnect if retryStrategy allows
+        console.log('[Redis] Connection ended');
+        if (mode !== 'disconnected') {
+            mode = 'disconnected';
+            if (!failoverStartedAt) {
+                failoverStartedAt = new Date();
+                totalFailovers++;
+            }
+        }
     });
 
     mode = 'redis';
@@ -248,10 +270,35 @@ function getRedisStatus() {
     if (client instanceof MemoryFallback) {
         return { connected: false, mode: 'memory' };
     }
-    return {
-        connected: client.status === 'ready',
-        mode: 'redis',
+    const connected = client.status === 'ready';
+    const result = {
+        connected,
+        mode,
         status: client.status,
+    };
+    // Attach failover info when in failover
+    if (failoverStartedAt) {
+        result.failover = {
+            active: true,
+            startedAt: failoverStartedAt.toISOString(),
+            durationSeconds: Math.round((Date.now() - failoverStartedAt.getTime()) / 1000),
+            reconnectAttempts,
+        };
+    }
+    return result;
+}
+
+/**
+ * Detailed failover info for metrics and monitoring.
+ * @returns {{ inFailover: boolean, failoverStartedAt: Date|null, failoverDurationMs: number, reconnectAttempts: number, totalFailovers: number }}
+ */
+function getRedisFailoverInfo() {
+    return {
+        inFailover: failoverStartedAt !== null,
+        failoverStartedAt,
+        failoverDurationMs: failoverStartedAt ? Date.now() - failoverStartedAt.getTime() : 0,
+        reconnectAttempts,
+        totalFailovers,
     };
 }
 
@@ -260,5 +307,6 @@ module.exports = {
     isRedisAvailable,
     getRedisMode,
     getRedisStatus,
+    getRedisFailoverInfo,
     MemoryFallback, // exported for testing
 };

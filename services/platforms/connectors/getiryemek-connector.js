@@ -93,16 +93,19 @@ class GetirYemekConnector extends BasePlatformConnector {
 
     mapGetirStatus(getirStatus) {
         const statusMap = {
-            100: 'NEW',
-            200: 'ACCEPTED',
-            300: 'PREPARING',
-            350: 'READY',
-            400: 'COURIER_ASSIGNED',
-            500: 'PICKED_UP',
-            550: 'ON_THE_WAY',
-            600: 'DELIVERED',
-            700: 'CANCELLED',
-            900: 'REJECTED'
+            310: 'PENDING_APPROVAL',
+            320: 'APPROVED',
+            325: 'SCHEDULED',
+            350: 'SCHEDULED_APPROVED',
+            400: 'NEW',
+            500: 'PREPARING',
+            550: 'READY',
+            600: 'COURIER_PICKED_UP',
+            700: 'ON_THE_WAY',
+            800: 'COURIER_ARRIVED',
+            900: 'DELIVERED',
+            1500: 'CANCELLED',
+            1600: 'CANCELLED_BY_RESTAURANT'
         };
         return statusMap[getirStatus] || 'NEW';
     }

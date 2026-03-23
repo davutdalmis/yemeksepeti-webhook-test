@@ -19,9 +19,17 @@ class GoogleMapsDistanceService {
         this.apiKey = process.env.GOOGLE_MAPS_API_KEY || '';
         this.cache = new Map();
         this.httpClient = axios.create({ timeout: 10000 });
+        this.circuitBreaker = null;
 
         // Cache cleanup interval
         this._cleanupInterval = setInterval(() => this._cleanupCache(), CACHE_CLEANUP_INTERVAL_MS);
+    }
+
+    /**
+     * Inject circuit breaker for API calls (set from SmartDispatchService)
+     */
+    setCircuitBreaker(breaker) {
+        this.circuitBreaker = breaker;
     }
 
     /**
@@ -117,7 +125,7 @@ class GoogleMapsDistanceService {
             .join('|');
         const dest = `${destination.latitude.toFixed(6)},${destination.longitude.toFixed(6)}`;
 
-        const response = await this.httpClient.get(API_BASE_URL, {
+        const apiCall = () => this.httpClient.get(API_BASE_URL, {
             params: {
                 origins,
                 destinations: dest,
@@ -127,6 +135,24 @@ class GoogleMapsDistanceService {
                 key: this.apiKey
             }
         });
+
+        // Use circuit breaker if available; fallback fills all couriers with Haversine
+        let response;
+        if (this.circuitBreaker) {
+            response = await this.circuitBreaker.execute(
+                apiCall,
+                () => {
+                    // Circuit open — apply Haversine fallback for all couriers in batch
+                    for (const courier of couriers) {
+                        results.set(courier.id, this._createFallback(courier, destination));
+                    }
+                    return null; // signal: results already populated
+                }
+            );
+            if (response === null) return; // fallback was used
+        } else {
+            response = await apiCall();
+        }
 
         const data = response.data;
 
