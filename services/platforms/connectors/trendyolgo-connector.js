@@ -81,7 +81,29 @@ class TrendyolGoConnector extends BasePlatformConnector {
             isDelivered: false,
             CargoProvider: rawOrder.cargoProviderName || null,
             CargoTrackingNumber: rawOrder.cargoTrackingNumber || null,
-            InvoiceLink: rawOrder.invoiceLink || null
+            InvoiceLink: rawOrder.invoiceLink || null,
+
+            // Flat customer fields (WPF/Android compatibility)
+            CustomerName: [
+                rawOrder.recipientName?.split(' ')[0] || rawOrder.customerFirstName || '',
+                rawOrder.recipientName?.split(' ').slice(1).join(' ') || rawOrder.customerLastName || ''
+            ].join(' ').trim() || rawOrder.recipientName || '',
+            CustomerPhone: rawOrder.recipientPhone || rawOrder.customerPhone || '',
+            CustomerAddress: rawOrder.deliveryAddress || rawOrder.shippingAddress?.fullAddress || '',
+            CustomerCity: rawOrder.city || rawOrder.shippingAddress?.city || '',
+            CustomerDistrict: rawOrder.district || rawOrder.shippingAddress?.district || '',
+            CustomerLatitude: rawOrder.latitude || 0,
+            CustomerLongitude: rawOrder.longitude || 0,
+            CustomerDirections: rawOrder.addressNote || rawOrder.shippingAddress?.addressNote || '',
+
+            // Status flags
+            IsAccepted: false,
+            IsPrepared: false,
+            IsDelivered: false,
+
+            // Counters
+            ItemCount: items.length,
+            TotalQuantity: items.reduce((sum, line) => sum + (parseInt(line.quantity) || 0), 0)
         };
     }
 

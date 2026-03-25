@@ -87,7 +87,26 @@ class GetirYemekConnector extends BasePlatformConnector {
                 Phone: rawOrder.courier.phoneNumber || '',
                 Latitude: rawOrder.courier.location?.latitude || 0,
                 Longitude: rawOrder.courier.location?.longitude || 0
-            } : null
+            } : null,
+
+            // Flat customer fields (WPF/Android compatibility)
+            CustomerName: rawOrder.client?.name || '',
+            CustomerPhone: rawOrder.client?.clientPhoneNumber || rawOrder.client?.maskedPhoneNumber || '',
+            CustomerAddress: rawOrder.client?.deliveryAddress?.address || '',
+            CustomerCity: rawOrder.client?.deliveryAddress?.city || '',
+            CustomerDistrict: rawOrder.client?.deliveryAddress?.district || '',
+            CustomerLatitude: rawOrder.client?.deliveryAddress?.latitude || 0,
+            CustomerLongitude: rawOrder.client?.deliveryAddress?.longitude || 0,
+            CustomerDirections: rawOrder.client?.deliveryAddress?.directions || '',
+
+            // Status flags
+            IsAccepted: false,
+            IsPrepared: false,
+            IsDelivered: false,
+
+            // Counters
+            ItemCount: (rawOrder.products || []).length,
+            TotalQuantity: (rawOrder.products || []).reduce((sum, p) => sum + (parseInt(p.count) || 0), 0)
         };
     }
 
