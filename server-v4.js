@@ -12,6 +12,7 @@ try { require('dotenv').config(); } catch (e) { }
 
 const express = require('express');
 const axios = require('axios');
+const crypto = require('crypto');
 const http = require('http');
 const { Server } = require('socket.io');
 const admin = require('firebase-admin');
@@ -23,6 +24,8 @@ const PlatformRegistry = require('./services/platforms/platform-registry');
 const YemekSepetiConnector = require('./services/platforms/connectors/yemeksepeti-connector');
 const GetirYemekConnector = require('./services/platforms/connectors/getiryemek-connector');
 const TrendyolGoConnector = require('./services/platforms/connectors/trendyolgo-connector');
+const FuudyConnector = require('./services/platforms/connectors/fuudy-connector');
+const MigrosYemekConnector = require('./services/platforms/connectors/migrosyemek-connector');
 const createOrdersApi = require('./services/api/orders-api');
 const createPlatformsApi = require('./services/api/platforms-api');
 const GoogleMapsDistanceService = require('./services/google-maps-distance');
@@ -66,7 +69,7 @@ if (process.env.REDIS_URL) {
 }
 
 app.set('trust proxy', 1); // Railway runs behind a proxy
-app.use(express.json());
+app.use(express.json({ limit: '50kb' }));
 
 // Global rate limit (genel güvenlik ağı)
 const globalLimiter = rateLimit({
@@ -77,7 +80,8 @@ const globalLimiter = rateLimit({
     message: { error: 'Server rate limit exceeded' }
 });
 
-// Polling endpoint'leri için ayrı limit (yüksek — her şube sık polling yapıyor)
+// Polling endpoint'leri için limit — binlerce şube polling yapabilir
+// Her şube ~1 req/10sn = 1000 şube = 6000 req/dk
 const pollingLimiter = rateLimit({
     windowMs: 60 * 1000,
     max: 10000,
@@ -87,10 +91,12 @@ const pollingLimiter = rateLimit({
     message: { error: 'Polling rate limit exceeded' }
 });
 
-// Webhook endpoint'leri için ayrı limit (daha düşük — platform webhook'ları)
+// Webhook endpoint'leri için limit — platformlar (YS, GY, TG, Fuudy, Migros) webhook push eder
+// Platformların IP'leri sınırlı, per-IP limit yeterli
+// Tek IP'den max 3000/dk = saniyede 50 webhook (platform sunucuları için makul)
 const webhookLimiter = rateLimit({
     windowMs: 60 * 1000,
-    max: 5000,
+    max: 3000,
     standardHeaders: true,
     legacyHeaders: false,
     keyGenerator: (req) => req.ip,
@@ -167,11 +173,26 @@ const SOCKET_AUTH_TOKEN = process.env.SOCKET_AUTH_TOKEN || null;
 function authenticateWebhook(req, res, next) {
     if (!WEBHOOK_SECRET) return res.status(503).json({ error: 'Webhook authentication not configured' });
     const secret = req.headers['x-webhook-secret'] || req.query.secret;
-    if (secret !== WEBHOOK_SECRET) {
+    if (!secret || !timingSafeCompare(secret, WEBHOOK_SECRET)) {
         console.warn(`[Security] Unauthorized webhook attempt from ${req.ip} to ${req.path}`);
         return res.status(401).json({ error: 'Unauthorized webhook' });
     }
     next();
+}
+
+// Timing-safe string karşılaştırma (timing attack önleme)
+function timingSafeCompare(a, b) {
+    if (typeof a !== 'string' || typeof b !== 'string') return false;
+    const bufA = Buffer.from(a);
+    const bufB = Buffer.from(b);
+    if (bufA.length !== bufB.length) {
+        // Uzunluk farklıysa bile sabit sürede karşılaştır (bilgi sızdırmamak için)
+        const padded = Buffer.alloc(bufA.length);
+        bufB.copy(padded, 0, 0, Math.min(bufB.length, padded.length));
+        crypto.timingSafeEqual(bufA, padded);
+        return false;
+    }
+    return crypto.timingSafeEqual(bufA, bufB);
 }
 
 // Platform webhook'ları için auth (DH/GetirYemek/TrendyolGo kendi secret'larını göndermez)
@@ -179,6 +200,43 @@ function authenticatePlatformWebhook(req, res, next) {
     // Platform webhook'ları doğrudan gelir, x-webhook-secret göndermezler
     // Gelecekte platform-bazlı doğrulama eklenebilir (IP whitelist, HMAC vs.)
     next();
+}
+
+// ==================== BRANCH VALIDATION (HARD) ====================
+// In-memory cache: branchId → { exists: bool, timestamp: Date }
+const branchValidationCache = new Map();
+const BRANCH_CACHE_TTL_MS = 5 * 60 * 1000; // 5 dakika
+
+async function validateBranchId(branchId, platform, dbRef) {
+    if (!branchId) return { valid: false, reason: 'branchId is required' };
+    if (!dbRef) return { valid: true, reason: 'firebase_not_available' }; // Firebase yoksa geç (graceful)
+
+    // Cache kontrol
+    const cached = branchValidationCache.get(branchId);
+    if (cached && (Date.now() - cached.timestamp) < BRANCH_CACHE_TTL_MS) {
+        if (!cached.exists) {
+            console.warn(`[Security] REJECTED: Unknown branchId ${branchId} for ${platform} (cached)`);
+            return { valid: false, reason: 'invalid_branch' };
+        }
+        return { valid: true };
+    }
+
+    // Firestore'dan doğrula
+    try {
+        const branchSnap = await dbRef.collection('branches').doc(branchId).get();
+        const exists = branchSnap.exists;
+        branchValidationCache.set(branchId, { exists, timestamp: Date.now() });
+
+        if (!exists) {
+            console.error(`[Security] REJECTED: Branch ${branchId} does NOT exist — ${platform} webhook blocked`);
+            return { valid: false, reason: 'invalid_branch' };
+        }
+        return { valid: true };
+    } catch (err) {
+        console.error(`[Security] Branch validation error for ${branchId}:`, err.message);
+        // Hata durumunda siparişi geçir (false negative'den kaçın — canlı restoran etkilenmesin)
+        return { valid: true, reason: 'validation_error_passthrough' };
+    }
 }
 
 // ==================== FIREBASE CONFIGURATION ====================
@@ -242,10 +300,15 @@ async function initializePlatformHub() {
     const yemeksepetiConnector = new YemekSepetiConnector(db, platformRegistry);
     const getiryemekConnector = new GetirYemekConnector(db, platformRegistry);
     const trendyolgoConnector = new TrendyolGoConnector(db, platformRegistry);
+    const fuudyConnector = new FuudyConnector(db, platformRegistry);
 
     platformRegistry.registerConnector('yemeksepeti', yemeksepetiConnector);
     platformRegistry.registerConnector('getiryemek', getiryemekConnector);
     platformRegistry.registerConnector('trendyolgo', trendyolgoConnector);
+    platformRegistry.registerConnector('fuudy', fuudyConnector);
+
+    const migrosyemekConnector = new MigrosYemekConnector(db, platformRegistry);
+    platformRegistry.registerConnector('migrosyemek', migrosyemekConnector);
 
     // Initialize Dispatch Metrics & Alerts
     dispatchMetrics = new DispatchMetrics(db);
@@ -1091,20 +1154,10 @@ app.post('/order/:remoteId', webhookLimiter, authenticatePlatformWebhook, async 
         return res.status(400).json({ error: 'branchId is required' });
     }
 
-    // Şube doğrulama (soft validation — sadece loglama, siparişi engellemez)
-    try {
-        const branchRef = db.collection('branches').doc(branchId);
-        const branchSnap = await branchRef.get();
-        if (!branchSnap.exists) {
-            console.error(`[YemekSepeti] ALERT: Branch ${branchId} does NOT exist in Firestore!`);
-        } else {
-            const branchData = branchSnap.data();
-            if (branchData.yemekSepeti_isEnabled === false) {
-                console.warn(`[YemekSepeti] WARNING: YemekSepeti DISABLED for branch ${branchId}`);
-            }
-        }
-    } catch (err) {
-        console.error(`[YemekSepeti] Branch validation error:`, err.message);
+    // Şube doğrulama (HARD validation — geçersiz branchId engellenir)
+    const branchCheck = await validateBranchId(branchId, 'yemeksepeti', db);
+    if (!branchCheck.valid) {
+        return res.status(403).json({ error: branchCheck.reason });
     }
 
     metrics.increment('orders_received_total', { platform: 'yemeksepeti' });
@@ -1242,6 +1295,8 @@ app.post('/webhook/newOrder', webhookLimiter, authenticatePlatformWebhook, async
         console.error('[GetirYemek] ❌ branchId belirlenemedi — sipariş reddedildi (multi-tenant güvenlik)');
         return res.status(400).json({ error: 'branchId is required' });
     }
+    const branchCheckGY = await validateBranchId(branchId, 'getiryemek', db);
+    if (!branchCheckGY.valid) return res.status(403).json({ error: branchCheckGY.reason });
 
     metrics.increment('orders_received_total', { platform: 'getiryemek' });
     metrics.increment('webhook_requests_total', { platform: 'getiryemek' });
@@ -1378,6 +1433,8 @@ app.post('/webhook/trendyolgo/order', webhookLimiter, authenticatePlatformWebhoo
         console.error('[TrendyolGo] ❌ branchId belirlenemedi — sipariş reddedildi (multi-tenant güvenlik)');
         return res.status(400).json({ error: 'branchId is required' });
     }
+    const branchCheckTG = await validateBranchId(branchId, 'trendyolgo', db);
+    if (!branchCheckTG.valid) return res.status(403).json({ error: branchCheckTG.reason });
 
     metrics.increment('orders_received_total', { platform: 'trendyolgo' });
     metrics.increment('webhook_requests_total', { platform: 'trendyolgo' });
@@ -1454,6 +1511,231 @@ app.post('/webhook/trendyolgo/cancel', webhookLimiter, authenticatePlatformWebho
         res.status(200).json({ success: true });
     } catch (error) {
         console.error('[TrendyolGo] Cancel webhook error:', error.message);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// ==================== FUUDY WEBHOOKS ====================
+
+app.post('/webhook/fuudy/order', webhookLimiter, authenticatePlatformWebhook, async (req, res) => {
+    const order = req.body;
+    const branchId = req.headers['x-branch-id'] || req.query.branchId;
+    if (!branchId) {
+        console.error('[Fuudy] branchId belirlenemedi — siparis reddedildi (multi-tenant guvenlik)');
+        return res.status(400).json({ error: 'branchId is required' });
+    }
+    const branchCheckF = await validateBranchId(branchId, 'fuudy', db);
+    if (!branchCheckF.valid) return res.status(403).json({ error: branchCheckF.reason });
+
+    metrics.increment('orders_received_total', { platform: 'fuudy' });
+    metrics.increment('webhook_requests_total', { platform: 'fuudy' });
+    console.log('[Fuudy] ========== NEW ORDER ==========');
+
+    try {
+        const connector = platformRegistry.getConnector('fuudy');
+        const transformedOrder = connector ? connector.transformOrder(order, branchId) : order;
+
+        const firebaseResult = await writeOrderToFirebaseUnified(transformedOrder, 'fuudy', branchId);
+        if (firebaseResult.success && smartDispatchService && branchId) {
+            const deliveryLocation = {
+                latitude: order.address?.latitude || 0,
+                longitude: order.address?.longitude || 0
+            };
+            const courier = await smartDispatchService.assignBestCourier(branchId, deliveryLocation);
+            metrics.increment('dispatch_assignments_total', { status: courier ? 'success' : 'queued' });
+            if (courier) {
+                await connector?.assignCourier(firebaseResult.orderId, courier.id, courier.name);
+                await notifyCourierNewOrder(courier, transformedOrder, 'Fuudy');
+            } else if (dispatchQueue) {
+                await dispatchQueue.enqueue({
+                    orderId: firebaseResult.orderId,
+                    platformId: 'fuudy',
+                    branchId,
+                    deliveryLocation
+                });
+            }
+        }
+
+        if (firebaseResult.success) {
+            // Socket.IO: yeni siparis bildirimi
+            io.to(`branch:${branchId}`).emit('order:new', {
+                orderId: firebaseResult.orderId,
+                platform: 'fuudy',
+                customerName: transformedOrder.Customer?.FirstName || '',
+                totalAmount: transformedOrder.TotalAmount || 0,
+                timestamp: new Date().toISOString()
+            });
+        }
+
+        console.log('[Fuudy] ============================');
+        res.status(200).json({ success: true });
+    } catch (error) {
+        console.error('[Fuudy] Webhook processing error:', error.message);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// ==================== MIGROS YEMEK WEBHOOKS ====================
+
+// Basic Auth middleware — Migros webhook'larında zorunlu
+function authenticateMigrosWebhook(req, res, next) {
+    const expectedUser = process.env.MIGROS_WEBHOOK_USER;
+    const expectedPass = process.env.MIGROS_WEBHOOK_PASS;
+    if (!expectedUser || !expectedPass) {
+        console.error('[MigrosYemek] MIGROS_WEBHOOK_USER/PASS env vars not configured');
+        return res.status(503).json({ error: 'Webhook authentication not configured' });
+    }
+    const auth = req.headers['authorization'];
+    if (!auth || !auth.startsWith('Basic ')) {
+        console.error('[MigrosYemek] Missing Basic Auth header');
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+    try {
+        const credentials = Buffer.from(auth.split(' ')[1], 'base64').toString();
+        const [username, password] = credentials.split(':');
+        if (!timingSafeCompare(username || '', expectedUser) || !timingSafeCompare(password || '', expectedPass)) {
+            console.error('[MigrosYemek] Invalid Basic Auth credentials');
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+        next();
+    } catch (e) {
+        console.error('[MigrosYemek] Auth parse error:', e.message);
+        return res.status(401).json({ error: 'Invalid auth format' });
+    }
+}
+
+// Sipariş Oluştu — Migros yeni sipariş push eder
+app.post('/webhook/migrosyemek/order-created', webhookLimiter, authenticateMigrosWebhook, async (req, res) => {
+    const order = req.body;
+    const storeId = order.store?.id;
+
+    // branchId: header, query veya Migros storeId → branchId eşleme ile belirle
+    const branchId = req.headers['x-branch-id'] || req.query.branchId;
+    if (!branchId) {
+        console.error('[MigrosYemek] branchId belirlenemedi — siparis reddedildi (multi-tenant guvenlik)');
+        return res.status(400).json({ error: 'branchId is required' });
+    }
+    const branchCheckMY = await validateBranchId(branchId, 'migrosyemek', db);
+    if (!branchCheckMY.valid) return res.status(403).json({ error: branchCheckMY.reason });
+
+    metrics.increment('orders_received_total', { platform: 'migrosyemek' });
+    metrics.increment('webhook_requests_total', { platform: 'migrosyemek' });
+    console.log(`[MigrosYemek] ========== NEW ORDER: ${order.id} ==========`);
+
+    try {
+        const connector = platformRegistry.getConnector('migrosyemek');
+        const transformedOrder = connector ? connector.transformOrder(order, branchId) : order;
+
+        const firebaseResult = await writeOrderToFirebaseUnified(transformedOrder, 'migrosyemek', branchId);
+        if (firebaseResult.success && smartDispatchService && branchId) {
+            const deliveryLocation = {
+                latitude: order.customer?.deliveryAddress?.geoLocation?.latitude || 0,
+                longitude: order.customer?.deliveryAddress?.geoLocation?.longitude || 0
+            };
+            if (order.deliveryProvider === 'RESTAURANT') {
+                const courier = await smartDispatchService.assignBestCourier(branchId, deliveryLocation);
+                metrics.increment('dispatch_assignments_total', { status: courier ? 'success' : 'queued' });
+                if (courier) {
+                    await connector?.assignCourier(firebaseResult.orderId, courier.id, courier.name);
+                    await notifyCourierNewOrder(courier, transformedOrder, 'MigrosYemek');
+                } else if (dispatchQueue) {
+                    await dispatchQueue.enqueue({
+                        orderId: firebaseResult.orderId,
+                        platformId: 'migrosyemek',
+                        branchId,
+                        deliveryLocation
+                    });
+                }
+            }
+        }
+
+        if (firebaseResult.success) {
+            io.to(`branch:${branchId}`).emit('order:new', {
+                orderId: firebaseResult.orderId,
+                platform: 'migrosyemek',
+                customerName: order.customer?.fullName || '',
+                totalAmount: (order.prices?.discounted?.amountAsPenny || order.prices?.total?.amountAsPenny || 0) / 100,
+                timestamp: new Date().toISOString()
+            });
+        }
+
+        console.log(`[MigrosYemek] ============================`);
+        res.status(200).json({ success: true });
+    } catch (error) {
+        console.error('[MigrosYemek] Order webhook error:', error.message);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Sipariş İptal Edildi — Migros iptal/red bilgisi push eder
+app.post('/webhook/migrosyemek/order-cancelled', webhookLimiter, authenticateMigrosWebhook, async (req, res) => {
+    const { OrderId, StoreId, UserId } = req.body;
+    const branchId = req.headers['x-branch-id'] || req.query.branchId;
+
+    metrics.increment('webhook_requests_total', { platform: 'migrosyemek', type: 'cancel' });
+    console.log(`[MigrosYemek] ORDER CANCELLED: ${OrderId}`);
+
+    try {
+        const connector = platformRegistry.getConnector('migrosyemek');
+        if (connector) {
+            await connector.updateOrderStatus(String(OrderId), 'CANCELLED', { cancelledBy: 'platform' });
+        }
+
+        if (branchId) {
+            io.to(`branch:${branchId}`).emit('order:cancelled', {
+                orderId: String(OrderId),
+                platform: 'migrosyemek',
+                timestamp: new Date().toISOString()
+            });
+        }
+
+        res.status(200).json({ success: true });
+    } catch (error) {
+        console.error('[MigrosYemek] Cancel webhook error:', error.message);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Kurye Durumu Değişti — Migros kurye durum değişikliği push eder
+app.post('/webhook/migrosyemek/delivery-status', webhookLimiter, authenticateMigrosWebhook, async (req, res) => {
+    const { orderId, storeId, status, deliveryStatus, isCancelled, deliveryProvider, courierName } = req.body;
+    const branchId = req.headers['x-branch-id'] || req.query.branchId;
+
+    metrics.increment('webhook_requests_total', { platform: 'migrosyemek', type: 'delivery_status' });
+    console.log(`[MigrosYemek] DELIVERY STATUS: order=${orderId} status=${deliveryStatus} courier=${courierName}`);
+
+    try {
+        const connector = platformRegistry.getConnector('migrosyemek');
+        if (connector) {
+            const updates = {
+                deliveryStatus: deliveryStatus || '',
+                courierName: courierName || '',
+                deliveryProvider: deliveryProvider || '',
+                isCancelled: isCancelled || false
+            };
+
+            // DELIVERED durumunda siparişi teslim edildi olarak işaretle
+            if (deliveryStatus === 'DELIVERED') {
+                await connector.updateOrderStatus(String(orderId), 'DELIVERED', updates);
+            } else {
+                await connector.updateOrderStatus(String(orderId), status || 'IN_PROGRESS', updates);
+            }
+        }
+
+        if (branchId) {
+            io.to(`branch:${branchId}`).emit('order:delivery-status', {
+                orderId: String(orderId),
+                platform: 'migrosyemek',
+                deliveryStatus,
+                courierName,
+                isCancelled,
+                timestamp: new Date().toISOString()
+            });
+        }
+
+        res.status(200).json({ success: true });
+    } catch (error) {
+        console.error('[MigrosYemek] Delivery status webhook error:', error.message);
         res.status(500).json({ error: 'Internal server error' });
     }
 });
@@ -1586,6 +1868,11 @@ app.delete('/api/getiryemek/webhooks/:webhookId', async (req, res) => {
 // ==================== METRICS ====================
 
 app.get('/api/metrics', async (req, res) => {
+    // Metrics endpoint'i auth ile korunur — iç yapı bilgisi sızıntısını önler
+    const apiKey = req.headers['x-api-key'];
+    if (apiKey !== API_KEYS.ADMIN_API_KEY) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
     try {
         const output = await metrics.getMetrics();
         res.set('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
@@ -1706,52 +1993,11 @@ app.get('/api/health/branch/:branchId', async (req, res) => {
 });
 
 app.get('/', async (req, res) => {
-    const allEntries = await orderStore.getAllEntries();
-    const ordersByStatus = {};
-    for (const [, item] of allEntries) {
-        ordersByStatus[item.status] = (ordersByStatus[item.status] || 0) + 1;
-    }
-
+    // Hassas bilgileri sızdırmayan minimal root endpoint
     res.json({
-        service: 'YemiGO Platform Hub Server',
-        version: '4.0.0',
-        architecture: 'MODULAR PLATFORM HUB',
-        firebase: {
-            status: firebaseInitialized ? 'CONNECTED' : 'DISABLED',
-            features: firebaseInitialized ? ['direct_write', 'smart_dispatch', 'push_notifications', 'realtime_sync'] : []
-        },
-        platformHub: {
-            platforms: platformRegistry.getAllPlatforms().map(p => ({ id: p.id, name: p.name, enabled: p.enabled })),
-            connectors: Array.from(platformRegistry.connectors.keys())
-        },
-        rateLimits: {
-            global: '15000/min',
-            polling: '10000/min',
-            webhook: '5000/min'
-        },
-        queues: {
-            yemeksepeti: { totalOrders: allEntries.length, ordersByStatus },
-            getiryemek: { pendingWebhooks: await webhookStore.size(), indexedKeys: await webhookStore.indexedKeyCount() },
-            cleanup: {
-                lastLazyCleanup: new Date(lastLazyCleanup).toISOString(),
-                lazyThresholdMin: LAZY_CLEANUP_THRESHOLD / 60000,
-                scheduledIntervalMin: 5
-            }
-        },
-        sockets: {
-            connectedCouriers: await courierState.connectedCount(),
-            totalConnections: io.sockets.sockets.size
-        },
-        api: {
-            v2: {
-                orders: '/api/v2/orders',
-                platforms: '/api/v2/platforms'
-            },
-            legacy: {
-                yemeksepeti: '/api/yemeksepeti/pending-orders',
-                getiryemek: '/poll/webhooks'
-            }
-        }
+        service: 'YemiGO Platform Hub',
+        status: 'ok',
+        timestamp: new Date().toISOString()
     });
 });
 

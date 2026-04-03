@@ -19,7 +19,8 @@ class BasePlatformConnector {
             'yemeksepeti': 'yemekSepetiOrders',
             'getiryemek': 'getirYemekOrders',
             'trendyolgo': 'trendyolGoOrders',
-            'qrmenu': 'qrMenuOrders'
+            'qrmenu': 'qrMenuOrders',
+            'migrosyemek': 'migrosYemekOrders'
         };
         return collections[this.platformId] || `${this.platformId}Orders`;
     }
