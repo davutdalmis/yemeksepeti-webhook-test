@@ -1176,7 +1176,8 @@ app.post('/order/:remoteId', webhookLimiter, authenticatePlatformWebhook, async 
         // Use connector for transformation
         const connector = platformRegistry.getConnector('yemeksepeti');
         console.log('[YemekSepeti] Connector available:', !!connector);
-        const transformedOrder = connector ? connector.transformOrder(order, branchId) : order;
+        const branchConfig = platformRegistry.getBranchPlatformConfig(branchId, 'yemeksepeti') || {};
+        const transformedOrder = connector ? connector.transformOrder(order, branchId, branchConfig) : order;
         transformedOrder.RemoteOrderId = `${remoteId}_${order.token}_${Date.now()}`;
 
         console.log('[YemekSepeti] Transformed - Items:', transformedOrder.Items?.length || 0);

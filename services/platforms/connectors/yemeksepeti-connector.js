@@ -19,14 +19,13 @@ class YemekSepetiConnector extends BasePlatformConnector {
             password: process.env.YEMEKSEPETI_PASSWORD || ''
         };
 
-        // Token cache
-        this.token = null;
-        this.tokenExpiry = null;
+        // Per-credential token cache (key: username → { token, expiry })
+        this.tokenCache = new Map();
     }
 
     // ==================== ORDER TRANSFORMATION ====================
 
-    transformOrder(rawOrder, branchId) {
+    transformOrder(rawOrder, branchId, branchConfig = {}) {
         const now = new Date();
         const rawDelivery = rawOrder.delivery || null;
         const deliveryAddress = rawDelivery?.address || rawOrder.customer?.address || null;
@@ -91,7 +90,7 @@ class YemekSepetiConnector extends BasePlatformConnector {
             OrderId: rawOrder.code || rawOrder.token || '',
             OrderToken: rawOrder.token || '',
             VendorId: rawOrder.vendorId || '',
-            ChainCode: this.config.chainCode,
+            ChainCode: branchConfig.chainCode || this.config.chainCode,
             OrderDate: rawOrder.createdAt || now.toISOString(),
             // DH API: preOrder=true ve delivery.expectedDeliveryTime ileri tarihli siparişleri belirtir
             IsScheduled: rawOrder.preOrder === true,
@@ -220,32 +219,37 @@ class YemekSepetiConnector extends BasePlatformConnector {
 
     // ==================== API AUTHENTICATION ====================
 
-    async getToken() {
-        // Check cache
-        if (this.token && this.tokenExpiry && Date.now() < this.tokenExpiry) {
-            return this.token;
-        }
+    async getToken(branchConfig = {}) {
+        const username = branchConfig.username || this.config.username;
+        const password = branchConfig.password || this.config.password;
 
-        if (!this.config.username || !this.config.password) {
+        if (!username || !password) {
             console.log('[YemekSepeti] No credentials configured');
             return null;
+        }
+
+        // Per-credential token cache
+        const cacheKey = username;
+        const cached = this.tokenCache.get(cacheKey);
+        if (cached && Date.now() < cached.expiry) {
+            return cached.token;
         }
 
         try {
             const response = await axios.post(
                 `${this.config.baseUrl}/v2/login`,
                 new URLSearchParams({
-                    username: this.config.username,
-                    password: this.config.password,
+                    username,
+                    password,
                     grant_type: 'client_credentials'
                 }),
                 { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: API_TIMEOUT }
             );
 
-            this.token = response.data.access_token;
-            this.tokenExpiry = Date.now() + (25 * 60 * 1000); // 25 minutes
-            console.log('[YemekSepeti] Token refreshed');
-            return this.token;
+            const token = response.data.access_token;
+            this.tokenCache.set(cacheKey, { token, expiry: Date.now() + (25 * 60 * 1000) });
+            console.log(`[YemekSepeti] Token refreshed (user: ${username.substring(0, 3)}...)`);
+            return token;
 
         } catch (error) {
             console.error('[YemekSepeti] Token error:', error.message);
@@ -256,7 +260,7 @@ class YemekSepetiConnector extends BasePlatformConnector {
     // ==================== API METHODS ====================
 
     async acceptOrder(orderId, branchConfig = {}) {
-        const token = await this.getToken();
+        const token = await this.getToken(branchConfig);
         if (!token) return { success: false, reason: 'no_token' };
 
         try {
@@ -279,7 +283,7 @@ class YemekSepetiConnector extends BasePlatformConnector {
     }
 
     async rejectOrder(orderId, reason, branchConfig = {}) {
-        const token = await this.getToken();
+        const token = await this.getToken(branchConfig);
         if (!token) return { success: false, reason: 'no_token' };
 
         try {
@@ -302,7 +306,7 @@ class YemekSepetiConnector extends BasePlatformConnector {
     }
 
     async markOrderReady(orderId, branchConfig = {}) {
-        const token = await this.getToken();
+        const token = await this.getToken(branchConfig);
         if (!token) return { success: false, reason: 'no_token' };
 
         try {
@@ -325,7 +329,7 @@ class YemekSepetiConnector extends BasePlatformConnector {
     }
 
     async markOrderPickedUp(orderId, branchConfig = {}) {
-        const token = await this.getToken();
+        const token = await this.getToken(branchConfig);
         if (!token) return { success: false, reason: 'no_token' };
 
         try {
@@ -355,13 +359,14 @@ class YemekSepetiConnector extends BasePlatformConnector {
 
     // ==================== STATUS CHECK ====================
 
-    async checkOrderStatus(orderToken) {
-        const token = await this.getToken();
-        if (!token || !this.config.chainCode) return null;
+    async checkOrderStatus(orderToken, branchConfig = {}) {
+        const token = await this.getToken(branchConfig);
+        const chainCode = branchConfig.chainCode || this.config.chainCode;
+        if (!token || !chainCode) return null;
 
         try {
             const response = await axios.get(
-                `${this.config.baseUrl}/v2/chains/${this.config.chainCode}/orders/${orderToken}`,
+                `${this.config.baseUrl}/v2/chains/${chainCode}/orders/${orderToken}`,
                 { headers: { 'Authorization': `Bearer ${token}` }, timeout: API_TIMEOUT }
             );
             return response.data.order;
