@@ -190,7 +190,7 @@ class YemekSepetiConnector extends BasePlatformConnector {
 
             // Platform specific
             PlatformOrderId: rawOrder.id || null,
-            CallbackUrls: rawOrder.callbackUrls || null,
+            CallbackUrls: this._extractCallbackUrls(rawOrder),
 
             // Flat customer fields (WPF/Android compatibility)
             CustomerName: rawOrder.customer
@@ -214,6 +214,35 @@ class YemekSepetiConnector extends BasePlatformConnector {
             // Counters
             ItemCount: (rawOrder.products || []).length,
             TotalQuantity: (rawOrder.products || []).reduce((sum, p) => sum + (parseInt(p.quantity) || 0), 0)
+        };
+    }
+
+    /**
+     * DH webhook payload'undan callback URL'lerini çıkarır.
+     * DH bunları şu alternatif isimlerle gönderebilir: callbackUrls, callback_urls, webhookUrls, links.
+     * Hiçbiri yoksa empty object döner (null değil) — Firestore'un alanı tutmasını garantilemek için.
+     * Empty object durumunda warning loglar — DH'nin gerçek alan adını sonradan tespit edebilmek için.
+     */
+    _extractCallbackUrls(rawOrder) {
+        const candidate = rawOrder.callbackUrls
+            || rawOrder.callback_urls
+            || rawOrder.webhookUrls
+            || rawOrder.links
+            || null;
+
+        if (candidate && typeof candidate === 'object' && Object.keys(candidate).length > 0) {
+            return candidate;
+        }
+
+        console.warn('[YS-CONNECTOR] CallbackUrls payload\'da bulunamadı, raw rawOrder keys:', Object.keys(rawOrder));
+        // Empty object — Firestore alanı tutar, WPF deserialize ederken hata vermez
+        return {
+            orderAcceptedUrl: '',
+            orderRejectedUrl: '',
+            orderPreparedUpUrl: '',
+            orderPreparedUrl: '',
+            orderPickedUpUrl: '',
+            adjustPreparationTimeUrl: ''
         };
     }
 
