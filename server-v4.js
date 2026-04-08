@@ -69,6 +69,32 @@ if (process.env.REDIS_URL) {
 }
 
 app.set('trust proxy', 1); // Railway runs behind a proxy
+
+// HTTP CORS — manuel implementation (sıfır bağımlılık).
+// Browser tabanlı istemciler (yemigo-pos web) için.
+// Webhook'lar (platform sunucuları) ve WPF polling browser'dan gelmediği için bundan etkilenmez.
+function isAllowedOrigin(origin) {
+    if (!origin) return true; // server-to-server
+    if (ALLOWED_ORIGINS.length > 0) return ALLOWED_ORIGINS.includes(origin);
+    // Whitelist tanımsızsa varsayılan: localhost (dev) + yemigo subdomain'leri
+    return /^https?:\/\/(localhost(:\d+)?|.*\.yemigo\.com)$/.test(origin);
+}
+
+app.use((req, res, next) => {
+    const origin = req.headers.origin;
+    if (origin && isAllowedOrigin(origin)) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Vary', 'Origin');
+        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-api-key, x-branch-id, x-admin-key, x-webhook-secret');
+        res.setHeader('Access-Control-Max-Age', '86400');
+    }
+    if (req.method === 'OPTIONS') {
+        return res.status(204).end();
+    }
+    next();
+});
+
 app.use(express.json({ limit: '50kb' }));
 
 // Global rate limit (genel güvenlik ağı)
