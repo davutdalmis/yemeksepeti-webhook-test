@@ -1291,29 +1291,7 @@ app.put('/remoteId/:remoteId/remoteOrder/:remoteOrderId/posOrderStatus', authent
 app.post('/webhook/newOrder', webhookLimiter, authenticatePlatformWebhook, async (req, res) => {
     const order = req.body;
     const restaurantSecretKey = req.headers['x-restaurant-secret-key'] || API_KEYS.GETIRYEMEK_DEFAULT_RESTAURANT_SECRET;
-    let branchId = req.headers['x-branch-id'] || req.query.branchId;
-
-    // Fallback: header yoksa payload'daki restaurantId'den branchId resolve et (multi-tenant)
-    if (!branchId) {
-        const restaurantId = order?.restaurant?.id || order?.restaurantId;
-        if (restaurantId) {
-            try {
-                const snap = await db.collection('branches')
-                    .where('getirYemek_restaurantId', '==', restaurantId)
-                    .limit(1)
-                    .get();
-                if (!snap.empty) {
-                    branchId = snap.docs[0].id;
-                    console.log(`[GetirYemek] ✅ branchId resolved from restaurantId=${restaurantId} → ${branchId}`);
-                } else {
-                    console.error(`[GetirYemek] ❌ restaurantId=${restaurantId} için eşleşen şube bulunamadı`);
-                }
-            } catch (err) {
-                console.error('[GetirYemek] restaurantId lookup hatası:', err);
-            }
-        }
-    }
-
+    const branchId = req.headers['x-branch-id'] || req.query.branchId;
     if (!branchId) {
         console.error('[GetirYemek] ❌ branchId belirlenemedi — sipariş reddedildi (multi-tenant güvenlik)');
         return res.status(400).json({ error: 'branchId is required' });
