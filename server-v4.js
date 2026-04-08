@@ -1303,11 +1303,6 @@ app.post('/webhook/newOrder', webhookLimiter, authenticatePlatformWebhook, async
     console.log('[DIAG-GY] body.restaurant?.id:', order?.restaurant?.id);
     console.log('[DIAG-GY] body.restaurantId:', order?.restaurantId);
     console.log('[DIAG-GY] body keys:', Object.keys(order || {}).join(','));
-    console.log('[DIAG-GY] foodOrder keys:', order?.foodOrder ? Object.keys(order.foodOrder).join(',') : 'YOK');
-    console.log('[DIAG-GY] foodOrder.id:', order?.foodOrder?.id);
-    console.log('[DIAG-GY] foodOrder.restaurant?.id:', order?.foodOrder?.restaurant?.id);
-    console.log('[DIAG-GY] foodOrder.restaurantId:', order?.foodOrder?.restaurantId);
-    console.log('[DIAG-GY] FULL BODY (first 800 chars):', JSON.stringify(order).slice(0, 800));
     console.log('[DIAG-GY] resolved branchId (header/query):', branchId || 'YOK');
     console.log('[DIAG-GY] ======================================');
 
