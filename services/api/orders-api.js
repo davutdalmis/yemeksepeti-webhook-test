@@ -547,6 +547,99 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
         }
     });
 
+    // ==================== BRANCH OPERATIONS ====================
+
+    /**
+     * POST /api/orders/:platformId/restaurant-status
+     * Şube açma/kapama (POS web client için).
+     * - Mevcut connector.setRestaurantStatus() metodunu kullanır (yeni Getir API çağrısı yok).
+     * - Mevcut sipariş akışına dokunmaz, yan kanal.
+     * - Audit log Firestore branchOperations koleksiyonuna yazılır.
+     *
+     * Headers: x-api-key, x-branch-id
+     * Body: { status: 'open' | 'closed' | 'busy', performedBy?: string, source?: string }
+     */
+    router.post('/:platformId/restaurant-status', async (req, res) => {
+        const { platformId } = req.params;
+        const branchId = req.branchId;
+        const { status, performedBy, source } = req.body || {};
+
+        if (!branchId) {
+            return res.status(400).json({ success: false, error: 'x-branch-id header required', code: 'NO_BRANCH_ID' });
+        }
+        if (!['open', 'closed', 'busy'].includes(status)) {
+            return res.status(400).json({ success: false, error: "status must be 'open' | 'closed' | 'busy'", code: 'INVALID_STATUS' });
+        }
+
+        try {
+            const connector = registry.getConnector(platformId);
+            if (!connector) {
+                return res.status(404).json({ success: false, error: `Platform not found: ${platformId}`, code: 'PLATFORM_NOT_FOUND' });
+            }
+            if (typeof connector.setRestaurantStatus !== 'function') {
+                return res.status(501).json({ success: false, error: `Platform ${platformId} does not support restaurant status toggle`, code: 'NOT_IMPLEMENTED' });
+            }
+
+            const branchConfig = registry.getBranchPlatformConfig(branchId, platformId) || {};
+            const result = await connector.setRestaurantStatus(status, branchConfig);
+
+            // Audit log + branch doc state cache — best effort, hata atılırsa ana işlemi etkilemez
+            if (db) {
+                try {
+                    await db.collection('branchOperations').add({
+                        branchId,
+                        platform: platformId,
+                        action: 'restaurant_status',
+                        value: status,
+                        performedBy: performedBy || 'unknown',
+                        source: source || 'webpos',
+                        success: result.success === true,
+                        result: result.success ? null : (result.reason || 'unknown'),
+                        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+                    });
+                } catch (auditErr) {
+                    console.warn('[OrdersAPI] Audit log write failed:', auditErr.message);
+                }
+
+                // Branch doc'a state cache yaz — POS UI'lar Firestore listener ile anlık görsün
+                if (result.success === true) {
+                    try {
+                        const branchRef = db.collection('branches').doc(branchId);
+                        await branchRef.update({
+                            [`${platformId}_isRestaurantOpen`]: status === 'open',
+                            [`${platformId}_restaurantStatus`]: status,
+                            [`${platformId}_restaurantStatusUpdatedAt`]: admin.firestore.FieldValue.serverTimestamp(),
+                        });
+                    } catch (cacheErr) {
+                        console.warn('[OrdersAPI] Branch doc state cache update failed:', cacheErr.message);
+                    }
+                }
+            }
+
+            // Socket.io broadcast — POS UI'lar anlık güncellensin
+            if (io && branchId) {
+                io.to(`branch:${branchId}`).emit('restaurant:status_changed', {
+                    platform: platformId,
+                    status,
+                    timestamp: new Date().toISOString(),
+                });
+            }
+
+            if (result.success) {
+                console.log(`[OrdersAPI] Restaurant status changed: ${platformId}/${branchId} -> ${status}`);
+                return res.json({ success: true, branchId, platform: platformId, status });
+            }
+            return res.status(400).json({
+                success: false,
+                error: result.reason || 'setRestaurantStatus failed',
+                code: 'STATUS_CHANGE_FAILED',
+            });
+        } catch (error) {
+            console.error('[OrdersAPI] Restaurant status error:', error.message);
+            return res.status(500).json({ success: false, error: error.message, code: 'SERVER_ERROR' });
+        }
+    });
+
     // ==================== ORDER QUERIES ====================
 
     /**
