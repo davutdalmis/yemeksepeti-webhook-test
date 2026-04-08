@@ -1293,19 +1293,6 @@ app.post('/webhook/newOrder', webhookLimiter, authenticatePlatformWebhook, async
     const restaurantSecretKey = req.headers['x-restaurant-secret-key'] || API_KEYS.GETIRYEMEK_DEFAULT_RESTAURANT_SECRET;
     let branchId = req.headers['x-branch-id'] || req.query.branchId;
 
-    // [DIAG-GY-001] Geçici teşhis: GetirYemek webhook neden branchId belirleyemiyor?
-    console.log('[DIAG-GY] ========== INCOMING WEBHOOK ==========');
-    console.log('[DIAG-GY] originalUrl:', req.originalUrl);
-    console.log('[DIAG-GY] query:', JSON.stringify(req.query));
-    console.log('[DIAG-GY] header.x-branch-id:', req.headers['x-branch-id'] || 'YOK');
-    console.log('[DIAG-GY] header.x-restaurant-secret-key:', restaurantSecretKey ? `${String(restaurantSecretKey).slice(0,8)}...` : 'YOK');
-    console.log('[DIAG-GY] body.id:', order?.id);
-    console.log('[DIAG-GY] body.restaurant?.id:', order?.restaurant?.id);
-    console.log('[DIAG-GY] body.restaurantId:', order?.restaurantId);
-    console.log('[DIAG-GY] body keys:', Object.keys(order || {}).join(','));
-    console.log('[DIAG-GY] resolved branchId (header/query):', branchId || 'YOK');
-    console.log('[DIAG-GY] ======================================');
-
     // Fallback: header yoksa payload'daki restaurantId'den branchId resolve et (multi-tenant)
     if (!branchId) {
         const restaurantId = order?.restaurant?.id || order?.restaurantId;
