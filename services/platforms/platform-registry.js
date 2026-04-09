@@ -2,6 +2,46 @@
 // PLATFORM REGISTRY - Firebase'den dinamik platform konfigürasyonlarını yönetir
 // ==================================================================================
 
+// Flat branch field şemasını (getirYemek_restaurantSecretKey ...) nested
+// platformSettings yapısına çevirir. WPF/PLATFORM_HARDENING 3.1 ile gelen
+// flat şemayı Railway connector'larının beklediği nested şemayla uyumlu kılar.
+// Eski nested platformSettings varsa öncelikli — tam geriye uyumlu.
+const FLAT_PLATFORM_PREFIXES = {
+    getiryemek: 'getirYemek_',
+    yemeksepeti: 'yemekSepeti_',
+    trendyolgo: 'trendyolGo_',
+    fuudy: 'fuudy_',
+    migrosyemek: 'migrosYemek_',
+};
+
+function flatBranchToPlatformSettings(branchData) {
+    const out = {};
+    for (const [platformId, prefix] of Object.entries(FLAT_PLATFORM_PREFIXES)) {
+        const cfg = {};
+        for (const [k, v] of Object.entries(branchData)) {
+            if (k.startsWith(prefix)) {
+                const subKey = k.slice(prefix.length);
+                cfg[subKey.charAt(0).toLowerCase() + subKey.slice(1)] = v;
+            }
+        }
+        if (Object.keys(cfg).length > 0) {
+            if (cfg.isEnabled !== undefined && cfg.enabled === undefined) {
+                cfg.enabled = cfg.isEnabled === true;
+            }
+            out[platformId] = cfg;
+        }
+    }
+    return out;
+}
+
+function resolvePlatformSettings(branchData) {
+    if (branchData.platformSettings && Object.keys(branchData.platformSettings).length > 0) {
+        return branchData.platformSettings;
+    }
+    const built = flatBranchToPlatformSettings(branchData);
+    return Object.keys(built).length > 0 ? built : null;
+}
+
 class PlatformRegistry {
     constructor(db) {
         this.db = db;
@@ -117,16 +157,17 @@ class PlatformRegistry {
     }
 
     // Branch bazlı konfigürasyonları yükle
+    // Hem nested 'platformSettings' hem flat 'getirYemek_*' şemasını destekler
     async loadBranchConfigs() {
-        // branches collection'dan platformSettings'leri çek
         const branchesSnapshot = await this.db.collectionGroup('branches').get();
 
         branchesSnapshot.forEach(doc => {
             const branchData = doc.data();
             const branchId = branchData.id || doc.id;
 
-            if (branchData.platformSettings) {
-                this.branchConfigs.set(branchId, branchData.platformSettings);
+            const settings = resolvePlatformSettings(branchData);
+            if (settings) {
+                this.branchConfigs.set(branchId, settings);
             }
         });
 
@@ -151,14 +192,16 @@ class PlatformRegistry {
         });
 
         // Branch configs listener (collectionGroup)
+        // Hem nested 'platformSettings' hem flat 'getirYemek_*' şemasını destekler
         this.db.collectionGroup('branches').onSnapshot(snapshot => {
             snapshot.docChanges().forEach(change => {
                 if (change.type === 'added' || change.type === 'modified') {
                     const branchData = change.doc.data();
                     const branchId = branchData.id || change.doc.id;
 
-                    if (branchData.platformSettings) {
-                        this.branchConfigs.set(branchId, branchData.platformSettings);
+                    const settings = resolvePlatformSettings(branchData);
+                    if (settings) {
+                        this.branchConfigs.set(branchId, settings);
                     }
                 }
             });
