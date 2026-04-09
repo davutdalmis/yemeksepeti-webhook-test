@@ -265,6 +265,41 @@ async function validateBranchId(branchId, platform, dbRef) {
     }
 }
 
+// ==================== GETIRYEMEK BRANCH RESOLVER ====================
+// Gelen Getir webhook'unun hangi şubeye ait olduğunu, x-restaurant-secret-key
+// header'ından Firestore'a bakarak çözer. URL'deki branchId'ye GÜVENMEZ —
+// secret authoritative kaynaktır (multi-tenant izolasyon).
+//
+// In-memory cache: secret → { branchId, timestamp }
+const getirSecretBranchCache = new Map();
+const GETIR_SECRET_CACHE_TTL_MS = 10 * 60 * 1000; // 10 dakika
+
+async function resolveBranchByGetirSecret(secret, dbRef) {
+    if (!secret || !dbRef) return null;
+
+    const cached = getirSecretBranchCache.get(secret);
+    if (cached && (Date.now() - cached.timestamp) < GETIR_SECRET_CACHE_TTL_MS) {
+        return cached.branchId;
+    }
+
+    try {
+        const snap = await dbRef.collection('branches')
+            .where('getirYemek_restaurantSecretKey', '==', secret)
+            .limit(1)
+            .get();
+        if (snap.empty) {
+            getirSecretBranchCache.set(secret, { branchId: null, timestamp: Date.now() });
+            return null;
+        }
+        const branchId = snap.docs[0].id;
+        getirSecretBranchCache.set(secret, { branchId, timestamp: Date.now() });
+        return branchId;
+    } catch (err) {
+        console.error('[GetirYemek] Secret→branch resolve error:', err.message);
+        return null;
+    }
+}
+
 // ==================== FIREBASE CONFIGURATION ====================
 let db = null;
 let firebaseInitialized = false;
@@ -1317,10 +1352,20 @@ app.put('/remoteId/:remoteId/remoteOrder/:remoteOrderId/posOrderStatus', authent
 app.post('/webhook/newOrder', webhookLimiter, authenticatePlatformWebhook, async (req, res) => {
     const order = req.body;
     const restaurantSecretKey = req.headers['x-restaurant-secret-key'] || API_KEYS.GETIRYEMEK_DEFAULT_RESTAURANT_SECRET;
-    const branchId = req.headers['x-branch-id'] || req.query.branchId;
+
+    // Multi-tenant güvenlik: secret authoritative — URL'deki branchId'yi override eder
+    let branchId = req.headers['x-branch-id'] || req.query.branchId;
+    const resolvedBranchId = await resolveBranchByGetirSecret(restaurantSecretKey, db);
+    if (resolvedBranchId) {
+        if (branchId && branchId !== resolvedBranchId) {
+            console.warn(`[GetirYemek] ⚠ branchId mismatch — URL=${branchId} secret-resolved=${resolvedBranchId} (using secret)`);
+        }
+        branchId = resolvedBranchId;
+    }
+
     if (!branchId) {
         console.error('[GetirYemek] ❌ branchId belirlenemedi — sipariş reddedildi (multi-tenant güvenlik)');
-        return res.status(400).json({ error: 'branchId is required' });
+        return res.status(400).json({ error: 'branchId could not be resolved from secret or URL' });
     }
     const branchCheckGY = await validateBranchId(branchId, 'getiryemek', db);
     if (!branchCheckGY.valid) return res.status(403).json({ error: branchCheckGY.reason });
@@ -1409,7 +1454,15 @@ app.post('/webhook/cancelOrder', webhookLimiter, authenticatePlatformWebhook, as
     }
 
     // Socket.IO: sipariş iptal bildirimi
-    const branchId = req.headers['x-branch-id'] || req.query.branchId;
+    // Multi-tenant güvenlik: secret authoritative
+    let branchId = req.headers['x-branch-id'] || req.query.branchId;
+    const resolvedBranchIdCancel = await resolveBranchByGetirSecret(restaurantSecretKey, db);
+    if (resolvedBranchIdCancel) {
+        if (branchId && branchId !== resolvedBranchIdCancel) {
+            console.warn(`[GetirYemek] ⚠ cancelOrder branchId mismatch — URL=${branchId} secret-resolved=${resolvedBranchIdCancel} (using secret)`);
+        }
+        branchId = resolvedBranchIdCancel;
+    }
     if (!branchId) {
         console.error('[GetirYemek] ❌ branchId belirlenemedi — iptal yayını atlandı (multi-tenant güvenlik)');
     }
