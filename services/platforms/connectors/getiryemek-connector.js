@@ -249,32 +249,67 @@ class GetirYemekConnector extends BasePlatformConnector {
 
     // ==================== RESTAURANT STATUS ====================
 
+    /**
+     * Restoran açma/kapama (PDF dokümanına uygun).
+     * - Base URL branchConfig.baseUrl'den gelir (hardcoded fallback yok)
+     * - Auth: POST /auth/login → token → PUT /restaurants/status/{open|close}
+     * - 'busy' için /restaurants/delivery-duration/busyness +30dk default
+     */
     async setRestaurantStatus(status, branchConfig = {}) {
-        const restaurantSecret = branchConfig.restaurantSecretKey || this.config.defaultRestaurantSecret;
+        const baseUrl = branchConfig.baseUrl;
+        const appSecretKey = branchConfig.appSecretKey;
+        const restaurantSecretKey = branchConfig.restaurantSecretKey || this.config.defaultRestaurantSecret;
 
-        if (!restaurantSecret) {
-            return { success: false, reason: 'no_secret' };
+        if (!baseUrl) return { success: false, reason: 'no_base_url' };
+        if (!appSecretKey) return { success: false, reason: 'no_app_secret' };
+        if (!restaurantSecretKey) return { success: false, reason: 'no_restaurant_secret' };
+
+        if (!['open', 'closed', 'busy'].includes(status)) {
+            return { success: false, reason: `invalid_status:${status}` };
         }
 
         try {
-            const response = await axios.post(
-                `${this.config.baseUrl}/restaurants/status`,
-                { status: status }, // 'open', 'closed', 'busy'
+            // 1) Token al — PDF: POST /auth/login body { appSecretKey, restaurantSecretKey }
+            const loginRes = await axios.post(
+                `${baseUrl}/auth/login`,
+                { appSecretKey, restaurantSecretKey },
+                { headers: { 'Content-Type': 'application/json' }, timeout: API_TIMEOUT }
+            );
+            const token = loginRes.data?.token;
+            if (!token) return { success: false, reason: 'login_no_token' };
+
+            // 2) Status'a göre doğru endpoint
+            let path;
+            let body = {};
+            if (status === 'open') {
+                path = '/restaurants/status/open';
+            } else if (status === 'closed') {
+                path = '/restaurants/status/close';
+            } else {
+                // 'busy' → yoğuna al, varsayılan +30 dk
+                path = '/restaurants/delivery-duration/busyness';
+                body = { isBusy: true, busynessDifferenceDuration: 30 };
+            }
+
+            const statusRes = await axios.put(
+                `${baseUrl}${path}`,
+                body,
                 {
                     headers: {
                         'Content-Type': 'application/json',
-                        'x-restaurant-secret-key': restaurantSecret
+                        'token': token,
                     },
-                    timeout: API_TIMEOUT
+                    timeout: API_TIMEOUT,
                 }
             );
 
             console.log(`[GetirYemek] Restaurant status changed: ${status}`);
-            return { success: true, status, response: response.data };
+            return { success: true, status, response: statusRes.data };
 
         } catch (error) {
-            console.error('[GetirYemek] Status change error:', error.message);
-            return { success: false, reason: error.response?.data?.message || error.message };
+            const apiMsg = error.response?.data?.message || error.response?.data?.error || error.message;
+            console.error('[GetirYemek] Status change error:', apiMsg);
+            return { success: false, reason: apiMsg };
         }
     }
 }
