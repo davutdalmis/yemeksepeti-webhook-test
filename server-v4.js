@@ -362,6 +362,34 @@ async function resolveBranchByGetirSecret(secret, dbRef) {
     }
 }
 
+// Body içindeki Getir restaurantId'den şube çözer (paylaşılan secret olan
+// firmaları ayırmak için). branches.getirYemek_restaurantId ile eşleşir.
+const getirRestaurantBranchCache = new Map();
+async function resolveBranchByGetirRestaurantId(restaurantId, dbRef) {
+    if (!restaurantId || !dbRef) return null;
+    const key = String(restaurantId);
+    const cached = getirRestaurantBranchCache.get(key);
+    if (cached && (Date.now() - cached.timestamp) < GETIR_SECRET_CACHE_TTL_MS) {
+        return cached.branchId;
+    }
+    try {
+        const snap = await dbRef.collection('branches')
+            .where('getirYemek_restaurantId', '==', key)
+            .limit(1)
+            .get();
+        if (snap.empty) {
+            getirRestaurantBranchCache.set(key, { branchId: null, timestamp: Date.now() });
+            return null;
+        }
+        const branchId = snap.docs[0].id;
+        getirRestaurantBranchCache.set(key, { branchId, timestamp: Date.now() });
+        return branchId;
+    } catch (err) {
+        console.error('[GetirYemek] RestaurantId→branch resolve error:', err.message);
+        return null;
+    }
+}
+
 // ==================== FIREBASE CONFIGURATION ====================
 let db = null;
 let firebaseInitialized = false;
@@ -1433,8 +1461,18 @@ app.put('/remoteId/:remoteId/remoteOrder/:remoteOrderId/posOrderStatus', authent
 // ==================== GETIRYEMEK WEBHOOKS (LEGACY COMPATIBILITY) ====================
 
 app.post('/webhook/newOrder', webhookLimiter, authenticatePlatformWebhook, async (req, res) => {
-    const order = req.body;
+    // Getir bazen { foodOrder: {...} } wrapper'ı içinde gönderir — unwrap et.
+    const rawBody = req.body || {};
+    const order = rawBody.foodOrder || rawBody;
     const restaurantSecretKey = req.headers['x-restaurant-secret-key'] || API_KEYS.GETIRYEMEK_DEFAULT_RESTAURANT_SECRET;
+
+    // Body içinden olası restaurantId alanları
+    const bodyRestaurantId =
+        order?.restaurantId ||
+        order?.restaurant?.id ||
+        order?.restaurant ||
+        rawBody?.restaurantId ||
+        null;
 
     // ===== DETAILED DIAGNOSTIC LOGGING =====
     console.log('[GetirYemek] ┌─── INCOMING WEBHOOK ───');
@@ -1443,31 +1481,72 @@ app.post('/webhook/newOrder', webhookLimiter, authenticatePlatformWebhook, async
     console.log(`[GetirYemek] │ x-restaurant-secret-key: ${restaurantSecretKey || '<MISSING>'}`);
     console.log(`[GetirYemek] │ x-branch-id (header): ${req.headers['x-branch-id'] || '<NONE>'}`);
     console.log(`[GetirYemek] │ branchId (query): ${req.query.branchId || '<NONE>'}`);
-    console.log(`[GetirYemek] │ body.id: ${order?.id || '<NONE>'}`);
-    console.log(`[GetirYemek] │ body.restaurant: ${JSON.stringify(order?.restaurant || order?.restaurantId || '<NONE>')}`);
-    console.log(`[GetirYemek] │ body keys: ${Object.keys(order || {}).join(',')}`);
+    console.log(`[GetirYemek] │ unwrapped: ${rawBody.foodOrder ? 'foodOrder' : 'direct'}`);
+    console.log(`[GetirYemek] │ order.id: ${order?.id || '<NONE>'}`);
+    console.log(`[GetirYemek] │ body.restaurantId: ${bodyRestaurantId || '<NONE>'}`);
+    console.log(`[GetirYemek] │ body keys: ${Object.keys(rawBody).join(',')}`);
     console.log('[GetirYemek] └────');
 
-    // Multi-tenant güvenlik: secret authoritative — URL'deki branchId'yi override eder
+    // Multi-source branchId resolve:
+    // a) URL/header (en hızlı) → b) secret → c) body.restaurantId → d) env fallback → e) permissive
     const urlBranchId = req.headers['x-branch-id'] || req.query.branchId;
-    let branchId = urlBranchId;
-    const resolvedBranchId = await resolveBranchByGetirSecret(restaurantSecretKey, db);
-    console.log(`[GetirYemek] resolver: secret=${restaurantSecretKey?.substring(0,16)}... -> branchId=${resolvedBranchId || 'NULL'}`);
+    let branchId = urlBranchId || null;
+    let resolveSource = urlBranchId ? 'url' : null;
 
-    if (resolvedBranchId) {
-        if (branchId && branchId !== resolvedBranchId) {
-            console.warn(`[GetirYemek] ⚠ branchId mismatch — URL=${branchId} secret-resolved=${resolvedBranchId} (using secret)`);
+    const secretResolved = await resolveBranchByGetirSecret(restaurantSecretKey, db);
+    console.log(`[GetirYemek] resolver(secret): secret=${restaurantSecretKey?.substring(0,16)}... -> ${secretResolved || 'NULL'}`);
+    if (secretResolved) {
+        if (branchId && branchId !== secretResolved) {
+            console.warn(`[GetirYemek] ⚠ branchId mismatch — URL=${branchId} secret=${secretResolved} (secret authoritative)`);
         }
-        branchId = resolvedBranchId;
+        branchId = secretResolved;
+        resolveSource = 'secret';
+    }
+
+    if (!branchId && bodyRestaurantId) {
+        const ridResolved = await resolveBranchByGetirRestaurantId(bodyRestaurantId, db);
+        console.log(`[GetirYemek] resolver(restaurantId): ${bodyRestaurantId} -> ${ridResolved || 'NULL'}`);
+        if (ridResolved) {
+            branchId = ridResolved;
+            resolveSource = 'restaurantId';
+        }
+    }
+
+    if (!branchId && process.env.GETIR_DEFAULT_BRANCH_ID) {
+        branchId = process.env.GETIR_DEFAULT_BRANCH_ID;
+        resolveSource = 'env_fallback';
+        console.warn(`[GetirYemek] ⚠ Using GETIR_DEFAULT_BRANCH_ID fallback: ${branchId}`);
     }
 
     // Capture for /debug/last-getir-webhooks
-    captureGetirWebhook(req, resolvedBranchId, urlBranchId, branchId);
+    captureGetirWebhook(req, secretResolved, urlBranchId, branchId);
 
     if (!branchId) {
+        // Permissive mode: 200 dön ki Getir retry yapmasın, ama Firestore'a unresolved olarak yaz
+        if (process.env.GETIR_WEBHOOK_PERMISSIVE === 'true') {
+            console.error('[GetirYemek] ⚠ branchId çözülemedi — PERMISSIVE mode, unresolved kaydediliyor');
+            try {
+                await db.collection('getirYemekOrders_unresolved').add({
+                    receivedAt: new Date(),
+                    headers: {
+                        'x-restaurant-secret-key': restaurantSecretKey || null,
+                        'x-branch-id': req.headers['x-branch-id'] || null,
+                        'user-agent': req.headers['user-agent'] || null,
+                    },
+                    query: req.query || {},
+                    body: rawBody,
+                    bodyRestaurantId: bodyRestaurantId || null,
+                    _unresolved: true,
+                });
+            } catch (e) {
+                console.error('[GetirYemek] unresolved write failed:', e.message);
+            }
+            return res.status(200).send('OK');
+        }
         console.error('[GetirYemek] ❌ branchId belirlenemedi — sipariş reddedildi (multi-tenant güvenlik)');
-        return res.status(400).json({ error: 'branchId could not be resolved from secret or URL' });
+        return res.status(400).json({ error: 'branchId could not be resolved (url/secret/restaurantId all failed)' });
     }
+    console.log(`[GetirYemek] ✓ branchId resolved via ${resolveSource}: ${branchId}`);
     const branchCheckGY = await validateBranchId(branchId, 'getiryemek', db);
     if (!branchCheckGY.valid) return res.status(403).json({ error: branchCheckGY.reason });
 
