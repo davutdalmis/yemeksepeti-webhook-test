@@ -265,6 +265,43 @@ async function validateBranchId(branchId, platform, dbRef) {
     }
 }
 
+// ==================== GETIRYEMEK DEBUG CAPTURE ====================
+// Son 20 Getir webhook'unun ham payload'ını (header + body) tutar.
+// Tanı için: kullanıcı sipariş gönderdiğinde Getir'in tam olarak neyi
+// gönderdiğini, hangi secret'ı kullandığını, body içinde restaurant id
+// olup olmadığını görmek için kullanılır.
+const lastGetirWebhooks = [];
+const MAX_GETIR_DEBUG = 20;
+
+function captureGetirWebhook(req, resolvedBranchId, urlBranchId, resolveResult) {
+    try {
+        lastGetirWebhooks.push({
+            time: new Date().toISOString(),
+            ip: req.ip || req.connection?.remoteAddress,
+            method: req.method,
+            path: req.path,
+            query: req.query,
+            headers: {
+                'content-type': req.headers['content-type'],
+                'user-agent': req.headers['user-agent']?.substring(0, 100),
+                'x-restaurant-secret-key': req.headers['x-restaurant-secret-key'] || null,
+                'x-branch-id': req.headers['x-branch-id'] || null,
+                'x-api-key': req.headers['x-api-key'] ? req.headers['x-api-key'].substring(0, 8) + '...' : null,
+            },
+            body: req.body, // FULL payload — Getir'in gönderdiği her şey
+            resolveResult: {
+                urlBranchId: urlBranchId,
+                resolvedBranchId: resolvedBranchId,
+                finalBranchId: resolveResult,
+                mismatch: urlBranchId && resolvedBranchId && urlBranchId !== resolvedBranchId,
+            },
+        });
+        if (lastGetirWebhooks.length > MAX_GETIR_DEBUG) lastGetirWebhooks.shift();
+    } catch (err) {
+        console.error('[GetirDebug] capture failed:', err.message);
+    }
+}
+
 // ==================== GETIRYEMEK BRANCH RESOLVER ====================
 // Gelen Getir webhook'unun hangi şubeye ait olduğunu, x-restaurant-secret-key
 // header'ından Firestore'a bakarak çözer. URL'deki branchId'ye GÜVENMEZ —
@@ -1353,15 +1390,33 @@ app.post('/webhook/newOrder', webhookLimiter, authenticatePlatformWebhook, async
     const order = req.body;
     const restaurantSecretKey = req.headers['x-restaurant-secret-key'] || API_KEYS.GETIRYEMEK_DEFAULT_RESTAURANT_SECRET;
 
+    // ===== DETAILED DIAGNOSTIC LOGGING =====
+    console.log('[GetirYemek] ┌─── INCOMING WEBHOOK ───');
+    console.log(`[GetirYemek] │ time: ${new Date().toISOString()}`);
+    console.log(`[GetirYemek] │ ip: ${req.ip}`);
+    console.log(`[GetirYemek] │ x-restaurant-secret-key: ${restaurantSecretKey || '<MISSING>'}`);
+    console.log(`[GetirYemek] │ x-branch-id (header): ${req.headers['x-branch-id'] || '<NONE>'}`);
+    console.log(`[GetirYemek] │ branchId (query): ${req.query.branchId || '<NONE>'}`);
+    console.log(`[GetirYemek] │ body.id: ${order?.id || '<NONE>'}`);
+    console.log(`[GetirYemek] │ body.restaurant: ${JSON.stringify(order?.restaurant || order?.restaurantId || '<NONE>')}`);
+    console.log(`[GetirYemek] │ body keys: ${Object.keys(order || {}).join(',')}`);
+    console.log('[GetirYemek] └────');
+
     // Multi-tenant güvenlik: secret authoritative — URL'deki branchId'yi override eder
-    let branchId = req.headers['x-branch-id'] || req.query.branchId;
+    const urlBranchId = req.headers['x-branch-id'] || req.query.branchId;
+    let branchId = urlBranchId;
     const resolvedBranchId = await resolveBranchByGetirSecret(restaurantSecretKey, db);
+    console.log(`[GetirYemek] resolver: secret=${restaurantSecretKey?.substring(0,16)}... -> branchId=${resolvedBranchId || 'NULL'}`);
+
     if (resolvedBranchId) {
         if (branchId && branchId !== resolvedBranchId) {
             console.warn(`[GetirYemek] ⚠ branchId mismatch — URL=${branchId} secret-resolved=${resolvedBranchId} (using secret)`);
         }
         branchId = resolvedBranchId;
     }
+
+    // Capture for /debug/last-getir-webhooks
+    captureGetirWebhook(req, resolvedBranchId, urlBranchId, branchId);
 
     if (!branchId) {
         console.error('[GetirYemek] ❌ branchId belirlenemedi — sipariş reddedildi (multi-tenant güvenlik)');
@@ -2106,6 +2161,19 @@ app.get('/socket/status', async (req, res) => {
 });
 
 // ==================== REQUEST LOG ENDPOINT ====================
+
+app.get('/debug/last-getir-webhooks', async (req, res) => {
+    const apiKey = req.headers['x-api-key'];
+    if (apiKey !== API_KEYS.YEMEKSEPETI_POLLING_KEY && apiKey !== API_KEYS.ADMIN_API_KEY) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+    res.json({
+        total: lastGetirWebhooks.length,
+        serverStartTime: serverStartTime,
+        currentTime: new Date().toISOString(),
+        webhooks: lastGetirWebhooks.slice().reverse(), // newest first
+    });
+});
 
 app.get('/debug/requests', async (req, res) => {
     const apiKey = req.headers['x-api-key'];
