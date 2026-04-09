@@ -274,6 +274,7 @@ const lastGetirWebhooks = [];
 const MAX_GETIR_DEBUG = 20;
 
 function captureGetirWebhook(req, resolvedBranchId, urlBranchId, resolveResult) {
+    // In-memory (per-instance) — hızlı erişim
     try {
         lastGetirWebhooks.push({
             time: new Date().toISOString(),
@@ -288,7 +289,7 @@ function captureGetirWebhook(req, resolvedBranchId, urlBranchId, resolveResult) 
                 'x-branch-id': req.headers['x-branch-id'] || null,
                 'x-api-key': req.headers['x-api-key'] ? req.headers['x-api-key'].substring(0, 8) + '...' : null,
             },
-            body: req.body, // FULL payload — Getir'in gönderdiği her şey
+            body: req.body,
             resolveResult: {
                 urlBranchId: urlBranchId,
                 resolvedBranchId: resolvedBranchId,
@@ -298,7 +299,31 @@ function captureGetirWebhook(req, resolvedBranchId, urlBranchId, resolveResult) 
         });
         if (lastGetirWebhooks.length > MAX_GETIR_DEBUG) lastGetirWebhooks.shift();
     } catch (err) {
-        console.error('[GetirDebug] capture failed:', err.message);
+        console.error('[GetirDebug] in-memory capture failed:', err.message);
+    }
+
+    // Firestore (multi-instance shared) — best effort, fire-and-forget
+    if (db) {
+        db.collection('debugGetirWebhooks').add({
+            time: admin.firestore.FieldValue.serverTimestamp(),
+            ip: req.ip || null,
+            path: req.path,
+            query: req.query || {},
+            headers: {
+                'content-type': req.headers['content-type'] || null,
+                'user-agent': (req.headers['user-agent'] || '').substring(0, 100),
+                'x-restaurant-secret-key': req.headers['x-restaurant-secret-key'] || null,
+                'x-branch-id': req.headers['x-branch-id'] || null,
+            },
+            bodyKeys: Object.keys(req.body || {}),
+            bodyJson: JSON.stringify(req.body || {}).substring(0, 8000),
+            resolveResult: {
+                urlBranchId: urlBranchId || null,
+                resolvedBranchId: resolvedBranchId || null,
+                finalBranchId: resolveResult || null,
+                mismatch: !!(urlBranchId && resolvedBranchId && urlBranchId !== resolvedBranchId),
+            },
+        }).catch(err => console.error('[GetirDebug] Firestore capture failed:', err.message));
     }
 }
 
@@ -1244,6 +1269,27 @@ app.use('/api/v2/platforms', createPlatformsApi(platformRegistry, db));
 app.post('/order/:remoteId', webhookLimiter, authenticatePlatformWebhook, async (req, res) => {
     const { remoteId } = req.params;
     const order = req.body;
+
+    // DIAG: bu endpoint Getir tarafından da kullanılıyor olabilir, capture
+    if (db) {
+        db.collection('debugGetirWebhooks').add({
+            time: admin.firestore.FieldValue.serverTimestamp(),
+            note: 'CAUGHT BY /order/:remoteId — likely YemekSepeti, but logging in case Getir uses it',
+            ip: req.ip || null,
+            path: req.path,
+            params: { remoteId },
+            query: req.query || {},
+            headers: {
+                'content-type': req.headers['content-type'] || null,
+                'user-agent': (req.headers['user-agent'] || '').substring(0, 100),
+                'x-restaurant-secret-key': req.headers['x-restaurant-secret-key'] || null,
+                'x-branch-id': req.headers['x-branch-id'] || null,
+            },
+            bodyKeys: Object.keys(req.body || {}),
+            bodyJson: JSON.stringify(req.body || {}).substring(0, 8000),
+        }).catch(err => console.error('[GetirDebug] /order/:remoteId capture failed:', err.message));
+    }
+
     // remoteId = POS Vendor ID = Firestore branch document ID (e.g. QgNkbMyFVgDWGqbHG1ZS)
     // DH sends webhooks to /order/{remoteId} where remoteId maps directly to branchId
     const branchId = remoteId || req.headers['x-branch-id'] || req.query.branchId;
@@ -2167,11 +2213,28 @@ app.get('/debug/last-getir-webhooks', async (req, res) => {
     if (apiKey !== API_KEYS.YEMEKSEPETI_POLLING_KEY && apiKey !== API_KEYS.ADMIN_API_KEY) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
+
+    // Firestore üzerinden — multi-instance'tan agnostik
+    let firestoreWebhooks = [];
+    if (db) {
+        try {
+            const snap = await db.collection('debugGetirWebhooks')
+                .orderBy('time', 'desc')
+                .limit(20)
+                .get();
+            firestoreWebhooks = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+        } catch (err) {
+            console.error('[GetirDebug] Firestore read failed:', err.message);
+        }
+    }
+
     res.json({
-        total: lastGetirWebhooks.length,
+        firestoreTotal: firestoreWebhooks.length,
+        instanceMemoryTotal: lastGetirWebhooks.length,
         serverStartTime: serverStartTime,
         currentTime: new Date().toISOString(),
-        webhooks: lastGetirWebhooks.slice().reverse(), // newest first
+        webhooks: firestoreWebhooks, // Firestore is authoritative (cross-instance)
+        instanceMemoryWebhooks: lastGetirWebhooks.slice().reverse(),
     });
 });
 
