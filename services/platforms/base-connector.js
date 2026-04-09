@@ -84,6 +84,11 @@ class BasePlatformConnector {
                 branchId: branchId || null,
                 source: 'railway_webhook',
                 updatedBy: 'railway_server',
+                // DIAG: hangi Railway service/host yazdığını izle
+                _railwayServiceName: process.env.RAILWAY_SERVICE_NAME || null,
+                _railwayPublicDomain: process.env.RAILWAY_PUBLIC_DOMAIN || null,
+                _railwayDeploymentId: process.env.RAILWAY_DEPLOYMENT_ID || null,
+                _railwayGitCommit: process.env.RAILWAY_GIT_COMMIT_SHA || null,
                 CreatedAt: admin.firestore.FieldValue.serverTimestamp(),
                 ReceivedAt: admin.firestore.FieldValue.serverTimestamp()
             };
