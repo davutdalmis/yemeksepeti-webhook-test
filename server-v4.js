@@ -1869,10 +1869,25 @@ app.post('/webhook/migrosyemek/order-created', webhookLimiter, authenticateMigro
     const order = req.body;
     const storeId = order.store?.id;
 
-    // branchId: header, query veya Migros storeId → branchId eşleme ile belirle
-    const branchId = req.headers['x-branch-id'] || req.query.branchId;
+    // branchId: header, query veya Migros storeId → branchId Firestore eşleme ile belirle
+    let branchId = req.headers['x-branch-id'] || req.query.branchId;
+    if (!branchId && storeId) {
+        // Firestore'da migrosYemek_storeId alanından branchId bul
+        try {
+            const branchesSnap = await db.collection('branches')
+                .where('migrosYemek_storeId', '==', String(storeId))
+                .limit(1)
+                .get();
+            if (!branchesSnap.empty) {
+                branchId = branchesSnap.docs[0].id;
+                console.log(`[MigrosYemek] storeId ${storeId} → branchId ${branchId} (Firestore lookup)`);
+            }
+        } catch (lookupErr) {
+            console.error(`[MigrosYemek] branchId lookup hatasi: ${lookupErr.message}`);
+        }
+    }
     if (!branchId) {
-        console.error('[MigrosYemek] branchId belirlenemedi — siparis reddedildi (multi-tenant guvenlik)');
+        console.error(`[MigrosYemek] branchId belirlenemedi — storeId=${storeId}, siparis reddedildi`);
         return res.status(400).json({ error: 'branchId is required' });
     }
     const branchCheckMY = await validateBranchId(branchId, 'migrosyemek', db);
@@ -1930,7 +1945,13 @@ app.post('/webhook/migrosyemek/order-created', webhookLimiter, authenticateMigro
 // Sipariş İptal Edildi — Migros iptal/red bilgisi push eder
 app.post('/webhook/migrosyemek/order-cancelled', webhookLimiter, authenticateMigrosWebhook, async (req, res) => {
     const { OrderId, StoreId, UserId } = req.body;
-    const branchId = req.headers['x-branch-id'] || req.query.branchId;
+    let branchId = req.headers['x-branch-id'] || req.query.branchId;
+    if (!branchId && StoreId) {
+        try {
+            const snap = await db.collection('branches').where('migrosYemek_storeId', '==', String(StoreId)).limit(1).get();
+            if (!snap.empty) branchId = snap.docs[0].id;
+        } catch (e) { console.error(`[MigrosYemek] Cancel branchId lookup: ${e.message}`); }
+    }
 
     metrics.increment('webhook_requests_total', { platform: 'migrosyemek', type: 'cancel' });
     console.log(`[MigrosYemek] ORDER CANCELLED: ${OrderId}`);
@@ -1959,7 +1980,13 @@ app.post('/webhook/migrosyemek/order-cancelled', webhookLimiter, authenticateMig
 // Kurye Durumu Değişti — Migros kurye durum değişikliği push eder
 app.post('/webhook/migrosyemek/delivery-status', webhookLimiter, authenticateMigrosWebhook, async (req, res) => {
     const { orderId, storeId, status, deliveryStatus, isCancelled, deliveryProvider, courierName } = req.body;
-    const branchId = req.headers['x-branch-id'] || req.query.branchId;
+    let branchId = req.headers['x-branch-id'] || req.query.branchId;
+    if (!branchId && storeId) {
+        try {
+            const snap = await db.collection('branches').where('migrosYemek_storeId', '==', String(storeId)).limit(1).get();
+            if (!snap.empty) branchId = snap.docs[0].id;
+        } catch (e) { console.error(`[MigrosYemek] DeliveryStatus branchId lookup: ${e.message}`); }
+    }
 
     metrics.increment('webhook_requests_total', { platform: 'migrosyemek', type: 'delivery_status' });
     console.log(`[MigrosYemek] DELIVERY STATUS: order=${orderId} status=${deliveryStatus} courier=${courierName}`);
