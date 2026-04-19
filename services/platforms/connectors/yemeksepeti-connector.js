@@ -181,6 +181,12 @@ class YemekSepetiConnector extends BasePlatformConnector {
             TotalAmount: parseFloat(rawOrder.price?.grandTotal) || 0,
             DeliveryFee: parseFloat(rawOrder.price?.deliveryFee) || 0,
             DiscountAmount: parseFloat(rawOrder.price?.discountAmountTotal) || 0,
+            // DH resmi alan: kuryenin/restoranın müşteriden tahsil edeceği tutar.
+            // 0 → tam online ödenmiş, >0 → kapıda tahsil edilecek (miktar kadar).
+            // Online/kapıda ayrımı için en kesin sinyal. Yok ise null (eski siparişler).
+            CollectFromCustomer: rawOrder.price?.collectFromCustomer !== undefined && rawOrder.price?.collectFromCustomer !== null
+                ? parseFloat(rawOrder.price.collectFromCustomer)
+                : null,
 
             // Delivery info
             PaymentMethod: rawOrder.payment?.type || rawOrder.paymentMethod || 'ONLINE',
@@ -249,8 +255,9 @@ class YemekSepetiConnector extends BasePlatformConnector {
     // ==================== API AUTHENTICATION ====================
 
     async getToken(branchConfig = {}) {
-        const username = branchConfig.username || this.config.username;
-        const password = branchConfig.password || this.config.password;
+        // Plan 23: Credential çözüm önceliği: branch-level → tenant-level → env fallback
+        const username = branchConfig.username || branchConfig.tenantUsername || this.config.username;
+        const password = branchConfig.password || branchConfig.tenantPassword || this.config.password;
 
         if (!username || !password) {
             console.log('[YemekSepeti] No credentials configured');
@@ -265,8 +272,10 @@ class YemekSepetiConnector extends BasePlatformConnector {
         }
 
         try {
+            // Plan 23: ApiBaseUrl da tenant-level'dan gelebilir
+            const loginBaseUrl = branchConfig.apiBaseUrl || branchConfig.tenantApiBaseUrl || this.config.baseUrl;
             const response = await axios.post(
-                `${this.config.baseUrl}/v2/login`,
+                `${loginBaseUrl}/v2/login`,
                 new URLSearchParams({
                     username,
                     password,
