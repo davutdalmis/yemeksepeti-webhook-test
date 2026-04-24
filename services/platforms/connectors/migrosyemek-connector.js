@@ -29,6 +29,13 @@ class MigrosYemekConnector extends BasePlatformConnector {
             ? new Date(rawOrder.log.createdAsMs).toISOString()
             : now.toISOString();
 
+        // WPF (MigrosYemekOrdersFirestoreService.GetMigrosYemekOrdersAsync) restart sonrası
+        // sipariş yüklerken `orderJson` alanından MigrosYemekOrder deserialize ediyor.
+        // Migros webhook payload field isimleri (id, customer, items, payment, prices,
+        // extendedProperties, log) WPF'deki [JsonPropertyName] attribute'larıyla bire bir
+        // eşleşiyor → raw payload direkt serialize edilebilir.
+        const orderJson = JSON.stringify(rawOrder);
+
         // Penny → TL dönüşümü
         const totalPenny = rawOrder.prices?.total?.amountAsPenny || 0;
         const discountedPenny = rawOrder.prices?.discounted?.amountAsPenny || 0;
@@ -43,6 +50,9 @@ class MigrosYemekConnector extends BasePlatformConnector {
         const payment = rawOrder.payment?.type || {};
 
         return {
+            // WPF restart için full-fidelity raw payload (deserialize edilebilir)
+            orderJson: orderJson,
+
             OrderId: String(rawOrder.id || ''),
             OrderToken: String(rawOrder.id || ''),
             OrderDate: createdAt,
@@ -139,21 +149,29 @@ class MigrosYemekConnector extends BasePlatformConnector {
 
     /**
      * Migros opsiyonlarını düzleştirir (sonsuz derinlik subOptions → flat list).
+     * Hiyerarşi bilgisi Id/ParentId/IsMainHeader alanlarıyla korunur — WPF
+     * tarafında parent-by-id map ile tree yeniden kurulabilir.
+     * `orderJson` yazılamazsa (Firestore 1MB limit vb.) bu field'lar yedek.
      */
-    _flattenOptions(options) {
+    _flattenOptions(options, parentId = null) {
         const result = [];
         for (const opt of options) {
+            const optId = opt.objectOptionItemId || opt.optionItemId || 0;
             result.push({
                 Name: opt.headerName || '',
                 Value: opt.itemNames || '',
                 Price: (opt.primaryPrice || 0) / 100,
                 IsExcluded: opt.excluded || false,
                 OptionType: opt.optionType || 'NONE',
-                Quantity: opt.quantity || 0
+                Quantity: opt.quantity || 0,
+                // Hiyerarşi bilgisi (WPF tree reconstruction için)
+                Id: optId,
+                ParentId: parentId || opt.parentObjectOptionItemId || null,
+                IsMainHeader: opt.objectOptionHeaderIsMainHeader === true
             });
-            // Recursive: alt opsiyonları da ekle
+            // Recursive: alt opsiyonları da ekle, parentId olarak bu opsiyonun id'si
             if (opt.subOptions && opt.subOptions.length > 0) {
-                result.push(...this._flattenOptions(opt.subOptions));
+                result.push(...this._flattenOptions(opt.subOptions, optId));
             }
         }
         return result;
