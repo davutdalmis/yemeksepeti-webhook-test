@@ -68,6 +68,9 @@ class MetricsCollector {
         this._writeCounter(lines, 'webhook_requests_total', 'Total webhook requests by platform');
         this._writeCounter(lines, 'socket_events_total', 'Total socket events by type');
         this._writeCounter(lines, 'dispatch_assignments_total', 'Total dispatch assignments by status');
+        this._writeCounter(lines, 'delayed_call_enqueue_total', 'Total delayed API calls enqueued');
+        this._writeCounter(lines, 'delayed_call_processed_total', 'Total delayed API calls successfully dispatched');
+        this._writeCounter(lines, 'delayed_call_failed_total', 'Total delayed API calls that exhausted retries');
 
         // ── Gauges (live from stores) ──
         try {

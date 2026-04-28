@@ -247,6 +247,54 @@ class GetirYemekConnector extends BasePlatformConnector {
         return { success: true, orderId };
     }
 
+    // ==================== DELAYED CALL DISPATCH (RAILWAY_DELAYED_QUEUE_PLAN.md Faz 1.4) ====================
+
+    /**
+     * Generic action dispatcher used by `DelayedCallQueue` worker.
+     *
+     * Routes a queued action to the appropriate platform method and converts
+     * `{ success: false }` returns into thrown errors so the worker can record
+     * the failure (markFailed → exponential backoff retry).
+     *
+     * @param {string} action  - verify | prepare | deliver | handover | cancel
+     * @param {string} orderId
+     * @param {object} payload - must include branchId; may include reason for cancel
+     */
+    async executeAction(action, orderId, payload = {}) {
+        if (!orderId) throw new Error('[GetirYemek][executeAction] orderId required');
+
+        const branchConfig = (payload.branchId && this.registry?.getBranchPlatformConfig)
+            ? (this.registry.getBranchPlatformConfig(payload.branchId, this.platformId) || {})
+            : {};
+
+        let result;
+        switch (action) {
+            case 'verify':
+                result = await this.acceptOrder(orderId, branchConfig);
+                break;
+            case 'prepare':
+                result = await this.markOrderReady(orderId, branchConfig);
+                break;
+            case 'deliver':
+                result = await this.markOrderDelivered(orderId, branchConfig);
+                break;
+            case 'handover':
+                result = await this.markOrderPickedUp(orderId, branchConfig);
+                break;
+            case 'cancel':
+                result = await this.rejectOrder(orderId, payload.reason || 'OTHER', branchConfig);
+                break;
+            default:
+                throw new Error(`[GetirYemek][executeAction] unknown action: ${action}`);
+        }
+
+        if (!result || result.success !== true) {
+            const reason = result?.reason || 'unknown';
+            throw new Error(`[GetirYemek][${action}] ${reason}`);
+        }
+        return result;
+    }
+
     // ==================== RESTAURANT STATUS ====================
 
     /**

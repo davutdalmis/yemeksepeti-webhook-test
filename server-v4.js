@@ -28,10 +28,12 @@ const FuudyConnector = require('./services/platforms/connectors/fuudy-connector'
 const MigrosYemekConnector = require('./services/platforms/connectors/migrosyemek-connector');
 const createOrdersApi = require('./services/api/orders-api');
 const createPlatformsApi = require('./services/api/platforms-api');
+const createDelayedCallApi = require('./services/api/delayed-call-api');
 const GoogleMapsDistanceService = require('./services/google-maps-distance');
 const DispatchMetrics = require('./services/dispatch/dispatch-metrics');
 const DispatchQueue = require('./services/dispatch/dispatch-queue');
 const DispatchAlerts = require('./services/dispatch/dispatch-alerts');
+const DelayedCallQueue = require('./services/queue/delayed-call-queue');
 const { getRedisClient, isRedisAvailable, getRedisStatus, getRedisFailoverInfo } = require('./services/redis-client');
 const { createAdapter } = require('@socket.io/redis-adapter');
 const OrderStore = require('./services/redis-orders');
@@ -440,6 +442,7 @@ let smartDispatchService = null;
 let dispatchMetrics = null;
 let dispatchAlerts = null;
 let dispatchQueue = null;
+let delayedCallQueue = null;
 
 async function initializePlatformHub() {
     console.log('[PlatformHub] Initializing...');
@@ -475,6 +478,15 @@ async function initializePlatformHub() {
     // Initialize Dispatch Queue (retry for failed assignments)
     dispatchQueue = new DispatchQueue(db, smartDispatchService, platformRegistry, dispatchMetrics);
     dispatchQueue.start();
+
+    // Initialize Delayed API Call Queue (GetirYemek 1-minute rule — RAILWAY_DELAYED_QUEUE_PLAN.md Faz 1.3)
+    // Worker stays dormant until Faz 1.4 wires connector.executeAction.
+    try {
+        delayedCallQueue = new DelayedCallQueue(db, platformRegistry);
+        delayedCallQueue.start();
+    } catch (delayedQueueErr) {
+        console.error('[PlatformHub] DelayedCallQueue init failed (non-fatal):', delayedQueueErr.message);
+    }
 
     console.log('[PlatformHub] Initialized with connectors:', Array.from(platformRegistry.connectors.keys()));
 }
@@ -1143,6 +1155,70 @@ async function writeOrderToFirebaseUnified(order, platformId, branchId) {
     }
 }
 
+// ==================== UNIFIED PLATFORM WEBHOOK HANDLER ====================
+
+/**
+ * Platform webhook'larında yeni sipariş akışını tek yerde yönetir:
+ *   1. metrics.increment (orders_received + webhook_requests)
+ *   2. connector.transformOrder (raw → standart şema)
+ *   3. writeOrderToFirebaseUnified (Firestore + dedup + field metadata)
+ *   4. smartDispatchService.assignBestCourier (+ dispatchQueue fallback)
+ *   5. connector.assignCourier + notifyCourierNewOrder (push notification)
+ *   6. Socket.IO emit 'order:new' (şubeye realtime bildirim)
+ *
+ * Yeni platform webhook'u eklerken:
+ *   - Kendi handler'ında branchId resolve + auth + delivery location extraction yapar
+ *   - `processPlatformOrderWebhook(platformId, rawOrder, branchId, opts)` çağırır
+ *   - Ortak logic kopyalanmaz
+ */
+async function processPlatformOrderWebhook(platformId, rawOrder, branchId, options = {}) {
+    const {
+        deliveryLocation = null,
+        shouldDispatch = true,
+        socketCustomerName = '',
+        socketTotalAmount = 0,
+        platformDisplayName = null
+    } = options;
+
+    metrics.increment('orders_received_total', { platform: platformId });
+    metrics.increment('webhook_requests_total', { platform: platformId });
+
+    const connector = platformRegistry.getConnector(platformId);
+    const transformedOrder = connector ? connector.transformOrder(rawOrder, branchId) : rawOrder;
+
+    const firebaseResult = await writeOrderToFirebaseUnified(transformedOrder, platformId, branchId);
+
+    if (firebaseResult.success && shouldDispatch && smartDispatchService && deliveryLocation) {
+        const courier = await smartDispatchService.assignBestCourier(branchId, deliveryLocation);
+        metrics.increment('dispatch_assignments_total', { status: courier ? 'success' : 'queued' });
+        if (courier) {
+            if (connector && connector.assignCourier) {
+                await connector.assignCourier(firebaseResult.orderId, courier.id, courier.name);
+            }
+            await notifyCourierNewOrder(courier, transformedOrder, platformDisplayName || platformId);
+        } else if (dispatchQueue) {
+            await dispatchQueue.enqueue({
+                orderId: firebaseResult.orderId,
+                platformId,
+                branchId,
+                deliveryLocation
+            });
+        }
+    }
+
+    if (firebaseResult.success && branchId) {
+        io.to(`branch:${branchId}`).emit('order:new', {
+            orderId: firebaseResult.orderId,
+            platform: platformId,
+            customerName: socketCustomerName,
+            totalAmount: socketTotalAmount,
+            timestamp: new Date().toISOString()
+        });
+    }
+
+    return firebaseResult;
+}
+
 // ==================== SOCKET.IO COURIER TRACKING ====================
 const courierState = new CourierStateStore(getRedisClient(), isRedisAvailable);
 
@@ -1156,6 +1232,11 @@ metrics.setCircuitBreakerProvider(() => {
     if (!smartDispatchService) return [];
     return smartDispatchService.getCircuitBreakerStatuses();
 });
+
+// Wire delayed call queue metrics (queue may be null if Firebase disabled)
+if (delayedCallQueue && typeof delayedCallQueue.setMetrics === 'function') {
+    delayedCallQueue.setMetrics(metrics);
+}
 
 // Socket.IO authentication middleware
 io.use((socket, next) => {
@@ -1291,6 +1372,21 @@ app.use('/api/v2/orders', (req, res, next) => {
 }));
 
 app.use('/api/v2/platforms', createPlatformsApi(platformRegistry, db));
+
+// Delayed API call queue (RAILWAY_DELAYED_QUEUE_PLAN.md Faz 1.5)
+// Lazy-mount: queue is initialized inside initializePlatformHub() (async after this point)
+let _delayedCallApiRouter = null;
+app.use('/api/v2/delayed-call', (req, res, next) => {
+    if (!_delayedCallApiRouter && delayedCallQueue) {
+        _delayedCallApiRouter = createDelayedCallApi(delayedCallQueue);
+    }
+    if (_delayedCallApiRouter) return _delayedCallApiRouter(req, res, next);
+    return res.status(503).json({
+        success: false,
+        error: 'DelayedCallQueue not initialized',
+        code: 'SERVICE_UNAVAILABLE'
+    });
+});
 
 // ==================== YEMEKSEPETI WEBHOOKS (LEGACY COMPATIBILITY) ====================
 
@@ -1787,46 +1883,18 @@ app.post('/webhook/fuudy/order', webhookLimiter, authenticatePlatformWebhook, as
     const branchCheckF = await validateBranchId(branchId, 'fuudy', db);
     if (!branchCheckF.valid) return res.status(403).json({ error: branchCheckF.reason });
 
-    metrics.increment('orders_received_total', { platform: 'fuudy' });
-    metrics.increment('webhook_requests_total', { platform: 'fuudy' });
     console.log('[Fuudy] ========== NEW ORDER ==========');
 
     try {
-        const connector = platformRegistry.getConnector('fuudy');
-        const transformedOrder = connector ? connector.transformOrder(order, branchId) : order;
-
-        const firebaseResult = await writeOrderToFirebaseUnified(transformedOrder, 'fuudy', branchId);
-        if (firebaseResult.success && smartDispatchService && branchId) {
-            const deliveryLocation = {
+        await processPlatformOrderWebhook('fuudy', order, branchId, {
+            deliveryLocation: {
                 latitude: order.address?.latitude || 0,
                 longitude: order.address?.longitude || 0
-            };
-            const courier = await smartDispatchService.assignBestCourier(branchId, deliveryLocation);
-            metrics.increment('dispatch_assignments_total', { status: courier ? 'success' : 'queued' });
-            if (courier) {
-                await connector?.assignCourier(firebaseResult.orderId, courier.id, courier.name);
-                await notifyCourierNewOrder(courier, transformedOrder, 'Fuudy');
-            } else if (dispatchQueue) {
-                await dispatchQueue.enqueue({
-                    orderId: firebaseResult.orderId,
-                    platformId: 'fuudy',
-                    branchId,
-                    deliveryLocation
-                });
-            }
-        }
-
-        if (firebaseResult.success) {
-            // Socket.IO: yeni siparis bildirimi
-            io.to(`branch:${branchId}`).emit('order:new', {
-                orderId: firebaseResult.orderId,
-                platform: 'fuudy',
-                customerName: transformedOrder.Customer?.FirstName || '',
-                totalAmount: transformedOrder.TotalAmount || 0,
-                timestamp: new Date().toISOString()
-            });
-        }
-
+            },
+            socketCustomerName: order.customer?.name || '',
+            socketTotalAmount: order.total || 0,
+            platformDisplayName: 'Fuudy'
+        });
         console.log('[Fuudy] ============================');
         res.status(200).json({ success: true });
     } catch (error) {
@@ -1893,47 +1961,21 @@ app.post('/webhook/migrosyemek/order-created', webhookLimiter, authenticateMigro
     const branchCheckMY = await validateBranchId(branchId, 'migrosyemek', db);
     if (!branchCheckMY.valid) return res.status(403).json({ error: branchCheckMY.reason });
 
-    metrics.increment('orders_received_total', { platform: 'migrosyemek' });
-    metrics.increment('webhook_requests_total', { platform: 'migrosyemek' });
     console.log(`[MigrosYemek] ========== NEW ORDER: ${order.id} ==========`);
 
     try {
-        const connector = platformRegistry.getConnector('migrosyemek');
-        const transformedOrder = connector ? connector.transformOrder(order, branchId) : order;
-
-        const firebaseResult = await writeOrderToFirebaseUnified(transformedOrder, 'migrosyemek', branchId);
-        if (firebaseResult.success && smartDispatchService && branchId) {
-            const deliveryLocation = {
+        // Migros'ta RESTAURANT delivery ise dispatch aktif — aksi halde Migros'un kendi kuryesi (dispatch skip)
+        const shouldDispatch = order.deliveryProvider === 'RESTAURANT';
+        await processPlatformOrderWebhook('migrosyemek', order, branchId, {
+            deliveryLocation: {
                 latitude: order.customer?.deliveryAddress?.geoLocation?.latitude || 0,
                 longitude: order.customer?.deliveryAddress?.geoLocation?.longitude || 0
-            };
-            if (order.deliveryProvider === 'RESTAURANT') {
-                const courier = await smartDispatchService.assignBestCourier(branchId, deliveryLocation);
-                metrics.increment('dispatch_assignments_total', { status: courier ? 'success' : 'queued' });
-                if (courier) {
-                    await connector?.assignCourier(firebaseResult.orderId, courier.id, courier.name);
-                    await notifyCourierNewOrder(courier, transformedOrder, 'MigrosYemek');
-                } else if (dispatchQueue) {
-                    await dispatchQueue.enqueue({
-                        orderId: firebaseResult.orderId,
-                        platformId: 'migrosyemek',
-                        branchId,
-                        deliveryLocation
-                    });
-                }
-            }
-        }
-
-        if (firebaseResult.success) {
-            io.to(`branch:${branchId}`).emit('order:new', {
-                orderId: firebaseResult.orderId,
-                platform: 'migrosyemek',
-                customerName: order.customer?.fullName || '',
-                totalAmount: (order.prices?.discounted?.amountAsPenny || order.prices?.total?.amountAsPenny || 0) / 100,
-                timestamp: new Date().toISOString()
-            });
-        }
-
+            },
+            shouldDispatch,
+            socketCustomerName: order.customer?.fullName || '',
+            socketTotalAmount: (order.prices?.discounted?.amountAsPenny || order.prices?.total?.amountAsPenny || 0) / 100,
+            platformDisplayName: 'MigrosYemek'
+        });
         console.log(`[MigrosYemek] ============================`);
         res.status(200).json({ success: true });
     } catch (error) {
@@ -2154,8 +2196,8 @@ app.delete('/api/getiryemek/webhooks/:webhookId', async (req, res) => {
 
 // ==================== METRICS ====================
 
-app.get('/api/metrics', async (req, res) => {
-    // Metrics endpoint'i auth ile korunur — iç yapı bilgisi sızıntısını önler
+// Prometheus exposition handler (auth'lu — iç yapı bilgisi sızıntısını önler)
+async function metricsHandler(req, res) {
     const apiKey = req.headers['x-api-key'];
     if (apiKey !== API_KEYS.ADMIN_API_KEY) {
         return res.status(401).json({ error: 'Unauthorized' });
@@ -2168,7 +2210,12 @@ app.get('/api/metrics', async (req, res) => {
         console.error('[Metrics] Error generating metrics:', error.message);
         res.status(500).send('# ERROR generating metrics\n');
     }
-});
+}
+
+// Eski path (backward compat)
+app.get('/api/metrics', metricsHandler);
+// Prometheus konvansiyonu (Faz 4.4 — 2026-04-18)
+app.get('/metrics', metricsHandler);
 
 // ==================== HEALTH & INFO ====================
 
