@@ -10,6 +10,11 @@ const ParasutProvider = require('./providers/ParasutProvider');
 const TokenManager = require('./auth/TokenManager');
 const CredentialVault = require('./secrets/CredentialVault');
 const { InvoiceProviderError } = require('./providers/IInvoiceProvider');
+const { IdempotencyService } = require('./lib/IdempotencyService');
+const RateLimiter = require('./lib/RateLimiter');
+const { InvoiceQueue } = require('./queue/InvoiceQueue');
+const InvoiceWorker = require('./workers/InvoiceWorker');
+const StockTransferListener = require('./listeners/StockTransferListener');
 
 initSentry({ dsn: process.env.SENTRY_DSN, service: 'invoicing-engine' });
 
@@ -203,6 +208,171 @@ app.get('/invoicing/tenants/:tenantId', requireApiKey, async (req, res) => {
         res.status(e.status || 500).json({ error: e.code || 'internal_error', message: e.message });
     }
 });
+
+// ---------------- Faz 2: Lifecycle (queue + worker + listener) ----------------
+
+let idempotency = null;
+let rateLimiter = null;
+let invoiceQueue = null;
+let invoiceWorker = null;
+let stockListener = null;
+
+if (firebaseInitialized && db) {
+    idempotency = new IdempotencyService({ db });
+}
+
+if (isRedisAvailable() && idempotency) {
+    rateLimiter = new RateLimiter({ redis });
+    try {
+        invoiceQueue = new InvoiceQueue({ connection: redis });
+    } catch (e) {
+        console.warn('[invoicing-engine] InvoiceQueue init skipped:', e.message);
+    }
+
+    if (invoiceQueue && invoiceQueue.available) {
+        invoiceWorker = new InvoiceWorker({
+            connection: redis,
+            idempotency,
+            tokenManager,
+            rateLimiter,
+            providerFactory,
+            tenantSettingsLoader: buildInvoiceContext,
+        });
+
+        // Auto-start listener only if explicitly enabled (avoids accidental Firestore subscriptions in dev)
+        if (process.env.INVOICING_LISTENER_ENABLED === 'true') {
+            stockListener = new StockTransferListener({
+                db,
+                idempotency,
+                queue: invoiceQueue,
+                settingsLoader: loadParasutSettings,
+            });
+            stockListener.start();
+        } else {
+            console.log('[invoicing-engine] StockTransferListener NOT started (set INVOICING_LISTENER_ENABLED=true to enable)');
+        }
+    }
+} else {
+    console.log('[invoicing-engine] Faz 2 lifecycle DISABLED (Redis or Firebase not available)');
+}
+
+/**
+ * Build the invoice context (branch + items + settings) from a draft document.
+ * Reads stockTransfers/{sourceId} for items + branches/{branchId} for tax info.
+ */
+async function buildInvoiceContext(tenantId, doc) {
+    if (!firebaseInitialized || !db) {
+        throw new Error('Firestore unavailable for invoice context build');
+    }
+    const settings = await loadParasutSettings(tenantId);
+
+    let sourceData = null;
+    if (doc.sourceType === 'stockTransfer' && doc.sourceId) {
+        const snap = await db.collection('stockTransfers').doc(doc.sourceId).get();
+        if (snap.exists) sourceData = snap.data();
+    }
+
+    let branchData = null;
+    const branchId = doc.branchId || (sourceData && (sourceData.destinationBranchId || sourceData.branchId));
+    if (branchId) {
+        const bSnap = await db.collection('branches').doc(branchId).get();
+        if (bSnap.exists) branchData = bSnap.data();
+    }
+
+    const items = ((sourceData && sourceData.items) || []).map((it) => ({
+        name: it.productName || it.name,
+        productName: it.productName || it.name,
+        productId: it.productId,
+        sku: it.sku,
+        quantity: Number(it.quantity || 1),
+        unitPrice: Number(it.unitPrice || 0),
+        vatRate: typeof it.vatRate === 'number' ? it.vatRate : settings.defaultVatRate || 20,
+        unit: it.unit || 'Adet',
+    }));
+
+    return {
+        branch: branchData || { name: 'Sube', taxNumber: '' },
+        items,
+        currency: doc.currency || sourceData?.currency || 'TRL',
+        issueDate: new Date().toISOString().slice(0, 10),
+        shipmentIncluded: doc.shipmentIncluded != null ? doc.shipmentIncluded : !!settings.shipmentIncludedDefault,
+        documentType: doc.documentType || settings.defaultDocumentType || 'sales_invoice',
+        description: sourceData ? `Sevkiyat: ${sourceData.transferNumber || sourceData.code || doc.sourceId}` : '',
+        invoiceSeriesPrefix: settings.invoiceSeriesPrefix || 'A',
+    };
+}
+
+// ---------------- Faz 2: Admin endpoints ----------------
+
+app.get('/invoicing/queue/stats', requireApiKey, async (_req, res) => {
+    if (!invoiceQueue) return res.status(503).json({ error: 'queue_unavailable' });
+    res.json(await invoiceQueue.stats());
+});
+
+app.get('/invoicing/jobs/dlq', requireApiKey, async (req, res) => {
+    if (!invoiceQueue) return res.status(503).json({ error: 'queue_unavailable' });
+    const start = parseInt(req.query.start || '0', 10);
+    const end = parseInt(req.query.end || '50', 10);
+    const failed = await invoiceQueue.listFailed(start, end);
+    res.json({
+        ok: true,
+        items: failed.map((j) => ({
+            id: j.id,
+            data: j.data,
+            attemptsMade: j.attemptsMade,
+            failedReason: j.failedReason,
+            stacktrace: j.stacktrace ? j.stacktrace.slice(0, 3) : [],
+            timestamp: j.timestamp,
+        })),
+    });
+});
+
+app.post('/invoicing/jobs/:id/retry', requireApiKey, async (req, res) => {
+    if (!invoiceQueue) return res.status(503).json({ error: 'queue_unavailable' });
+    res.json(await invoiceQueue.retry(req.params.id));
+});
+
+app.post('/invoicing/jobs/:id/cancel', requireApiKey, async (req, res) => {
+    if (!invoiceQueue) return res.status(503).json({ error: 'queue_unavailable' });
+    const result = await invoiceQueue.cancel(req.params.id);
+    if (result.ok && idempotency) {
+        await idempotency.update(req.params.id, { status: 'cancelled' }).catch(() => {});
+        await idempotency.appendAudit(req.params.id, 'manually_cancelled', 'admin').catch(() => {});
+    }
+    res.json(result);
+});
+
+// Manual mode: panel triggers send for an existing draft
+app.post('/invoicing/draft/:id/send', requireApiKey, async (req, res) => {
+    if (!invoiceQueue || !idempotency) return res.status(503).json({ error: 'lifecycle_unavailable' });
+    try {
+        const doc = await idempotency.getById(req.params.id);
+        if (!doc) return res.status(404).json({ error: 'not_found' });
+        if (doc.status === 'sent') return res.status(409).json({ error: 'already_sent' });
+
+        await idempotency.update(req.params.id, { status: 'queued' });
+        const job = await invoiceQueue.add({
+            documentId: req.params.id,
+            tenantId: doc.tenantId,
+            sourceTransferId: doc.sourceId,
+        });
+        await idempotency.appendAudit(req.params.id, 'manually_queued', req.body.by || 'panel');
+        res.json({ ok: true, jobId: job.id });
+    } catch (e) {
+        res.status(500).json({ error: e.code || 'internal_error', message: e.message });
+    }
+});
+
+// Graceful shutdown
+async function shutdown() {
+    console.log('[invoicing-engine] Graceful shutdown...');
+    if (stockListener) stockListener.stop();
+    if (invoiceWorker) await invoiceWorker.close().catch(() => {});
+    if (invoiceQueue) await invoiceQueue.close().catch(() => {});
+    process.exit(0);
+}
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
 
 // ---------------- 404 ----------------
 
