@@ -34,7 +34,7 @@ const DispatchMetrics = require('./services/dispatch/dispatch-metrics');
 const DispatchQueue = require('./services/dispatch/dispatch-queue');
 const DispatchAlerts = require('./services/dispatch/dispatch-alerts');
 const DelayedCallQueue = require('./services/queue/delayed-call-queue');
-const { getRedisClient, isRedisAvailable, getRedisStatus, getRedisFailoverInfo } = require('./services/redis-client');
+const { getRedisClient, isRedisAvailable, getRedisStatus, getRedisFailoverInfo } = require('@yemigo/shared/redis-client');
 const { createAdapter } = require('@socket.io/redis-adapter');
 const OrderStore = require('./services/redis-orders');
 const CancellationStore = require('./services/redis-cancellations');
@@ -435,48 +435,8 @@ async function resolveBranchByGetirRestaurantId(restaurantId, dbRef) {
 }
 
 // ==================== FIREBASE CONFIGURATION ====================
-let db = null;
-let firebaseInitialized = false;
-
-function initializeFirebase() {
-    try {
-        const firebaseCredentials = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-
-        if (firebaseCredentials) {
-            const serviceAccount = JSON.parse(firebaseCredentials);
-            admin.initializeApp({
-                credential: admin.credential.cert(serviceAccount)
-            });
-            console.log('[Firebase] Initialized from environment variable');
-        } else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-            admin.initializeApp({
-                credential: admin.credential.applicationDefault()
-            });
-            console.log('[Firebase] Initialized from GOOGLE_APPLICATION_CREDENTIALS');
-        } else {
-            try {
-                const serviceAccount = require('./firebase-credentials.json');
-                admin.initializeApp({
-                    credential: admin.credential.cert(serviceAccount)
-                });
-                console.log('[Firebase] Initialized from local firebase-credentials.json');
-            } catch (e) {
-                console.warn('[Firebase] No credentials found - Firebase features disabled');
-                return false;
-            }
-        }
-
-        db = admin.firestore();
-        firebaseInitialized = true;
-        console.log('[Firebase] Firestore connected successfully');
-        return true;
-    } catch (error) {
-        console.error('[Firebase] Initialization error:', error.message);
-        return false;
-    }
-}
-
-initializeFirebase();
+// Plan 27 Faz 1.1: init delegated to @yemigo/shared/firestore-admin (auto-init on require).
+const { db, firebaseInitialized } = require('@yemigo/shared/firestore-admin');
 
 // ==================== PLATFORM REGISTRY INITIALIZATION ====================
 const platformRegistry = new PlatformRegistry(db);
