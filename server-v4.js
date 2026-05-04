@@ -347,15 +347,38 @@ async function resolveBranchByGetirSecret(secret, dbRef) {
     }
 
     try {
+        // Aynı secret birden fazla şubede olabilir (test şube vs prod) — limit(5) ile
+        // ambiguity tespit edebiliyoruz, sonra client-side `isEnabled !== false` filtre.
+        // 14 şubede `getirYemek_isEnabled` field'ı yok (undefined → backward-compat:
+        // aktif say). Sadece açıkça `false` olanlar elenir; tipik test şubeleri böyle.
         const snap = await dbRef.collection('branches')
             .where('getirYemek_restaurantSecretKey', '==', secret)
-            .limit(1)
+            .limit(5)
             .get();
+
         if (snap.empty) {
             getirSecretBranchCache.set(secret, { branchId: null, timestamp: Date.now() });
             return null;
         }
-        const branchId = snap.docs[0].id;
+
+        const activeMatches = snap.docs.filter(d => d.data().getirYemek_isEnabled !== false);
+
+        if (activeMatches.length === 0) {
+            console.warn(`[GetirYemek] secret=${secret.substring(0, 10)}... ${snap.size} match buldu ama hepsi isEnabled=false`);
+            getirSecretBranchCache.set(secret, { branchId: null, timestamp: Date.now() });
+            return null;
+        }
+
+        if (activeMatches.length > 1) {
+            // Aynı secret birden fazla aktif şubede → secret artık otoriter sayılamaz.
+            // Caller body.restaurantId fallback'ine düşmeli (resolveBranchByGetirRestaurantId).
+            const ids = activeMatches.map(d => d.id).join(', ');
+            console.error(`[GetirYemek] AMBIGUOUS secret=${secret.substring(0, 10)}... ${activeMatches.length} aktif şubeye eşleşiyor (${ids}); secret resolve atlandı, restaurantId şart`);
+            getirSecretBranchCache.set(secret, { branchId: null, timestamp: Date.now() });
+            return null;
+        }
+
+        const branchId = activeMatches[0].id;
         getirSecretBranchCache.set(secret, { branchId, timestamp: Date.now() });
         return branchId;
     } catch (err) {
@@ -375,15 +398,34 @@ async function resolveBranchByGetirRestaurantId(restaurantId, dbRef) {
         return cached.branchId;
     }
     try {
+        // Secret resolver ile aynı pattern: ambiguity'i tespit et, isEnabled=false elenir.
+        // Aynı restaurantId iki aktif şubede paylaşılırsa caller env_fallback'a düşer.
         const snap = await dbRef.collection('branches')
             .where('getirYemek_restaurantId', '==', key)
-            .limit(1)
+            .limit(5)
             .get();
+
         if (snap.empty) {
             getirRestaurantBranchCache.set(key, { branchId: null, timestamp: Date.now() });
             return null;
         }
-        const branchId = snap.docs[0].id;
+
+        const activeMatches = snap.docs.filter(d => d.data().getirYemek_isEnabled !== false);
+
+        if (activeMatches.length === 0) {
+            console.warn(`[GetirYemek] restaurantId=${key} ${snap.size} match buldu ama hepsi isEnabled=false`);
+            getirRestaurantBranchCache.set(key, { branchId: null, timestamp: Date.now() });
+            return null;
+        }
+
+        if (activeMatches.length > 1) {
+            const ids = activeMatches.map(d => d.id).join(', ');
+            console.error(`[GetirYemek] AMBIGUOUS restaurantId=${key} ${activeMatches.length} aktif şubeye eşleşiyor (${ids})`);
+            getirRestaurantBranchCache.set(key, { branchId: null, timestamp: Date.now() });
+            return null;
+        }
+
+        const branchId = activeMatches[0].id;
         getirRestaurantBranchCache.set(key, { branchId, timestamp: Date.now() });
         return branchId;
     } catch (err) {
