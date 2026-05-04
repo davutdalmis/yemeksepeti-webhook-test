@@ -1,0 +1,21 @@
+{
+  "name": "yemigo-invoicing-engine",
+  "version": "0.1.0",
+  "description": "YemiGO invoicing engine — Parasut & provider-agnostic e-Invoice/e-Despatch service (Plan 27)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "@sentry/node": "^7.100.0",
+    "@yemigo/shared": "file:../../shared",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "firebase-admin": "^12.0.0",
+    "ioredis": "^5.10.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

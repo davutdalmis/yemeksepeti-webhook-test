@@ -1,0 +1,14 @@
+{
+  "name": "@yemigo/shared",
+  "version": "0.1.0",
+  "private": true,
+  "description": "YemiGO shared infrastructure modules (firestore-admin, redis-client, sentry-init) consumed by Railway services.",
+  "main": "index.js",
+  "files": [
+    "firestore-admin.js",
+    "redis-client.js",
+    "sentry-init.js",
+    "index.js",
+    "README.md"
+  ]
+}
