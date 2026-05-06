@@ -1,0 +1,6 @@
+{
+  "name": "yemigo-webhook-monorepo",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Plan 27 monorepo root marker — Railway builds resolve from this file. Each service has its own buildCommand/startCommand pointing to apps/<name>/."
+}
