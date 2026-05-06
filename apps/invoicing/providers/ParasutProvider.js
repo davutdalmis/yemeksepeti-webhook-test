@@ -87,9 +87,30 @@ class ParasutProvider {
     // -------------------- HEALTH --------------------
 
     async ping(token) {
+        // Parasut API: /v4/me ve /v4/companies global endpoint'leri (companyId prefix YOK).
+        // Her tenant icin /me ile kullaniciyi dogrula + /companies'ten configure edilen
+        // companyId'nin gercekten erisilebilir oldugunu validate et.
         try {
-            const data = await this._get(token, '/me');
-            return { ok: true, company: data && data.data ? data.data.attributes || {} : {} };
+            const meUrl = `${this.baseUrl}/v4/me`;
+            const companiesUrl = `${this.baseUrl}/v4/companies`;
+            const headers = { Authorization: `Bearer ${token}`, Accept: 'application/json' };
+            const [meRes, coRes] = await Promise.all([
+                axios.get(meUrl, { headers, timeout: this.timeoutMs }),
+                axios.get(companiesUrl, { headers, timeout: this.timeoutMs }),
+            ]);
+            const companies = Array.isArray(coRes.data && coRes.data.data) ? coRes.data.data : [];
+            const match = companies.find((c) => String(c.id) === this.companyId);
+            if (!match) {
+                return {
+                    ok: false,
+                    error: `companyId "${this.companyId}" not accessible by user "${meRes.data && meRes.data.data && meRes.data.data.attributes && meRes.data.data.attributes.email || '?'}". Available: ${companies.map((c) => c.id).join(', ') || 'none'}`,
+                    code: 'COMPANY_NOT_ACCESSIBLE',
+                };
+            }
+            return {
+                ok: true,
+                company: { id: match.id, ...(match.attributes || {}) },
+            };
         } catch (err) {
             return { ok: false, error: err.message, code: err.code };
         }
