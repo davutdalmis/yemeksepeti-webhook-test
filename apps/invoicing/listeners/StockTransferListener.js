@@ -242,11 +242,17 @@ class StockTransferListener {
             console.log(`[StockTransferListener] Parasut draft created for ${docId} -> parasutInvoiceId=${draft.providerInvoiceId}`);
         } catch (e) {
             // Sessiz fallback: yetkili onay aninda eski createInvoice yolu calisir.
-            console.warn(`[StockTransferListener] Parasut draft create FAILED for ${docId}: ${e.message} (code=${e.code || '?'})`);
+            console.warn(`[StockTransferListener] Parasut draft create FAILED for ${docId}: ${e.reqMethod || ''} ${e.reqUrl || ''} -> ${e.status} ${e.message} (code=${e.code || '?'})`);
+            if (e.providerPayload) {
+                console.warn(`[StockTransferListener]   Parasut payload:`, JSON.stringify(e.providerPayload).slice(0, 800));
+            }
             await this.idempotency.appendAudit(docId, 'parasut_draft_failed', 'listener', {
                 error: e.message,
                 code: e.code,
                 status: e.status,
+                reqUrl: e.reqUrl,
+                reqMethod: e.reqMethod,
+                providerPayload: e.providerPayload ? JSON.stringify(e.providerPayload).slice(0, 1000) : null,
             }).catch(() => {});
         }
     }

@@ -34,13 +34,15 @@
  */
 
 class InvoiceProviderError extends Error {
-    constructor(message, { code, status, retryable, providerPayload } = {}) {
+    constructor(message, { code, status, retryable, providerPayload, reqUrl, reqMethod } = {}) {
         super(message);
         this.name = 'InvoiceProviderError';
         this.code = code || 'PROVIDER_ERROR';
         this.status = status || null;
         this.retryable = !!retryable;
         this.providerPayload = providerPayload || null;
+        this.reqUrl = reqUrl || null;
+        this.reqMethod = reqMethod || null;
     }
 }
 

@@ -599,7 +599,10 @@ class ParasutProvider {
         const payload = err.response && err.response.data;
         const retryable = !status || status === 408 || status === 429 || (status >= 500 && status < 600);
         const msg = (payload && (payload.message || payload.error_description || payload.error)) || err.message;
-        return new InvoiceProviderError(msg, { code, status, retryable, providerPayload: payload });
+        // Plan 28+ debug: hata URL'sini ve metodunu paylas, bilinmeyen 404'leri tesh icin
+        const reqUrl = err.config && err.config.url;
+        const reqMethod = err.config && err.config.method;
+        return new InvoiceProviderError(msg, { code, status, retryable, providerPayload: payload, reqUrl, reqMethod });
     }
 }
 
