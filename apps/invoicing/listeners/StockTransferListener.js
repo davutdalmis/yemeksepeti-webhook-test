@@ -1,14 +1,15 @@
 // ==================================================================================
 // StockTransferListener — Firestore listener: stockTransfers.status='shipped'
 // ==================================================================================
-// Plan 27 Faz 2.1.
+// Plan 27 Faz 2.1, Plan 28 Faz 1.1.3 ile guncellendi.
 // Yeni shipped doc gelince:
 //   1. Tenant settings'i yukle (invoicingCredentials/{tenantId}/providers/parasut)
 //   2. isEnabled false -> skip
 //   3. IdempotencyService ile invoiceDocuments draft olustur (race-safe)
-//   4. automationMode='auto' -> kuyruga ekle
-//      automationMode='manual' -> sadece draft, panel'den onay bekler
-//   5. stockTransfer dok'una parasutQueued=true yaz (re-process onle)
+//   4. stockTransfer dok'una parasutQueued=true yaz (re-process onle)
+// Plan 28: artik 'auto' modda dahi otomatik kuyruga ALMAZ. Yetkili panelden
+// onaylayinca engine /invoicing/draft/:id/approve endpoint'i tetiklenir,
+// queued/sent gecisleri orada yapilir. automationMode bu noktada read-only kalsin.
 // ==================================================================================
 
 class StockTransferListener {
@@ -87,19 +88,51 @@ class StockTransferListener {
             return;
         }
 
+        // Plan 28: items snapshot — modal+approve endpoint icin items[]'i drafte yaz.
+        // originalQuantity sevkiyat anindaki miktar; finalQuantity onay sirasinda
+        // duzenlenebilir (default = originalQuantity).
+        const itemsSnapshot = Array.isArray(transfer.items)
+            ? transfer.items.map((it, idx) => ({
+                  itemIndex: idx,
+                  productId: it.productId || '',
+                  productName: it.productName || '',
+                  unit: it.unit || 'adet',
+                  unitPrice: Number(it.unitPrice || 0),
+                  vatRate: Number(it.vatRate || 0),
+                  originalQuantity: Number(
+                      it.shippedQuantity != null ? it.shippedQuantity :
+                      it.approvedQuantity != null ? it.approvedQuantity :
+                      it.requestedQuantity || 0
+                  ),
+                  batchId: it.batchId || null,
+                  batchNumber: it.batchNumber || null,
+              }))
+            : [];
+
+        // Plan 28: shipmentMeta — sevkiyat zamanindaki bilgiler.
+        const shipmentMeta = {
+            shippedAt: transfer.shippedAt || Date.now(),
+            shippedBy: transfer.preparedBy || transfer.shippedBy || null,
+            sourceBranchId: transfer.sourceBranchId || null,
+            targetBranchId: transfer.destinationBranchId || transfer.targetBranchId || transfer.branchId || null,
+            targetBranchName: transfer.targetBranchName || null,
+        };
+
         // Create draft via idempotency service
         const result = await this.idempotency.ensureDraft({
             tenantId,
             sourceType: 'stockTransfer',
             sourceId: transferId,
             data: {
-                branchId: transfer.destinationBranchId || transfer.branchId,
+                branchId: transfer.destinationBranchId || transfer.targetBranchId || transfer.branchId,
                 provider: 'parasut',
                 sourceTransferNumber: transfer.transferNumber || transfer.code,
                 amount: transfer.totalAmount || 0,
                 currency: transfer.currency || 'TRL',
                 documentType: settings.defaultDocumentType || 'sales_invoice',
                 shipmentIncluded: !!settings.shipmentIncludedDefault,
+                items: itemsSnapshot,
+                shipmentMeta,
             },
         });
 
@@ -110,15 +143,10 @@ class StockTransferListener {
             console.warn(`[StockTransferListener] could not mark transfer ${transferId} as queued:`, e.message);
         }
 
-        // Auto-mode: enqueue immediately
-        if (!result.existing && settings.automationMode === 'auto' && this.queue && this.queue.available) {
-            try {
-                await this.queue.add({ documentId: result.id, tenantId, sourceTransferId: transferId });
-                await this.idempotency.appendAudit(result.id, 'queued', 'StockTransferListener', { auto: true });
-            } catch (e) {
-                console.error(`[StockTransferListener] enqueue failed for doc ${result.id}:`, e.message);
-            }
-        }
+        // Plan 28: auto-enqueue intentionally removed.
+        // Owner approval (panel "Onayla" -> POST /invoicing/draft/:id/approve)
+        // is now the sole trigger for Parasut POST. Draft remains in 'draft' status
+        // until pending_approval -> approved -> queued path runs in approve handler.
     }
 }
 

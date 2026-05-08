@@ -85,12 +85,15 @@ function makeWorker(overrides = {}) {
 }
 
 async function seed(db, idempotency, tenantId, sourceId) {
+    // Plan 28: worker only processes 'approved' (or mid-retry 'queued') docs.
+    // Tests simulate the approve endpoint having already flipped status.
     const r = await idempotency.ensureDraft({
         tenantId,
         sourceType: 'stockTransfer',
         sourceId,
         data: { branchId: 'b1', amount: 100 },
     });
+    await idempotency.update(r.id, { status: 'approved' });
     return r.id;
 }
 
@@ -120,6 +123,25 @@ describe('InvoiceWorker._handler', () => {
         const result = await worker._handler({ id: docId, data: { documentId: docId, tenantId: 't1' }, attemptsMade: 1 });
         expect(result.skipped).toBe(true);
         expect(mock.calls.createInvoice).toBe(0);
+    });
+
+    test('Plan 28: skips non-approved doc (draft, pending_approval)', async () => {
+        for (const status of ['draft', 'pending_approval']) {
+            const { worker, idempotency, mock, db } = makeWorker();
+            const r = await idempotency.ensureDraft({
+                tenantId: 't1',
+                sourceType: 'stockTransfer',
+                sourceId: `TR-skip-${status}`,
+                data: { branchId: 'b1', amount: 100 },
+            });
+            if (status !== 'draft') {
+                await idempotency.update(r.id, { status });
+            }
+            const result = await worker._handler({ id: r.id, data: { documentId: r.id, tenantId: 't1' }, attemptsMade: 1 });
+            expect(result.skipped).toBe(true);
+            expect(result.reason).toBe(`not_approved:${status}`);
+            expect(mock.calls.createInvoice).toBe(0);
+        }
     });
 
     test('provider failure -> status=failed/queued + audit + rethrow', async () => {

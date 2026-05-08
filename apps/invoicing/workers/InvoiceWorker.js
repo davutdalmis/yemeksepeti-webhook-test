@@ -88,6 +88,14 @@ class InvoiceWorker {
             console.log(`[InvoiceWorker] doc ${documentId} already in status=${doc.status}, skipping`);
             return { skipped: true, reason: doc.status };
         }
+        // Plan 28 Faz 1.1.4: only 'approved' (fresh from approve endpoint)
+        // or 'queued' (mid-retry) docs are eligible. Anything else (draft,
+        // pending_approval, sending, failed) means owner approval has not
+        // produced a signed-off, dispatchable doc yet — drop the job.
+        if (doc.status !== 'approved' && doc.status !== 'queued') {
+            console.warn(`[InvoiceWorker] doc ${documentId} status=${doc.status} not eligible — skipping`);
+            return { skipped: true, reason: `not_approved:${doc.status}` };
+        }
 
         // 2. Rate limit
         if (this.rateLimiter) {

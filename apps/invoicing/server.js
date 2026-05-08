@@ -3,7 +3,7 @@ try { require('dotenv').config(); } catch (e) { }
 const express = require('express');
 
 const { admin, db, firebaseInitialized } = require('@yemigo/shared/firestore-admin');
-const { getRedisClient, isRedisAvailable, getRedisStatus } = require('@yemigo/shared/redis-client');
+const { getRedisClient, isRedisAvailable, getRedisStatus, MemoryFallback } = require('@yemigo/shared/redis-client');
 const { initSentry } = require('@yemigo/shared/sentry-init');
 
 const ParasutProvider = require('./providers/ParasutProvider');
@@ -15,6 +15,7 @@ const RateLimiter = require('./lib/RateLimiter');
 const { InvoiceQueue } = require('./queue/InvoiceQueue');
 const InvoiceWorker = require('./workers/InvoiceWorker');
 const StockTransferListener = require('./listeners/StockTransferListener');
+const { ApprovalProcessor, ApprovalError } = require('./lib/ApprovalProcessor');
 
 initSentry({ dsn: process.env.SENTRY_DSN, service: 'invoicing-engine' });
 
@@ -210,51 +211,104 @@ app.get('/invoicing/tenants/:tenantId', requireApiKey, async (req, res) => {
 });
 
 // ---------------- Faz 2: Lifecycle (queue + worker + listener) ----------------
+// Init iki aşamalı:
+//   1. ApprovalProcessor (Plan 28) — sadece Firestore + provider gerektirir, Redis bağımsız.
+//   2. Queue/Worker/Listener (Plan 27) — BullMQ gerçek Redis ister. ioredis async bağlanır,
+//      bu yüzden ready event'ini bekleriz. Ready gelmeden önce gelen istekler 503 alır
+//      (endpoint guard'ları doğal olarak null-check yapıyor).
 
 let idempotency = null;
 let rateLimiter = null;
 let invoiceQueue = null;
 let invoiceWorker = null;
 let stockListener = null;
+let approvalProcessor = null;
 
-if (firebaseInitialized && db) {
-    idempotency = new IdempotencyService({ db });
+async function waitForRedisReady(redisClient, timeoutMs = 15000) {
+    if (redisClient instanceof MemoryFallback) return false;
+    if (redisClient.status === 'ready') return true;
+    return await new Promise((resolve) => {
+        const t = setTimeout(() => resolve(false), timeoutMs);
+        const onReady = () => { clearTimeout(t); resolve(true); };
+        redisClient.once('ready', onReady);
+    });
 }
 
-if (isRedisAvailable() && idempotency) {
+async function initRedisDependentLifecycle() {
+    if (rateLimiter) return; // already inited
     rateLimiter = new RateLimiter({ redis });
     try {
         invoiceQueue = new InvoiceQueue({ connection: redis });
     } catch (e) {
         console.warn('[invoicing-engine] InvoiceQueue init skipped:', e.message);
+        return;
+    }
+    if (!invoiceQueue || !invoiceQueue.available) {
+        console.warn('[invoicing-engine] InvoiceQueue unavailable; worker/listener skipped');
+        return;
     }
 
-    if (invoiceQueue && invoiceQueue.available) {
-        invoiceWorker = new InvoiceWorker({
-            connection: redis,
+    invoiceWorker = new InvoiceWorker({
+        connection: redis,
+        idempotency,
+        tokenManager,
+        rateLimiter,
+        providerFactory,
+        tenantSettingsLoader: buildInvoiceContext,
+    });
+
+    if (process.env.INVOICING_LISTENER_ENABLED === 'true') {
+        stockListener = new StockTransferListener({
+            db,
             idempotency,
-            tokenManager,
-            rateLimiter,
-            providerFactory,
-            tenantSettingsLoader: buildInvoiceContext,
+            queue: invoiceQueue,
+            settingsLoader: loadParasutSettings,
         });
-
-        // Auto-start listener only if explicitly enabled (avoids accidental Firestore subscriptions in dev)
-        if (process.env.INVOICING_LISTENER_ENABLED === 'true') {
-            stockListener = new StockTransferListener({
-                db,
-                idempotency,
-                queue: invoiceQueue,
-                settingsLoader: loadParasutSettings,
-            });
-            stockListener.start();
-        } else {
-            console.log('[invoicing-engine] StockTransferListener NOT started (set INVOICING_LISTENER_ENABLED=true to enable)');
-        }
+        stockListener.start();
+        console.log('[invoicing-engine] Plan 27 lifecycle ready (queue+worker+listener active)');
+    } else {
+        console.log('[invoicing-engine] Plan 27 lifecycle ready (queue+worker active; listener disabled, set INVOICING_LISTENER_ENABLED=true)');
     }
-} else {
-    console.log('[invoicing-engine] Faz 2 lifecycle DISABLED (Redis or Firebase not available)');
 }
+
+async function initLifecycle() {
+    if (!firebaseInitialized || !db) {
+        console.log('[invoicing-engine] Lifecycle DISABLED (Firebase not available)');
+        return;
+    }
+    idempotency = new IdempotencyService({ db });
+
+    // Plan 28: ApprovalProcessor — Redis gerektirmez
+    approvalProcessor = new ApprovalProcessor({
+        db,
+        idempotency,
+        tokenManager,
+        providerFactory,
+        contextLoader: buildInvoiceContext,
+    });
+    console.log('[invoicing-engine] ApprovalProcessor ready (Plan 28)');
+
+    // Plan 27: BullMQ queue/worker/listener — gerçek Redis bekler
+    if (redis instanceof MemoryFallback) {
+        console.log('[invoicing-engine] Plan 27 lifecycle DISABLED (Redis fallback to memory; BullMQ requires real Redis)');
+        return;
+    }
+
+    const ready = await waitForRedisReady(redis);
+    if (!ready) {
+        console.warn('[invoicing-engine] Plan 27 lifecycle DEFERRED (Redis not ready within 15s) — will init on next ready event');
+        redis.once('ready', () => {
+            initRedisDependentLifecycle().catch((e) =>
+                console.error('[invoicing-engine] deferred lifecycle init error:', e.message),
+            );
+        });
+        return;
+    }
+
+    await initRedisDependentLifecycle();
+}
+
+initLifecycle().catch((e) => console.error('[invoicing-engine] initLifecycle error:', e.message));
 
 /**
  * Build the invoice context (branch + items + settings) from a draft document.
@@ -340,6 +394,104 @@ app.post('/invoicing/jobs/:id/cancel', requireApiKey, async (req, res) => {
         await idempotency.appendAudit(req.params.id, 'manually_cancelled', 'admin').catch(() => {});
     }
     res.json(result);
+});
+
+// Plan 28: panel saves owner-edited line items + diffReason for an existing draft.
+// status: draft|pending_approval -> pending_approval; idempotent on repeated saves.
+const { validateTransition } = require('./lib/StatusTransitionValidator');
+
+app.post('/invoicing/draft/:id/save-edits', requireApiKey, async (req, res) => {
+    if (!idempotency) return res.status(503).json({ error: 'lifecycle_unavailable' });
+    try {
+        const { tenantId, edits, editedBy, note } = req.body || {};
+        if (!tenantId) return res.status(400).json({ error: 'missing_tenantId' });
+        if (!Array.isArray(edits)) return res.status(400).json({ error: 'edits_not_array' });
+
+        const doc = await idempotency.getById(req.params.id);
+        if (!doc) return res.status(404).json({ error: 'not_found' });
+        if (doc.tenantId !== tenantId) return res.status(403).json({ error: 'tenant_mismatch' });
+
+        const transition = validateTransition(doc.status, 'pending_approval');
+        if (!transition.ok) {
+            return res.status(409).json({ error: 'invalid_transition', from: doc.status, reason: transition.reason });
+        }
+
+        // Item-level validation: finalQty in [0, originalQty], itemIndex valid.
+        const itemsByIdx = new Map((doc.items || []).map((it) => [it.itemIndex, it]));
+        const cleanEdits = [];
+        let fireTotal = 0;
+        for (const e of edits) {
+            const idx = Number(e.itemIndex);
+            const original = itemsByIdx.get(idx);
+            if (!original) {
+                return res.status(400).json({ error: 'unknown_itemIndex', itemIndex: idx });
+            }
+            const finalQty = Number(e.finalQty);
+            if (!Number.isFinite(finalQty) || finalQty < 0 || finalQty > original.originalQuantity) {
+                return res.status(400).json({
+                    error: 'finalQty_out_of_range',
+                    itemIndex: idx,
+                    originalQuantity: original.originalQuantity,
+                    received: finalQty,
+                });
+            }
+            const diffReason = ['fire', 'iade', 'duzeltme'].includes(e.diffReason) ? e.diffReason : undefined;
+            cleanEdits.push({
+                itemIndex: idx,
+                productId: original.productId,
+                originalQty: original.originalQuantity,
+                finalQty,
+                diffReason,
+                note: typeof e.note === 'string' ? e.note.slice(0, 500) : undefined,
+            });
+            const diff = original.originalQuantity - finalQty;
+            if (diff > 0 && diffReason === 'fire') fireTotal += diff;
+        }
+
+        await idempotency.update(req.params.id, {
+            status: 'pending_approval',
+            approvalMeta: {
+                edits: cleanEdits,
+                fireQuantityTotal: fireTotal,
+                lastEditedAt: Date.now(),
+                lastEditedBy: editedBy || 'panel',
+            },
+        });
+        await idempotency.appendAudit(req.params.id, 'edited', editedBy || 'panel', {
+            editsCount: cleanEdits.length,
+            fireTotal,
+            note: note ? String(note).slice(0, 500) : undefined,
+        });
+
+        res.json({ ok: true, status: 'pending_approval', edits: cleanEdits, fireQuantityTotal: fireTotal });
+    } catch (e) {
+        console.error('[invoicing-engine] save-edits error:', e.message);
+        res.status(e.status || 500).json({ error: e.code || 'internal_error', message: e.message });
+    }
+});
+
+// Plan 28 Faz 3: atomik onay — Paraşüt createInvoice (e_archive) + Firestore transaction.
+// Body: { tenantId, approvedBy, edits?, fireRecords? }
+// edits: [{ itemIndex, finalQty, diffReason? }] — opsiyonel; verilmezse approvalMeta'dakini kullanır.
+// approvalProcessor initLifecycle() içinde init edilir.
+app.post('/invoicing/draft/:id/approve', requireApiKey, async (req, res) => {
+    if (!approvalProcessor) {
+        return res.status(503).json({ error: 'approval_processor_unavailable', message: 'firebase or idempotency not initialized' });
+    }
+    try {
+        const result = await approvalProcessor.approve(req.params.id, req.body || {});
+        res.json(result);
+    } catch (e) {
+        if (e instanceof ApprovalError) {
+            return res.status(e.status || 500).json({
+                error: e.code || 'approval_error',
+                message: e.message,
+                ...(e.payload ? { payload: e.payload } : {}),
+            });
+        }
+        console.error('[invoicing-engine] approve unexpected error:', e);
+        res.status(500).json({ error: 'internal_error', message: e.message });
+    }
 });
 
 // Manual mode: panel triggers send for an existing draft
