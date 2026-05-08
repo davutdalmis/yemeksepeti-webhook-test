@@ -498,6 +498,197 @@ class ParasutProvider {
         }
     }
 
+    // -------------------- SHIPMENT DOCUMENT (Plan 28++) --------------------
+
+    /**
+     * Plan 28++ — Sevk irsaliyesi (e-İrsaliye'nin Paraşüt karşılığı) yarat.
+     * Fatura'dan farklı: GİB'e gönderilen e-İrsaliye QR kodlu PDF olur,
+     * sürücü malla birlikte götürür. Mali değer içermez (KDV hesaplaması fatura tarafında).
+     *
+     * Paraşüt JSON:API: data.relationships.stock_movements.data[] zorunlu — her stok hareketi
+     * bir ürün satırını + miktar + fiyat'ı temsil eder. include=stock_movements ile resmi
+     * hareketler döner.
+     *
+     * @param {object} payload
+     * @param {string} payload.contactId  Alıcı (şube) Paraşüt contact ID
+     * @param {Array}  payload.items      [{ productId, quantity, unitPrice, vatRate, name }]
+     * @param {string} [payload.issueDate]       İrsaliye düzenleme tarihi (default: bugün)
+     * @param {string} [payload.shipmentDate]    Fiili sevk tarihi-saati (ISO 8601)
+     * @param {string} [payload.procurementNumber] İrsaliye numarası (opsiyonel; verilmezse Paraşüt otomatik)
+     * @param {string} [payload.description]     İrsaliye açıklaması
+     * @param {string} [payload.address]         Sevk adresi
+     * @param {string} [payload.city]
+     * @param {string} [payload.district]
+     * @param {boolean} [payload.inflow]         false=satış (giden), true=alış (gelen). Default: false
+     * @returns {Promise<{providerShipmentId, shipmentNumber, pdfUrl, qrUrl, eDocStatus}>}
+     */
+    async createShipmentDocument(token, payload) {
+        const {
+            contactId,
+            items,
+            issueDate,
+            shipmentDate,
+            procurementNumber,
+            description,
+            address,
+            city,
+            district,
+            inflow = false,
+        } = payload;
+
+        if (!contactId) throw new InvoiceProviderError('contactId required', { code: 'SHIPMENT_NO_CONTACT' });
+        if (!Array.isArray(items) || items.length === 0) {
+            throw new InvoiceProviderError('items required', { code: 'SHIPMENT_NO_ITEMS' });
+        }
+
+        // Paraşüt: stock_movements relationship'i ile ürün satırları gömülü olarak gönderilir.
+        // sales_invoice_details ile aynı pattern: id YOK, included YOK, doğrudan inline.
+        const stockMovements = items.map((it) => ({
+            type: 'stock_movements',
+            attributes: {
+                quantity: Number(it.quantity),
+                unit_price: Number(it.unitPrice || 0),
+                vat_rate: typeof it.vatRate === 'number' ? it.vatRate : 0,
+                description: it.description || it.name || '',
+            },
+            relationships: {
+                product: { data: { type: 'products', id: String(it.productId) } },
+            },
+        }));
+
+        const attributes = {
+            issue_date: issueDate || new Date().toISOString().slice(0, 10),
+            inflow: !!inflow,
+        };
+        if (description) attributes.description = description;
+        if (address) attributes.address = address;
+        if (city) attributes.city = city;
+        if (district) attributes.district = district;
+        if (shipmentDate) attributes.shipment_date = shipmentDate;
+        if (procurementNumber) attributes.procurement_number = procurementNumber;
+
+        const body = {
+            data: {
+                type: 'shipment_documents',
+                attributes,
+                relationships: {
+                    contact: { data: { type: 'contacts', id: String(contactId) } },
+                    stock_movements: { data: stockMovements },
+                },
+            },
+        };
+
+        const created = await this._post(token, '/shipment_documents?include=stock_movements', body);
+        if (!created || !created.data || !created.data.id) {
+            throw new InvoiceProviderError('Shipment document create returned no id', { code: 'SHIPMENT_CREATE_NO_ID' });
+        }
+
+        return {
+            providerShipmentId: String(created.data.id),
+            shipmentNumber: created.data.attributes && (created.data.attributes.procurement_number || created.data.attributes.invoice_no),
+            pdfUrl: this._extractShipmentPdfUrl(created),
+            issueDate: created.data.attributes && created.data.attributes.issue_date,
+            shipmentDate: created.data.attributes && created.data.attributes.shipment_date,
+        };
+    }
+
+    /**
+     * Plan 28++ — taslak e-İrsaliye'yi güncelle (kalemler, açıklama, adres, sevk tarihi).
+     * Paraşüt resmilemiş irsaliyeyi reddeder; sadece taslak (henüz GİB'e gönderilmemiş) çalışır.
+     */
+    async updateShipmentDocument(token, providerShipmentId, payload) {
+        const {
+            items,
+            description,
+            address,
+            city,
+            district,
+            shipmentDate,
+            issueDate,
+            procurementNumber,
+        } = payload;
+
+        const attributes = {};
+        if (description != null) attributes.description = description;
+        if (address != null) attributes.address = address;
+        if (city != null) attributes.city = city;
+        if (district != null) attributes.district = district;
+        if (shipmentDate != null) attributes.shipment_date = shipmentDate;
+        if (issueDate != null) attributes.issue_date = issueDate;
+        if (procurementNumber != null) attributes.procurement_number = procurementNumber;
+
+        const body = {
+            data: {
+                id: String(providerShipmentId),
+                type: 'shipment_documents',
+                attributes,
+            },
+        };
+
+        if (Array.isArray(items)) {
+            const stockMovements = items.map((it) => ({
+                type: 'stock_movements',
+                attributes: {
+                    quantity: Number(it.quantity),
+                    unit_price: Number(it.unitPrice || 0),
+                    vat_rate: typeof it.vatRate === 'number' ? it.vatRate : 0,
+                    description: it.description || it.name || '',
+                },
+                relationships: {
+                    product: { data: { type: 'products', id: String(it.productId) } },
+                },
+            }));
+            body.data.relationships = {
+                stock_movements: { data: stockMovements },
+            };
+        }
+
+        const updated = await this._put(token, `/shipment_documents/${providerShipmentId}`, body);
+        if (!updated || !updated.data || !updated.data.id) {
+            throw new InvoiceProviderError('Shipment document update returned no id', { code: 'SHIPMENT_UPDATE_NO_ID' });
+        }
+        return {
+            providerShipmentId: String(updated.data.id),
+            shipmentNumber: updated.data.attributes && (updated.data.attributes.procurement_number || updated.data.attributes.invoice_no),
+            pdfUrl: this._extractShipmentPdfUrl(updated),
+        };
+    }
+
+    /**
+     * Plan 28++ — Şu anki Paraşüt API'si "convert_to_e_shipment" gibi resmilestirme
+     * endpoint'i sunmuyor. Resmî e-İrsaliye süreci Paraşüt panelinden manuel veya
+     * Paraşüt'ün kendi otomasyonu ile tetikleniyor. Bu metod taslak irsaliyeyi
+     * yeniden çekip pdf+QR url'ini döner.
+     */
+    async getShipmentDocument(token, providerShipmentId) {
+        const data = await this._get(token, `/shipment_documents/${providerShipmentId}?include=stock_movements,contact`);
+        if (!data || !data.data) {
+            throw new InvoiceProviderError('Shipment document not found', { code: 'SHIPMENT_NOT_FOUND', status: 404 });
+        }
+        return {
+            providerShipmentId: String(data.data.id),
+            shipmentNumber: data.data.attributes && (data.data.attributes.procurement_number || data.data.attributes.invoice_no),
+            pdfUrl: this._extractShipmentPdfUrl(data),
+            issueDate: data.data.attributes && data.data.attributes.issue_date,
+            shipmentDate: data.data.attributes && data.data.attributes.shipment_date,
+            archived: data.data.attributes && data.data.attributes.archived,
+        };
+    }
+
+    async deleteShipmentDocument(token, providerShipmentId) {
+        try {
+            await this._delete(token, `/shipment_documents/${providerShipmentId}`);
+            return { ok: true };
+        } catch (err) {
+            // _delete zaten InvoiceProviderError ile sarmalamış; status'u koruyup code'u shipment-spesifik yap.
+            if (err && err.name === 'InvoiceProviderError') {
+                err.code = 'SHIPMENT_DELETE_FAILED';
+                throw err;
+            }
+            throw this._wrap(err, 'SHIPMENT_DELETE_FAILED');
+        }
+    }
+
     // -------------------- HELPERS --------------------
 
     _basePath(suffix) {
@@ -580,6 +771,17 @@ class ParasutProvider {
      * yoksa null doner ve panel/WPF kendi taraflarinda PDF olusturmak zorunda.
      */
     _extractSalesInvoicePdfUrl(response) {
+        if (!response || !response.data || !response.data.attributes) return null;
+        const a = response.data.attributes;
+        return a.printable_html_url || a.preview_url || a.print_url || null;
+    }
+
+    /**
+     * Plan 28++ — Shipment document PDF/QR url'i. Paraşüt response attributes'unda
+     * printable_html_url benzeri alan dönerse onu kullanır; yoksa null.
+     * Sürücüye basılan QR kodlu PDF bu URL'den indirilir.
+     */
+    _extractShipmentPdfUrl(response) {
         if (!response || !response.data || !response.data.attributes) return null;
         const a = response.data.attributes;
         return a.printable_html_url || a.preview_url || a.print_url || null;

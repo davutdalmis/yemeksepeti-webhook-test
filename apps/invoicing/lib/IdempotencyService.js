@@ -9,13 +9,19 @@
 
 const crypto = require('crypto');
 
-function buildIdempotencyKey({ tenantId, sourceType, sourceId }) {
+/**
+ * Plan 28++: documentKind opsiyonel. 'invoice' (default) eski hash'leri korur,
+ * 'shipment' yeni e-irsaliye akisi icin ayri doc ID uretir; ayni stockTransfer
+ * icin hem fatura hem irsaliye yan yana yasayabilsin.
+ */
+function buildIdempotencyKey({ tenantId, sourceType, sourceId, documentKind }) {
     if (!tenantId || !sourceType || !sourceId) {
         throw new Error('IdempotencyService: tenantId, sourceType, sourceId required');
     }
+    const kindSuffix = documentKind && documentKind !== 'invoice' ? `:${documentKind}` : '';
     return crypto
         .createHash('sha256')
-        .update(`${tenantId}:${sourceType}:${sourceId}`)
+        .update(`${tenantId}:${sourceType}:${sourceId}${kindSuffix}`)
         .digest('hex');
 }
 
@@ -28,10 +34,12 @@ class IdempotencyService {
 
     /**
      * Idempotency check + draft create (Plan 27 manual mode).
+     * Plan 28++: documentKind opsiyonel ('invoice'|'shipment'); default 'invoice'.
      * Returns { existing: true, doc } if already present, or { existing: false, doc } after create.
      */
-    async ensureDraft({ tenantId, sourceType, sourceId, data }) {
-        const key = buildIdempotencyKey({ tenantId, sourceType, sourceId });
+    async ensureDraft({ tenantId, sourceType, sourceId, documentKind, data }) {
+        const kind = documentKind || 'invoice';
+        const key = buildIdempotencyKey({ tenantId, sourceType, sourceId, documentKind: kind });
         const ref = this.db.collection(this.collection).doc(key);
         const snap = await ref.get();
         if (snap.exists) {
@@ -41,6 +49,7 @@ class IdempotencyService {
             tenantId,
             sourceType,
             sourceId,
+            documentKind: kind,
             idempotencyKey: key,
             status: 'draft',
             errorCount: 0,

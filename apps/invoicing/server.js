@@ -16,6 +16,7 @@ const { InvoiceQueue } = require('./queue/InvoiceQueue');
 const InvoiceWorker = require('./workers/InvoiceWorker');
 const StockTransferListener = require('./listeners/StockTransferListener');
 const { ApprovalProcessor, ApprovalError } = require('./lib/ApprovalProcessor');
+const { ShipmentProcessor, ShipmentError } = require('./lib/ShipmentProcessor');
 
 initSentry({ dsn: process.env.SENTRY_DSN, service: 'invoicing-engine' });
 
@@ -122,6 +123,9 @@ app.post('/invoicing/credentials', requireApiKey, async (req, res) => {
             defaultVatRate = 20,
             invoiceSeriesPrefix = 'A',
             shipmentIncludedDefault = false,
+            // Plan 28+/Plan 28++: belge tipi ayri ayri kontrol.
+            invoiceDraftMode = 'enabled',
+            shipmentMode = 'disabled',
             updatedBy = 'panel',
         } = req.body || {};
 
@@ -147,6 +151,8 @@ app.post('/invoicing/credentials', requireApiKey, async (req, res) => {
             defaultVatRate,
             invoiceSeriesPrefix,
             shipmentIncludedDefault: !!shipmentIncludedDefault,
+            invoiceDraftMode: ['enabled', 'disabled'].includes(invoiceDraftMode) ? invoiceDraftMode : 'enabled',
+            shipmentMode: ['disabled', 'manual', 'auto'].includes(shipmentMode) ? shipmentMode : 'disabled',
             provider: 'parasut',
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
             updatedBy: String(updatedBy),
@@ -223,6 +229,7 @@ let invoiceQueue = null;
 let invoiceWorker = null;
 let stockListener = null;
 let approvalProcessor = null;
+let shipmentProcessor = null;
 
 async function waitForRedisReady(redisClient, timeoutMs = 15000) {
     if (redisClient instanceof MemoryFallback) return false;
@@ -294,6 +301,16 @@ async function initLifecycle() {
         contextLoader: buildInvoiceContext,
     });
     console.log('[invoicing-engine] ApprovalProcessor ready (Plan 28)');
+
+    // Plan 28++: ShipmentProcessor — e-irsaliye akisi (Redis gerektirmez)
+    shipmentProcessor = new ShipmentProcessor({
+        db,
+        idempotency,
+        tokenManager,
+        providerFactory,
+        contextLoader: buildInvoiceContext,
+    });
+    console.log('[invoicing-engine] ShipmentProcessor ready (Plan 28++)');
 
     // Plan 27: BullMQ queue/worker/listener — gerçek Redis bekler
     if (redis instanceof MemoryFallback) {
@@ -497,6 +514,71 @@ app.post('/invoicing/draft/:id/approve', requireApiKey, async (req, res) => {
             });
         }
         console.error('[invoicing-engine] approve unexpected error:', e);
+        res.status(500).json({ error: 'internal_error', message: e.message });
+    }
+});
+
+// ---------------- Plan 28++ Shipment (e-irsaliye) endpoint'leri ----------------
+
+// Manual modda yetkili "İrsaliye Oluştur" basinca: Parasut'a shipment_document POST
+app.post('/invoicing/shipment/:id/create', requireApiKey, async (req, res) => {
+    if (!shipmentProcessor) {
+        return res.status(503).json({ error: 'shipment_processor_unavailable' });
+    }
+    try {
+        const result = await shipmentProcessor.create(req.params.id, req.body || {});
+        res.json(result);
+    } catch (e) {
+        if (e instanceof ShipmentError) {
+            return res.status(e.status || 500).json({
+                error: e.code || 'shipment_error',
+                message: e.message,
+                ...(e.payload ? { payload: e.payload } : {}),
+            });
+        }
+        console.error('[invoicing-engine] shipment create unexpected error:', e);
+        res.status(500).json({ error: 'internal_error', message: e.message });
+    }
+});
+
+// Yetkili kalem duzenleme (eksik fire vb.) — Parasut update + Firestore approvalMeta
+app.post('/invoicing/shipment/:id/save-edits', requireApiKey, async (req, res) => {
+    if (!shipmentProcessor) {
+        return res.status(503).json({ error: 'shipment_processor_unavailable' });
+    }
+    try {
+        const result = await shipmentProcessor.saveEdits(req.params.id, req.body || {});
+        res.json(result);
+    } catch (e) {
+        if (e instanceof ShipmentError) {
+            return res.status(e.status || 500).json({
+                error: e.code || 'shipment_error',
+                message: e.message,
+                ...(e.payload ? { payload: e.payload } : {}),
+            });
+        }
+        console.error('[invoicing-engine] shipment save-edits unexpected error:', e);
+        res.status(500).json({ error: 'internal_error', message: e.message });
+    }
+});
+
+// Yetkili "Onayla" — Firestore transaction (status='sent', inventory, stockTransfer.completed)
+app.post('/invoicing/shipment/:id/finalize', requireApiKey, async (req, res) => {
+    if (!shipmentProcessor) {
+        return res.status(503).json({ error: 'shipment_processor_unavailable' });
+    }
+    try {
+        const result = await shipmentProcessor.finalize(req.params.id, req.body || {});
+        res.json(result);
+    } catch (e) {
+        if (e instanceof ShipmentError) {
+            return res.status(e.status || 500).json({
+                error: e.code || 'shipment_error',
+                message: e.message,
+                ...(e.payload ? { payload: e.payload } : {}),
+            });
+        }
+        console.error('[invoicing-engine] shipment finalize unexpected error:', e);
         res.status(500).json({ error: 'internal_error', message: e.message });
     }
 });

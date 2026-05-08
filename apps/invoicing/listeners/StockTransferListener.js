@@ -1,19 +1,27 @@
 // ==================================================================================
 // StockTransferListener — Firestore listener: stockTransfers.status='shipped'
 // ==================================================================================
-// Plan 27 Faz 2.1, Plan 28 Faz 1.1.3, Plan 28+ (e-fatura taslak) ile guncellendi.
+// Plan 27 Faz 2.1, Plan 28 Faz 1.1.3, Plan 28+ (e-fatura taslak), Plan 28++ (e-irsaliye)
+// ile guncellendi.
+//
+// Tenant settings iki ayri mod kontrol eder:
+//   settings.invoiceDraftMode = 'enabled' (default) | 'disabled'
+//     - Plan 28+ sales_invoice draft akisi
+//   settings.shipmentMode = 'disabled' (default) | 'manual' | 'auto'
+//     - Plan 28++ shipment_document (e-irsaliye) akisi
+//     - 'manual': Firestore'da documentKind='shipment' DRAFT yaratilir, Parasut'a POST yapilmaz
+//                 (yetkili panelden "Irsaliye Olustur" basinca tetiklenir)
+//     - 'auto':   Firestore DRAFT + Parasut'a otomatik POST /shipment_documents
+//
 // Yeni shipped doc gelince:
 //   1. Tenant settings yukle (invoicingCredentials/{tenantId}/providers/parasut)
 //   2. isEnabled false -> skip
-//   3. IdempotencyService ile invoiceDocuments draft olustur (race-safe)
-//   4. **Plan 28+**: Eger providerFactory + tokenManager + contextLoader verilmisse,
-//      Parasut'e dogrudan taslak sales_invoice POST eder (e-belge degil, GİB'e gitmez)
-//      ve parasutInvoiceId + parasutPdfUrl alanlarini Firestore'a yazar.
-//      Sevkiyatci PDF link'ini hemen alabilsin diye. Hata olursa sessizce devam eder
-//      (yetkili onay aninda eski createInvoice yolu fallback olarak calisir).
+//   3. invoiceDraftMode != 'disabled' ise: invoice DRAFT + (Plan 28+ taslak fatura POST)
+//   4. shipmentMode != 'disabled' ise: shipment DRAFT + (auto modda shipment_document POST)
 //   5. stockTransfer dok'una parasutQueued=true yaz (re-process onle)
-// Plan 28: 'auto' modda dahi otomatik KUYRUGA ALMAZ. Yetkili panelden onaylayinca
-// engine /invoicing/draft/:id/approve endpoint'i tetiklenir.
+//
+// Plan 28: invoice akisinda 'auto' modda dahi otomatik KUYRUGA ALMAZ. Yetkili panelden
+// onaylayinca engine /invoicing/draft/:id/approve endpoint'i tetiklenir.
 // ==================================================================================
 
 class StockTransferListener {
@@ -128,42 +136,91 @@ class StockTransferListener {
             targetBranchName: transfer.targetBranchName || null,
         };
 
-        // Create draft via idempotency service
-        const result = await this.idempotency.ensureDraft({
-            tenantId,
-            sourceType: 'stockTransfer',
-            sourceId: transferId,
-            data: {
-                branchId: transfer.destinationBranchId || transfer.targetBranchId || transfer.branchId,
-                provider: 'parasut',
-                sourceTransferNumber: transfer.transferNumber || transfer.code,
-                amount: transfer.totalAmount || 0,
-                currency: transfer.currency || 'TRL',
-                documentType: settings.defaultDocumentType || 'sales_invoice',
-                shipmentIncluded: !!settings.shipmentIncludedDefault,
-                items: itemsSnapshot,
-                shipmentMeta,
-            },
-        });
+        const baseDraftData = {
+            branchId: transfer.destinationBranchId || transfer.targetBranchId || transfer.branchId,
+            provider: 'parasut',
+            sourceTransferNumber: transfer.transferNumber || transfer.code,
+            amount: transfer.totalAmount || 0,
+            currency: transfer.currency || 'TRL',
+            documentType: settings.defaultDocumentType || 'sales_invoice',
+            shipmentIncluded: !!settings.shipmentIncludedDefault,
+            items: itemsSnapshot,
+            shipmentMeta,
+        };
 
-        // Mark transfer as queued (whether new or existing)
+        const invoiceDraftMode = settings.invoiceDraftMode || 'enabled';
+        // Plan 28++: shipmentMode default 'disabled' — geriye uyumluluk (mevcut tenant'lar etkilenmez).
+        const shipmentMode = settings.shipmentMode || 'disabled';
+
+        let invoiceDocId = null;
+        let invoiceResult = null;
+        let shipmentDocId = null;
+        let shipmentResult = null;
+
+        // Plan 28+ — sales_invoice (fatura) DRAFT akisi
+        if (invoiceDraftMode !== 'disabled') {
+            invoiceResult = await this.idempotency.ensureDraft({
+                tenantId,
+                sourceType: 'stockTransfer',
+                sourceId: transferId,
+                documentKind: 'invoice',
+                data: baseDraftData,
+            });
+            invoiceDocId = invoiceResult.id;
+        }
+
+        // Plan 28++ — shipment_document (e-irsaliye) DRAFT akisi
+        if (shipmentMode !== 'disabled') {
+            shipmentResult = await this.idempotency.ensureDraft({
+                tenantId,
+                sourceType: 'stockTransfer',
+                sourceId: transferId,
+                documentKind: 'shipment',
+                data: baseDraftData,
+            });
+            shipmentDocId = shipmentResult.id;
+        }
+
+        // Mark transfer as queued (whether new or existing). parasutDocumentId
+        // ile invoice doc'unu, parasutShipmentDocumentId ile shipment doc'unu referansla.
         try {
-            await docSnap.ref.update({ parasutQueued: true, parasutDocumentId: result.id });
+            const update = { parasutQueued: true };
+            if (invoiceDocId) update.parasutDocumentId = invoiceDocId;
+            if (shipmentDocId) update.parasutShipmentDocumentId = shipmentDocId;
+            await docSnap.ref.update(update);
         } catch (e) {
             console.warn(`[StockTransferListener] could not mark transfer ${transferId} as queued:`, e.message);
         }
 
-        // Plan 28+: Yeni yaratilan draft icin Parasut'e taslak sales_invoice POST et.
-        // Mevcut belge ise (existing=true) atla — onceden taslak Parasut'te var demek.
+        // Plan 28+: Yeni yaratilan invoice draft icin Parasut'e taslak sales_invoice POST et.
         if (
-            result.existing === false &&
+            invoiceResult &&
+            invoiceResult.existing === false &&
             this.providerFactory &&
             this.tokenManager &&
             this.contextLoader
         ) {
             await this._tryCreateParasutDraft({
                 tenantId,
-                docId: result.id,
+                docId: invoiceResult.id,
+                transferId,
+                transfer,
+            });
+        }
+
+        // Plan 28++: 'auto' modda yeni shipment draft icin Parasut'a POST /shipment_documents.
+        // 'manual' modda Firestore'da DRAFT olarak kalir, yetkili panelden tetikler.
+        if (
+            shipmentResult &&
+            shipmentResult.existing === false &&
+            shipmentMode === 'auto' &&
+            this.providerFactory &&
+            this.tokenManager &&
+            this.contextLoader
+        ) {
+            await this._tryCreateParasutShipment({
+                tenantId,
+                docId: shipmentResult.id,
                 transferId,
                 transfer,
             });
@@ -172,6 +229,101 @@ class StockTransferListener {
         // Plan 28: auto-enqueue intentionally removed.
         // Owner approval (panel "Onayla" -> POST /invoicing/draft/:id/approve)
         // is now the sole trigger for Parasut finalization (convert_to_invoice).
+    }
+
+    /**
+     * Plan 28++ — 'auto' modda Parasut'a shipment_document POST eder.
+     * 'manual' modda CALMAZ — yetkili panelden tetiklenir.
+     * Hata olursa sessizce devam eder (audit'e parasut_shipment_failed yazilir).
+     */
+    async _tryCreateParasutShipment({ tenantId, docId, transferId, transfer }) {
+        try {
+            const provider = await this.providerFactory(tenantId);
+            const token = await this.tokenManager.getValidToken(tenantId);
+            const ctx = await this.contextLoader(tenantId, {
+                tenantId,
+                sourceType: 'stockTransfer',
+                sourceId: transferId,
+                branchId: transfer.destinationBranchId || transfer.targetBranchId || transfer.branchId,
+            });
+
+            // Contact upsert (alici sube)
+            const contact = await provider.upsertContact(token, {
+                ...ctx.branch,
+                id: ctx.branch.id || transfer.destinationBranchId || transfer.targetBranchId,
+            });
+
+            // Product upsert (kalemleri Parasut'a tani)
+            const itemsWithProductIds = [];
+            for (const it of (ctx.items || [])) {
+                if (!it.quantity || it.quantity <= 0) continue;
+                const p = await provider.upsertProduct(token, {
+                    name: it.productName || it.name,
+                    sku: it.productId || it.sku,
+                    unit: it.unit,
+                    vatRate: it.vatRate,
+                });
+                itemsWithProductIds.push({
+                    productId: p.productId,
+                    name: it.productName || it.name,
+                    description: it.productName || it.name,
+                    quantity: it.quantity,
+                    unitPrice: it.unitPrice,
+                    vatRate: it.vatRate,
+                });
+            }
+
+            if (itemsWithProductIds.length === 0) {
+                console.warn(`[StockTransferListener] doc ${docId} has 0 valid items for Parasut shipment — skipping POST`);
+                return;
+            }
+
+            const shipmentDate = transfer.shippedAt
+                ? (typeof transfer.shippedAt.toDate === 'function'
+                    ? transfer.shippedAt.toDate().toISOString()
+                    : new Date(transfer.shippedAt).toISOString())
+                : new Date().toISOString();
+
+            const shipment = await provider.createShipmentDocument(token, {
+                contactId: contact.contactId,
+                items: itemsWithProductIds,
+                issueDate: ctx.issueDate,
+                shipmentDate,
+                description: ctx.description,
+                address: ctx.branch && ctx.branch.address,
+                city: ctx.branch && ctx.branch.city,
+                district: ctx.branch && ctx.branch.district,
+                procurementNumber: transfer.transferNumber || transfer.code,
+                inflow: false,
+            });
+
+            await this.idempotency.update(docId, {
+                parasutShipmentId: shipment.providerShipmentId,
+                parasutShipmentNumber: shipment.shipmentNumber,
+                parasutContactId: contact.contactId,
+                pdfUrl: shipment.pdfUrl,
+                parasutShipmentCreatedAt: Date.now(),
+            });
+            await this.idempotency.appendAudit(docId, 'parasut_shipment_created', 'listener', {
+                parasutShipmentId: shipment.providerShipmentId,
+                items: itemsWithProductIds.length,
+            }).catch(() => {});
+
+            console.log(`[StockTransferListener] Parasut shipment created for ${docId} -> parasutShipmentId=${shipment.providerShipmentId}`);
+        } catch (e) {
+            console.warn(`[StockTransferListener] Parasut shipment create FAILED for ${docId}: ${e.reqMethod || ''} ${e.reqUrl || ''} -> ${e.status} ${e.message} (code=${e.code || '?'})`);
+            if (e.providerPayload) {
+                console.warn(`[StockTransferListener]   Parasut payload:`, JSON.stringify(e.providerPayload).slice(0, 800));
+            }
+            await this.idempotency.appendAudit(docId, 'parasut_shipment_failed', 'listener', {
+                error: e.message,
+                code: e.code,
+                status: e.status,
+                reqUrl: e.reqUrl,
+                reqMethod: e.reqMethod,
+                providerPayload: e.providerPayload ? JSON.stringify(e.providerPayload).slice(0, 1000) : null,
+            }).catch(() => {});
+        }
     }
 
     async _tryCreateParasutDraft({ tenantId, docId, transferId, transfer }) {
