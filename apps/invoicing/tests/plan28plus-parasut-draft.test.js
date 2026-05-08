@@ -72,7 +72,12 @@ describe('Plan 28+ ParasutProvider draft akisi', () => {
         expect(salesPostBody.data.attributes.shipment_included).toBe(true);
         expect(salesPostBody.data.attributes.order_no).toBe('ST-1');
         expect(salesPostBody.data.relationships.contact.data.id).toBe('C1');
-        expect(salesPostBody.included).toHaveLength(1);
+        // Parasut JSON:API: detaylar 'included' yerine direkt relationships.details.data icine gomulu
+        expect(salesPostBody.included).toBeUndefined();
+        expect(salesPostBody.data.relationships.details.data).toHaveLength(1);
+        expect(salesPostBody.data.relationships.details.data[0].type).toBe('sales_invoice_details');
+        expect(salesPostBody.data.relationships.details.data[0].attributes.quantity).toBe(100);
+        expect(salesPostBody.data.relationships.details.data[0].relationships.product.data.id).toBe('P1');
     });
 
     test('createDraftInvoice -> 422 -> InvoiceProviderError POST_FAILED', async () => {
@@ -110,7 +115,8 @@ describe('Plan 28+ ParasutProvider draft akisi', () => {
         expect(r.providerInvoiceId).toBe('111');
         expect(putBody.data.id).toBe('111');
         expect(putBody.data.attributes.description).toBe('Eksilen 5 paket fire');
-        expect(putBody.included[0].attributes.quantity).toBe(95);
+        expect(putBody.included).toBeUndefined();
+        expect(putBody.data.relationships.details.data[0].attributes.quantity).toBe(95);
     });
 
     test('finalizeInvoice -> POST /convert_to_invoice + GET ile e_doc cek', async () => {

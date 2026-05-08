@@ -202,15 +202,11 @@ class ParasutProvider {
             throw new InvoiceProviderError('items required', { code: 'INVOICE_NO_ITEMS' });
         }
 
-        const detailsAttributes = items.map((it) => ({
-            quantity: it.quantity,
-            unit_price: it.unitPrice,
-            vat_rate: typeof it.vatRate === 'number' ? it.vatRate : 20,
-            description: it.description || it.name || '',
-        }));
-        const detailsRelationship = items.map((it, i) => ({
+        // Parasut JSON:API beklentisi: details_inline (id YOK, included YOK, dogrudan
+        // relationships.details.data icine gomulu). 404 "Record was not found:
+        // SalesInvoiceDetail" hatasi temp-X id'leri yuzunden olusuyordu.
+        const details = items.map((it) => ({
             type: 'sales_invoice_details',
-            id: `temp-${i}`,
             attributes: {
                 quantity: it.quantity,
                 unit_price: it.unitPrice,
@@ -235,10 +231,9 @@ class ParasutProvider {
                 },
                 relationships: {
                     contact: { data: { type: 'contacts', id: String(contactId) } },
-                    details: { data: detailsRelationship.map((d) => ({ type: d.type, id: d.id })) },
+                    details: { data: details },
                 },
             },
-            included: detailsRelationship,
         };
 
         const created = await this._post(token, '/sales_invoices?include=active_e_document', body);
@@ -294,9 +289,8 @@ class ParasutProvider {
             throw new InvoiceProviderError('items required', { code: 'INVOICE_NO_ITEMS' });
         }
 
-        const detailsRelationship = items.map((it, i) => ({
+        const details = items.map((it) => ({
             type: 'sales_invoice_details',
-            id: `temp-${i}`,
             attributes: {
                 quantity: it.quantity,
                 unit_price: it.unitPrice,
@@ -325,10 +319,9 @@ class ParasutProvider {
                 attributes,
                 relationships: {
                     contact: { data: { type: 'contacts', id: String(contactId) } },
-                    details: { data: detailsRelationship.map((d) => ({ type: d.type, id: d.id })) },
+                    details: { data: details },
                 },
             },
-            included: detailsRelationship,
         };
 
         const created = await this._post(token, '/sales_invoices', body);
@@ -372,9 +365,8 @@ class ParasutProvider {
         };
 
         if (Array.isArray(items)) {
-            const detailsRelationship = items.map((it, i) => ({
+            const details = items.map((it) => ({
                 type: 'sales_invoice_details',
-                id: `temp-${i}`,
                 attributes: {
                     quantity: it.quantity,
                     unit_price: it.unitPrice,
@@ -386,9 +378,8 @@ class ParasutProvider {
                 },
             }));
             body.data.relationships = {
-                details: { data: detailsRelationship.map((d) => ({ type: d.type, id: d.id })) },
+                details: { data: details },
             };
-            body.included = detailsRelationship;
         }
 
         const updated = await this._put(token, `/sales_invoices/${providerInvoiceId}`, body);
