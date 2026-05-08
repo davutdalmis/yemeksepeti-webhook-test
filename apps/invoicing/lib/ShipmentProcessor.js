@@ -17,6 +17,19 @@
 
 const { applyMovement, makeEmptyAggregate } = require('./InventoryAggregator');
 
+/** Firestore Timestamp / ms / Date / null -> ms (Plan 28++ Date(Invalid) bugfix) */
+function tsToMs(v) {
+    if (v == null) return Date.now();
+    if (typeof v === 'number') return v;
+    if (v instanceof Date) return v.getTime();
+    if (typeof v === 'object') {
+        if (typeof v.toMillis === 'function') return v.toMillis();
+        if (typeof v._seconds === 'number') return v._seconds * 1000 + Math.floor((v._nanoseconds || 0) / 1e6);
+        if (typeof v.seconds === 'number') return v.seconds * 1000 + Math.floor((v.nanoseconds || 0) / 1e6);
+    }
+    return Date.now();
+}
+
 class ShipmentError extends Error {
     constructor(message, { status = 500, code, payload } = {}) {
         super(message);
@@ -117,9 +130,7 @@ class ShipmentProcessor {
                 contactId: contact.contactId,
                 items: itemsWithProductIds,
                 issueDate: ctx.issueDate,
-                shipmentDate: doc.shipmentMeta && doc.shipmentMeta.shippedAt
-                    ? new Date(doc.shipmentMeta.shippedAt).toISOString()
-                    : new Date().toISOString(),
+                shipmentDate: new Date(tsToMs(doc.shipmentMeta && doc.shipmentMeta.shippedAt)).toISOString(),
                 description: ctx.description,
                 address: ctx.branch && ctx.branch.address,
                 city: ctx.branch && ctx.branch.city,

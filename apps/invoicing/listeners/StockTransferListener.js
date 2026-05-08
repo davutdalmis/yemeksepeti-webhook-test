@@ -24,6 +24,23 @@
 // onaylayinca engine /invoicing/draft/:id/approve endpoint'i tetiklenir.
 // ==================================================================================
 
+/**
+ * Firestore Timestamp / ms / Date / null degerlerini guvenle ms'e cevirir.
+ * Plan 28++: shipped_at gibi alanlar `firestore.SERVER_TIMESTAMP` ile yazildigi zaman
+ * Timestamp objesi olur; downstream'da new Date(ts).toISOString() Invalid Date verir.
+ */
+function tsToMs(v) {
+    if (v == null) return Date.now();
+    if (typeof v === 'number') return v;
+    if (v instanceof Date) return v.getTime();
+    if (typeof v === 'object') {
+        if (typeof v.toMillis === 'function') return v.toMillis();
+        if (typeof v._seconds === 'number') return v._seconds * 1000 + Math.floor((v._nanoseconds || 0) / 1e6);
+        if (typeof v.seconds === 'number') return v.seconds * 1000 + Math.floor((v.nanoseconds || 0) / 1e6);
+    }
+    return Date.now();
+}
+
 class StockTransferListener {
     /**
      * @param {object} deps
@@ -128,8 +145,9 @@ class StockTransferListener {
             : [];
 
         // Plan 28: shipmentMeta — sevkiyat zamanindaki bilgiler.
+        // Plan 28++: Timestamp -> ms cevrim, downstream'da Date(ts).toISOString() ile patlamasin.
         const shipmentMeta = {
-            shippedAt: transfer.shippedAt || Date.now(),
+            shippedAt: tsToMs(transfer.shippedAt),
             shippedBy: transfer.preparedBy || transfer.shippedBy || null,
             sourceBranchId: transfer.sourceBranchId || null,
             targetBranchId: transfer.destinationBranchId || transfer.targetBranchId || transfer.branchId || null,
@@ -278,11 +296,7 @@ class StockTransferListener {
                 return;
             }
 
-            const shipmentDate = transfer.shippedAt
-                ? (typeof transfer.shippedAt.toDate === 'function'
-                    ? transfer.shippedAt.toDate().toISOString()
-                    : new Date(transfer.shippedAt).toISOString())
-                : new Date().toISOString();
+            const shipmentDate = new Date(tsToMs(transfer.shippedAt)).toISOString();
 
             const shipment = await provider.createShipmentDocument(token, {
                 contactId: contact.contactId,
