@@ -131,9 +131,12 @@ class ParasutProvider {
                 type: 'contacts',
                 attributes: {
                     name: branch.name || branch.branchName || 'Sube',
+                    // account_type Parasut'ta ZORUNLU (sadece 'customer' | 'supplier').
+                    // Sube faturalanan taraf oldugu icin daima 'customer'.
+                    account_type: 'customer',
+                    contact_type: taxNo ? 'company' : 'person',
                     tax_number: taxNo || '',
                     tax_office: branch.taxOffice || '',
-                    contact_type: 'company',
                     address: branch.address || '',
                     city: branch.city || '',
                     district: branch.district || '',
