@@ -192,33 +192,78 @@ class ApprovalProcessor {
             }));
 
         let parasutResult = null;
+        // Plan 28+: Eger listener Parasut'a taslak yazmissa (doc.parasutInvoiceId var),
+        // updateDraftInvoice + finalizeInvoice (convert_to_invoice) yolu kullanilir.
+        // Yoksa eski tek-atis createInvoice yolu (geriye uyumlu).
+        const useExistingDraft = !!doc.parasutInvoiceId;
+
         try {
             const token = await this.tokenManager.getValidToken(tenantId);
-            const contact = await provider.upsertContact(token, ctx.branch);
-            const itemsWithProductIds = [];
-            for (const it of items4Parasut) {
-                const p = await provider.upsertProduct(token, it);
-                itemsWithProductIds.push({ ...it, productId: p.productId });
+
+            if (useExistingDraft) {
+                // YOL A — Plan 28+ iki asamali: mevcut taslagi guncelle + resmilestir
+                // Edits varsa kalem degisiklikleri taslakta da olsun.
+                if (Array.isArray(items4Parasut) && items4Parasut.length > 0) {
+                    const itemsWithProductIds = [];
+                    for (const it of items4Parasut) {
+                        const p = await provider.upsertProduct(token, it);
+                        itemsWithProductIds.push({ ...it, productId: p.productId });
+                    }
+                    try {
+                        await provider.updateDraftInvoice(token, doc.parasutInvoiceId, {
+                            items: itemsWithProductIds,
+                            description: ctx.description,
+                            shipmentIncluded: !!ctx.shipmentIncluded,
+                            issueDate: ctx.issueDate,
+                        });
+                    } catch (updErr) {
+                        console.warn(`[ApprovalProcessor] updateDraftInvoice fail (devam): ${updErr.message}`);
+                    }
+                }
+
+                // Resmilestir — convert_to_invoice
+                // documentType su an kullanmiyoruz; Parasut alici VKN'sine gore
+                // otomatik e_invoice (B2B) veya e_archive (B2C) secer. Ileride
+                // ctx.documentType'dan zorlanabilir.
+                const finalize = await provider.finalizeInvoice(token, doc.parasutInvoiceId, {});
+                parasutResult = {
+                    providerInvoiceId: finalize.providerInvoiceId,
+                    contactId: doc.parasutContactId || null,
+                    invoiceNumber: finalize.invoiceNumber,
+                    pdfUrl: finalize.pdfUrl,
+                    eArchiveId: finalize.eDocType === 'e_archive' ? finalize.eDocId : null,
+                    eInvoiceId: finalize.eDocType === 'e_invoice' ? finalize.eDocId : null,
+                    eDocType: finalize.eDocType,
+                };
+            } else {
+                // YOL B — Eski tek-atis (geriye uyumlu): listener Parasut'a yazmamissa
+                const contact = await provider.upsertContact(token, ctx.branch);
+                const itemsWithProductIds = [];
+                for (const it of items4Parasut) {
+                    const p = await provider.upsertProduct(token, it);
+                    itemsWithProductIds.push({ ...it, productId: p.productId });
+                }
+                parasutResult = await provider.createInvoice(token, {
+                    contactId: contact.contactId,
+                    items: itemsWithProductIds.length > 0 ? itemsWithProductIds : [{
+                        // Tum kalemler 0 ise (rare): tek bir "amount" kaydi olusturma
+                        name: doc.sourceTransferNumber || doc.sourceId || 'Sevkiyat',
+                        productName: doc.sourceTransferNumber || 'Sevkiyat',
+                        sku: doc.sourceId || documentId,
+                        quantity: 1,
+                        unitPrice: Number(doc.amount || 0),
+                        vatRate: ctx.defaultVatRate || 20,
+                        unit: 'Adet',
+                    }],
+                    currency: ctx.currency || 'TRL',
+                    issueDate: ctx.issueDate || new Date().toISOString().slice(0, 10),
+                    shipmentIncluded: !!ctx.shipmentIncluded,
+                    documentType: 'e_archive',
+                    description: ctx.description,
+                    invoiceSeries: ctx.invoiceSeriesPrefix,
+                });
+                parasutResult.contactId = contact.contactId;
             }
-            parasutResult = await provider.createInvoice(token, {
-                contactId: contact.contactId,
-                items: itemsWithProductIds.length > 0 ? itemsWithProductIds : [{
-                    // Tum kalemler 0 ise (rare): tek bir "amount" kaydi olusturma
-                    name: doc.sourceTransferNumber || doc.sourceId || 'Sevkiyat',
-                    productName: doc.sourceTransferNumber || 'Sevkiyat',
-                    sku: doc.sourceId || documentId,
-                    quantity: 1,
-                    unitPrice: Number(doc.amount || 0),
-                    vatRate: ctx.defaultVatRate || 20,
-                    unit: 'Adet',
-                }],
-                currency: ctx.currency || 'TRL',
-                issueDate: ctx.issueDate || new Date().toISOString().slice(0, 10),
-                shipmentIncluded: !!ctx.shipmentIncluded,
-                documentType: 'e_archive',
-                description: ctx.description,
-                invoiceSeries: ctx.invoiceSeriesPrefix,
-            });
         } catch (e) {
             // Paraşüt başarısız → status'u geri pending_approval'a çek + audit
             await this.idempotency.update(documentId, {
@@ -268,8 +313,10 @@ class ApprovalProcessor {
                 txn.update(docRef, {
                     status: 'sent',
                     parasutInvoiceId: parasutResult.providerInvoiceId,
-                    parasutEArchiveId: parasutResult.eArchiveId,
-                    parasutContactId: parasutResult.contactId,
+                    parasutEArchiveId: parasutResult.eArchiveId || null,
+                    parasutEInvoiceId: parasutResult.eInvoiceId || null,
+                    parasutEDocType: parasutResult.eDocType || (parasutResult.eArchiveId ? 'e_archive' : null),
+                    parasutContactId: parasutResult.contactId || null,
                     invoiceNumber: parasutResult.invoiceNumber,
                     pdfUrl: parasutResult.pdfUrl,
                     updatedAt: ts,
@@ -411,14 +458,19 @@ class ApprovalProcessor {
 
         await this.idempotency.appendAudit(documentId, 'sent', 'invoicing-engine', {
             parasutInvoiceId: parasutResult.providerInvoiceId,
-            eArchiveId: parasutResult.eArchiveId,
+            eArchiveId: parasutResult.eArchiveId || null,
+            eInvoiceId: parasutResult.eInvoiceId || null,
+            eDocType: parasutResult.eDocType || (parasutResult.eArchiveId ? 'e_archive' : null),
+            twoPhase: !!useExistingDraft,
             fireTotal,
         });
 
         return {
             ok: true,
             parasutInvoiceId: parasutResult.providerInvoiceId,
-            eArchiveId: parasutResult.eArchiveId,
+            eArchiveId: parasutResult.eArchiveId || null,
+            eInvoiceId: parasutResult.eInvoiceId || null,
+            eDocType: parasutResult.eDocType || (parasutResult.eArchiveId ? 'e_archive' : null),
             invoiceNumber: parasutResult.invoiceNumber,
             fireQuantityTotal: fireTotal,
             pdfUrl: parasutResult.pdfUrl,

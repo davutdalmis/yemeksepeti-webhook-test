@@ -263,9 +263,16 @@ async function initRedisDependentLifecycle() {
             idempotency,
             queue: invoiceQueue,
             settingsLoader: loadParasutSettings,
+            // Plan 28+: listener'a Parasut taslak yazma yetenegi.
+            // Default acik; INVOICING_PARASUT_DRAFT_DISABLED=true ile devre disi birakilabilir
+            // (dev/staging icin).
+            providerFactory: process.env.INVOICING_PARASUT_DRAFT_DISABLED === 'true' ? null : providerFactory,
+            tokenManager: process.env.INVOICING_PARASUT_DRAFT_DISABLED === 'true' ? null : tokenManager,
+            contextLoader: process.env.INVOICING_PARASUT_DRAFT_DISABLED === 'true' ? null : buildInvoiceContext,
         });
         stockListener.start();
-        console.log('[invoicing-engine] Plan 27 lifecycle ready (queue+worker+listener active)');
+        const draftMode = process.env.INVOICING_PARASUT_DRAFT_DISABLED === 'true' ? 'firestore-only' : 'parasut-draft-enabled';
+        console.log(`[invoicing-engine] Plan 27 lifecycle ready (queue+worker+listener active, draft mode: ${draftMode})`);
     } else {
         console.log('[invoicing-engine] Plan 27 lifecycle ready (queue+worker active; listener disabled, set INVOICING_LISTENER_ENABLED=true)');
     }

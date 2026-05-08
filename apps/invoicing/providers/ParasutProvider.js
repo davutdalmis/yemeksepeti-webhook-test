@@ -268,6 +268,221 @@ class ParasutProvider {
         return result;
     }
 
+    /**
+     * Plan 28+ — sadece taslak sales_invoice yaratir (e-belge YOK).
+     * Donus: { providerInvoiceId, invoiceNumber, pdfUrl }
+     * Yetkili sonra updateDraftInvoice ile duzeltir, finalizeInvoice ile resmilestirir.
+     */
+    async createDraftInvoice(token, payload) {
+        const {
+            contactId,
+            items,
+            currency = 'TRL',
+            issueDate,
+            invoiceSeries,
+            description,
+            shipmentIncluded = false,
+            orderNo,
+            orderDate,
+        } = payload;
+
+        if (!contactId) throw new InvoiceProviderError('contactId required', { code: 'INVOICE_NO_CONTACT' });
+        if (!Array.isArray(items) || items.length === 0) {
+            throw new InvoiceProviderError('items required', { code: 'INVOICE_NO_ITEMS' });
+        }
+
+        const detailsRelationship = items.map((it, i) => ({
+            type: 'sales_invoice_details',
+            id: `temp-${i}`,
+            attributes: {
+                quantity: it.quantity,
+                unit_price: it.unitPrice,
+                vat_rate: typeof it.vatRate === 'number' ? it.vatRate : 20,
+                description: it.description || it.name || '',
+            },
+            relationships: {
+                product: { data: { type: 'products', id: String(it.productId) } },
+            },
+        }));
+
+        const attributes = {
+            item_type: 'invoice',
+            description: description || '',
+            issue_date: issueDate || new Date().toISOString().slice(0, 10),
+            invoice_series: invoiceSeries || 'A',
+            currency,
+            shipment_included: shipmentIncluded,
+        };
+        if (orderNo) attributes.order_no = orderNo;
+        if (orderDate) attributes.order_date = orderDate;
+
+        const body = {
+            data: {
+                type: 'sales_invoices',
+                attributes,
+                relationships: {
+                    contact: { data: { type: 'contacts', id: String(contactId) } },
+                    details: { data: detailsRelationship.map((d) => ({ type: d.type, id: d.id })) },
+                },
+            },
+            included: detailsRelationship,
+        };
+
+        const created = await this._post(token, '/sales_invoices', body);
+        if (!created || !created.data || !created.data.id) {
+            throw new InvoiceProviderError('Draft invoice create returned no id', { code: 'INVOICE_CREATE_NO_ID' });
+        }
+
+        return {
+            providerInvoiceId: String(created.data.id),
+            invoiceNumber: created.data.attributes && created.data.attributes.invoice_no,
+            pdfUrl: this._extractSalesInvoicePdfUrl(created),
+        };
+    }
+
+    /**
+     * Plan 28+ — taslak sales_invoice icindeki kalemleri/aciklamayi guncelle.
+     * Sadece taslak (resmilesmemis) belgelerde calisir; e-fatura/e-arsiv olmus
+     * belgelerde Parasut PUT'u reddeder, cancel + recreate gerek.
+     *
+     * Bu impl PATCH semantik degil, full replace: tum kalemleri yeniden yazar.
+     */
+    async updateDraftInvoice(token, providerInvoiceId, payload) {
+        const {
+            items,
+            description,
+            shipmentIncluded,
+            issueDate,
+        } = payload;
+
+        const attributes = {};
+        if (description != null) attributes.description = description;
+        if (shipmentIncluded != null) attributes.shipment_included = !!shipmentIncluded;
+        if (issueDate) attributes.issue_date = issueDate;
+
+        const body = {
+            data: {
+                id: String(providerInvoiceId),
+                type: 'sales_invoices',
+                attributes,
+            },
+        };
+
+        if (Array.isArray(items)) {
+            const detailsRelationship = items.map((it, i) => ({
+                type: 'sales_invoice_details',
+                id: `temp-${i}`,
+                attributes: {
+                    quantity: it.quantity,
+                    unit_price: it.unitPrice,
+                    vat_rate: typeof it.vatRate === 'number' ? it.vatRate : 20,
+                    description: it.description || it.name || '',
+                },
+                relationships: {
+                    product: { data: { type: 'products', id: String(it.productId) } },
+                },
+            }));
+            body.data.relationships = {
+                details: { data: detailsRelationship.map((d) => ({ type: d.type, id: d.id })) },
+            };
+            body.included = detailsRelationship;
+        }
+
+        const updated = await this._put(token, `/sales_invoices/${providerInvoiceId}`, body);
+        if (!updated || !updated.data || !updated.data.id) {
+            throw new InvoiceProviderError('Draft invoice update returned no id', { code: 'INVOICE_UPDATE_NO_ID' });
+        }
+        return {
+            providerInvoiceId: String(updated.data.id),
+            invoiceNumber: updated.data.attributes && updated.data.attributes.invoice_no,
+            pdfUrl: this._extractSalesInvoicePdfUrl(updated),
+        };
+    }
+
+    /**
+     * Plan 28+ — taslak sales_invoice'i resmi e-fatura veya e-arsiv'e cevirir.
+     * Parasut /sales_invoices/{id}/convert_to_invoice endpoint'i.
+     * VKN durumuna gore Parasut otomatik e_invoice (B2B) veya e_archive (B2C) secer.
+     *
+     * @param {string} providerInvoiceId taslak sales_invoice ID
+     * @param {object} [opts]
+     * @param {string} [opts.documentType] 'e_invoice' | 'e_archive' (Yemigo'nun zorlamak istedigi tip)
+     * @param {object} [opts.eInvoiceAttrs] e-fatura icin GİB attribute'lari (scenario, to_phase)
+     * @param {object} [opts.eArchiveAttrs] e-arsiv icin attribute'lar (vat_withholding_code, internet_sale)
+     * @returns {Promise<{providerInvoiceId, eDocId, eDocType, pdfUrl, invoiceNumber}>}
+     */
+    async finalizeInvoice(token, providerInvoiceId, opts = {}) {
+        const { documentType, eInvoiceAttrs = {}, eArchiveAttrs = {} } = opts;
+        const body = {
+            data: {
+                type: 'sales_invoices',
+                attributes: {},
+            },
+        };
+        if (documentType === 'e_invoice') {
+            body.data.attributes.scenario = eInvoiceAttrs.scenario || 'temel_fatura';
+            body.data.attributes.to_phase = eInvoiceAttrs.to_phase || null;
+            if (eInvoiceAttrs.invoice_note) body.data.attributes.invoice_note = eInvoiceAttrs.invoice_note;
+        } else if (documentType === 'e_archive') {
+            const internetSale = eArchiveAttrs.internet_sale || {};
+            body.data.attributes.vat_withholding_code = eArchiveAttrs.vat_withholding_code || '';
+            body.data.attributes.internet_sale = {
+                url: internetSale.url || '',
+                payment_type: internetSale.payment_type || 'KREDIKARTI/BANKAKARTI',
+                payment_platform: internetSale.payment_platform || 'SISTEM',
+                payment_date: internetSale.payment_date || new Date().toISOString().slice(0, 10),
+            };
+        }
+
+        const result = await this._post(token, `/sales_invoices/${providerInvoiceId}/convert_to_invoice`, body);
+        if (!result || !result.data || !result.data.id) {
+            throw new InvoiceProviderError('Finalize returned no id', { code: 'FINALIZE_NO_ID' });
+        }
+
+        // Resmi belge ID'yi cek
+        const fresh = await this._get(token, `/sales_invoices/${providerInvoiceId}?include=active_e_document`);
+        let eDocId = null;
+        let eDocType = null;
+        if (fresh && Array.isArray(fresh.included)) {
+            const eDoc = fresh.included.find((x) => x.type === 'e_archives' || x.type === 'e_invoices');
+            if (eDoc) {
+                eDocId = String(eDoc.id);
+                eDocType = eDoc.type === 'e_invoices' ? 'e_invoice' : 'e_archive';
+            }
+        }
+
+        return {
+            providerInvoiceId: String(result.data.id),
+            eDocId,
+            eDocType,
+            pdfUrl: this._extractPdfUrl(fresh) || this._extractSalesInvoicePdfUrl(fresh),
+            invoiceNumber: result.data.attributes && result.data.attributes.invoice_no,
+        };
+    }
+
+    /**
+     * Plan 28+ — Aliciyi e-fatura mukellefi mi diye sorgular.
+     * VKN/TCKN bazli e-fatura inbox arar; bulunursa B2B (e_invoice), bulunmazsa B2C (e_archive).
+     *
+     * @returns {Promise<{registered: boolean, alias?: string, type?: string}>}
+     */
+    async checkVknInbox(token, vkn) {
+        if (!vkn) return { registered: false };
+        try {
+            const data = await this._get(token, `/e_invoice_inboxes?filter[vkn]=${encodeURIComponent(vkn)}`);
+            const items = (data && Array.isArray(data.data)) ? data.data : [];
+            if (items.length === 0) return { registered: false };
+            const first = items[0];
+            return {
+                registered: true,
+                alias: first.attributes && (first.attributes.email_address || first.attributes.alias),
+                type: first.attributes && first.attributes.address_type,
+            };
+        } catch (_e) {
+            return { registered: false };
+        }
+    }
+
     async getDocument(token, providerInvoiceId) {
         const data = await this._get(token, `/sales_invoices/${providerInvoiceId}?include=active_e_document`);
         if (!data || !data.data) {
@@ -326,6 +541,23 @@ class ParasutProvider {
         }
     }
 
+    async _put(token, suffix, body) {
+        const url = `${this.baseUrl}${this._basePath(suffix)}`;
+        try {
+            const { data } = await axios.put(url, body, {
+                headers: {
+                    Authorization: `Bearer ${token}`,
+                    'Content-Type': 'application/json',
+                    Accept: 'application/json',
+                },
+                timeout: this.timeoutMs,
+            });
+            return data;
+        } catch (err) {
+            throw this._wrap(err, 'PUT_FAILED');
+        }
+    }
+
     async _delete(token, suffix) {
         const url = `${this.baseUrl}${this._basePath(suffix)}`;
         try {
@@ -346,6 +578,17 @@ class ParasutProvider {
             return eDoc.attributes.printable_html_url || eDoc.attributes.url || null;
         }
         return null;
+    }
+
+    /**
+     * Plan 28+ — Taslak sales_invoice PDF link'i (henuz e-belge olmadan).
+     * Parasut sales_invoice attribute'larinda preview/printable url donulebilir;
+     * yoksa null doner ve panel/WPF kendi taraflarinda PDF olusturmak zorunda.
+     */
+    _extractSalesInvoicePdfUrl(response) {
+        if (!response || !response.data || !response.data.attributes) return null;
+        const a = response.data.attributes;
+        return a.printable_html_url || a.preview_url || a.print_url || null;
     }
 
     _wrap(err, code) {
