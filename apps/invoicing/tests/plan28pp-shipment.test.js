@@ -62,7 +62,10 @@ describe('Plan 28++ ParasutProvider shipment_document akisi', () => {
 
         expect(r.providerShipmentId).toBe('777');
         expect(r.shipmentNumber).toBe('IRS-2026-001');
-        expect(r.pdfUrl).toBe('https://parasut.com/print/shipment/777.pdf');
+        // Plan 28++: pdfUrl artik Parasut PANEL URL'i (browser'da acilabilsin)
+        expect(r.pdfUrl).toBe(`https://uygulama.parasut.com/${COMPANY_ID}/sales/shipment_documents/777`);
+        // API endpoint URL (Bearer token gerektirir) ayri alanda
+        expect(r.apiPrintUrl).toBe('https://parasut.com/print/shipment/777.pdf');
 
         // JSON:API format dogrulamasi
         expect(postBody.data.type).toBe('shipment_documents');

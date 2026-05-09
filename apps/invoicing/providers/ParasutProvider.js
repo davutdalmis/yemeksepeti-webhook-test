@@ -583,10 +583,14 @@ class ParasutProvider {
             throw new InvoiceProviderError('Shipment document create returned no id', { code: 'SHIPMENT_CREATE_NO_ID' });
         }
 
+        const shipmentId = String(created.data.id);
         return {
-            providerShipmentId: String(created.data.id),
+            providerShipmentId: shipmentId,
             shipmentNumber: created.data.attributes && (created.data.attributes.procurement_number || created.data.attributes.invoice_no),
-            pdfUrl: this._extractShipmentPdfUrl(created),
+            // Plan 28++ — kullanici browser'da acabilsin diye Parasut panel URL'i dondur.
+            // Eski 'api.parasut.com/.../print' API endpoint'iydi, browser'dan 401 verirdi.
+            pdfUrl: this._buildPanelShipmentUrl(shipmentId),
+            apiPrintUrl: this._extractShipmentPdfUrl(created),
             issueDate: created.data.attributes && created.data.attributes.issue_date,
             shipmentDate: created.data.attributes && created.data.attributes.shipment_date,
         };
@@ -780,11 +784,22 @@ class ParasutProvider {
      * Plan 28++ — Shipment document PDF/QR url'i. Paraşüt response attributes'unda
      * printable_html_url benzeri alan dönerse onu kullanır; yoksa null.
      * Sürücüye basılan QR kodlu PDF bu URL'den indirilir.
+     * NOT: Bu URL 'api.parasut.com/...' formatinda olur ve Bearer token gerektirir.
+     * Kullanici browser'i icin _buildPanelShipmentUrl tercih edilir.
      */
     _extractShipmentPdfUrl(response) {
         if (!response || !response.data || !response.data.attributes) return null;
         const a = response.data.attributes;
         return a.printable_html_url || a.preview_url || a.print_url || null;
+    }
+
+    /**
+     * Plan 28++ — Parasut'un kendi web panel URL'i (uygulama.parasut.com).
+     * Kullanici hesabina login oldugu icin browser direkt acabilir;
+     * orada 'Onayla / GIB'e Gonder' butonu da gorunur.
+     */
+    _buildPanelShipmentUrl(shipmentId) {
+        return `https://uygulama.parasut.com/${this.companyId}/sales/shipment_documents/${shipmentId}`;
     }
 
     _wrap(err, code) {
