@@ -30,6 +30,23 @@ function tsToMs(v) {
     return Date.now();
 }
 
+/**
+ * Plan 28+++ — sevkiyat detaylarini Parasut description'a yazılabilir metne çevir.
+ * Paraşüt API'sinde sürücü/plaka için doğrudan alan yok; kullanıcı GİB onayında
+ * Paraşüt panelinden manuel doldurur. Description'a yazıyoruz ki açıklama
+ * alanında görünsün, kullanıcı kopyalayabilsin.
+ */
+function buildShipmentDescription(baseDescription, shipmentDetails) {
+    const parts = [];
+    if (baseDescription) parts.push(baseDescription);
+    if (shipmentDetails) {
+        if (shipmentDetails.driverName) parts.push(`Sürücü: ${shipmentDetails.driverName}`);
+        if (shipmentDetails.driverTckn) parts.push(`TCKN: ${shipmentDetails.driverTckn}`);
+        if (shipmentDetails.vehiclePlate) parts.push(`Plaka: ${shipmentDetails.vehiclePlate}`);
+    }
+    return parts.join(' | ');
+}
+
 class ShipmentError extends Error {
     constructor(message, { status = 500, code, payload } = {}) {
         super(message);
@@ -65,9 +82,11 @@ class ShipmentProcessor {
     /**
      * Plan 28++ create — manuel modda yetkili "İrsaliye Oluştur" basinca tetiklenir.
      * Parasut'a shipment_document POST eder; basarili olursa parasutShipmentId yazilir.
+     * Plan 28+++: shipmentDetails (driverName, driverTckn, vehiclePlate, shipmentDateTime)
+     * body'den alinip Firestore'a kaydedilir, Parasut description'a yazilir.
      */
     async create(documentId, body = {}) {
-        const { tenantId, requestedBy } = body;
+        const { tenantId, requestedBy, shipmentDetails } = body;
         if (!tenantId) throw new ShipmentError('missing tenantId', { status: 400, code: 'missing_tenantId' });
 
         const doc = await this.idempotency.getById(documentId);
@@ -126,12 +145,22 @@ class ShipmentProcessor {
 
         let shipment;
         try {
+            // Plan 28+++ — sevkiyat tarihi onceligi: form -> shipmentMeta -> simdi
+            const effectiveDetails = shipmentDetails || doc.shipmentDetails || null;
+            const formMs = effectiveDetails && effectiveDetails.shipmentDateTime
+                ? Date.parse(effectiveDetails.shipmentDateTime)
+                : NaN;
+            const shipmentDateMs = Number.isFinite(formMs)
+                ? formMs
+                : tsToMs(doc.shipmentMeta && doc.shipmentMeta.shippedAt);
+            const description = buildShipmentDescription(ctx.description, effectiveDetails);
+
             shipment = await provider.createShipmentDocument(token, {
                 contactId: contact.contactId,
                 items: itemsWithProductIds,
                 issueDate: ctx.issueDate,
-                shipmentDate: new Date(tsToMs(doc.shipmentMeta && doc.shipmentMeta.shippedAt)).toISOString(),
-                description: ctx.description,
+                shipmentDate: new Date(shipmentDateMs).toISOString(),
+                description,
                 address: ctx.branch && ctx.branch.address,
                 city: ctx.branch && ctx.branch.city,
                 district: ctx.branch && ctx.branch.district,
@@ -162,6 +191,8 @@ class ShipmentProcessor {
             parasutContactId: contact.contactId,
             pdfUrl: shipment.pdfUrl,
             parasutShipmentCreatedAt: Date.now(),
+            // Plan 28+++ — sevkiyat detaylarini kalici sakla
+            ...(shipmentDetails ? { shipmentDetails } : {}),
         });
         await this.idempotency.appendAudit(documentId, 'parasut_shipment_created', requestedBy || 'panel', {
             parasutShipmentId: shipment.providerShipmentId,
@@ -181,7 +212,7 @@ class ShipmentProcessor {
      * Parasut tarafinda updateShipmentDocument cagirir + Firestore approvalMeta guncellenir.
      */
     async saveEdits(documentId, body = {}) {
-        const { tenantId, edits, editedBy, note } = body;
+        const { tenantId, edits, editedBy, note, shipmentDetails } = body;
         if (!tenantId) throw new ShipmentError('missing tenantId', { status: 400, code: 'missing_tenantId' });
         if (!Array.isArray(edits)) throw new ShipmentError('edits not array', { status: 400, code: 'edits_not_array' });
 
@@ -266,6 +297,28 @@ class ShipmentProcessor {
             }
         }
 
+        // Plan 28+++ — Parasut'a yazilmissa description + shipment_date guncelle
+        if (doc.parasutShipmentId && shipmentDetails) {
+            try {
+                const provider = await this.providerFactory(tenantId);
+                const token = await this.tokenManager.getValidToken(tenantId);
+                const ctx = await this.contextLoader(tenantId, doc);
+                const description = buildShipmentDescription(ctx.description, shipmentDetails);
+                const formMs = shipmentDetails.shipmentDateTime
+                    ? Date.parse(shipmentDetails.shipmentDateTime)
+                    : NaN;
+                const shipmentDateIso = Number.isFinite(formMs)
+                    ? new Date(formMs).toISOString()
+                    : undefined;
+                await provider.updateShipmentDocument(token, doc.parasutShipmentId, {
+                    description,
+                    ...(shipmentDateIso ? { shipmentDate: shipmentDateIso } : {}),
+                });
+            } catch (e) {
+                console.warn(`[ShipmentProcessor] updateShipmentDocument(meta) failed: ${e.message}`);
+            }
+        }
+
         await this.idempotency.update(documentId, {
             status: 'pending_approval',
             approvalMeta: {
@@ -275,6 +328,7 @@ class ShipmentProcessor {
                 lastEditedAt: Date.now(),
                 lastEditedBy: editedBy || 'panel',
             },
+            ...(shipmentDetails ? { shipmentDetails } : {}),
         });
         await this.idempotency.appendAudit(documentId, 'shipment_edited', editedBy || 'panel', {
             editsCount: cleanEdits.length,

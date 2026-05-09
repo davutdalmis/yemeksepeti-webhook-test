@@ -126,6 +126,13 @@ app.post('/invoicing/credentials', requireApiKey, async (req, res) => {
             // Plan 28+/Plan 28++: belge tipi ayri ayri kontrol.
             invoiceDraftMode = 'enabled',
             shipmentMode = 'disabled',
+            // Plan 28+++: imalat (gonderici) bilgileri - e-Irsaliye sevk cikis adresi
+            manufacturerName = '',
+            manufacturerTaxNumber = '',
+            manufacturerTaxOffice = '',
+            manufacturerAddress = '',
+            manufacturerCity = '',
+            manufacturerDistrict = '',
             updatedBy = 'panel',
         } = req.body || {};
 
@@ -153,6 +160,12 @@ app.post('/invoicing/credentials', requireApiKey, async (req, res) => {
             shipmentIncludedDefault: !!shipmentIncludedDefault,
             invoiceDraftMode: ['enabled', 'disabled'].includes(invoiceDraftMode) ? invoiceDraftMode : 'enabled',
             shipmentMode: ['disabled', 'manual', 'auto'].includes(shipmentMode) ? shipmentMode : 'disabled',
+            manufacturerName: String(manufacturerName || ''),
+            manufacturerTaxNumber: String(manufacturerTaxNumber || ''),
+            manufacturerTaxOffice: String(manufacturerTaxOffice || ''),
+            manufacturerAddress: String(manufacturerAddress || ''),
+            manufacturerCity: String(manufacturerCity || ''),
+            manufacturerDistrict: String(manufacturerDistrict || ''),
             provider: 'parasut',
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
             updatedBy: String(updatedBy),
