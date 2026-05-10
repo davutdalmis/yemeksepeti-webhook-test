@@ -25,6 +25,8 @@ const YemekSepetiConnector = require('./services/platforms/connectors/yemeksepet
 const GetirYemekConnector = require('./services/platforms/connectors/getiryemek-connector');
 const TrendyolGoConnector = require('./services/platforms/connectors/trendyolgo-connector');
 const FuudyConnector = require('./services/platforms/connectors/fuudy-connector');
+// Plan 30: Telefon siparişi connector (Yemigo kendi kanalı, tableOrders koleksiyonu)
+const PhoneConnector = require('./services/platforms/connectors/phone-connector');
 const MigrosYemekConnector = require('./services/platforms/connectors/migrosyemek-connector');
 const createOrdersApi = require('./services/api/orders-api');
 const createPlatformsApi = require('./services/api/platforms-api');
@@ -32,6 +34,10 @@ const createDelayedCallApi = require('./services/api/delayed-call-api');
 const GoogleMapsDistanceService = require('./services/google-maps-distance');
 const DispatchMetrics = require('./services/dispatch/dispatch-metrics');
 const DispatchQueue = require('./services/dispatch/dispatch-queue');
+// Plan 29 Faz 2.3 — Pre-dispatch buffer (kurye dönüş bekleme penceresi, default 0 = kapalı)
+const PreDispatchBuffer = require('./services/dispatch/pre-dispatch-buffer');
+// Plan 29 Faz 2.4 — Audit log (assignmentDecisions koleksiyonu)
+const DispatchAudit = require('./services/dispatch/dispatch-audit');
 const DispatchAlerts = require('./services/dispatch/dispatch-alerts');
 const DelayedCallQueue = require('./services/queue/delayed-call-queue');
 const { getRedisClient, isRedisAvailable, getRedisStatus, getRedisFailoverInfo } = require('@yemigo/shared/redis-client');
@@ -444,6 +450,8 @@ let smartDispatchService = null;
 let dispatchMetrics = null;
 let dispatchAlerts = null;
 let dispatchQueue = null;
+let preDispatchBuffer = null; // Plan 29 Faz 2.3
+let dispatchAudit = null;     // Plan 29 Faz 2.4
 let delayedCallQueue = null;
 
 async function initializePlatformHub() {
@@ -466,6 +474,12 @@ async function initializePlatformHub() {
     const migrosyemekConnector = new MigrosYemekConnector(db, platformRegistry);
     platformRegistry.registerConnector('migrosyemek', migrosyemekConnector);
 
+    // Plan 30: Telefon siparişi connector — WPF DispatchApiClient tarafından
+    // POST /api/v2/orders/phone/{docId}/assign-courier ile tetiklenir.
+    // Connector tableOrders koleksiyonuna assignedCourierId/Name yazar (base.assignCourier transaction).
+    const phoneConnector = new PhoneConnector(db, platformRegistry);
+    platformRegistry.registerConnector('phone', phoneConnector);
+
     // Initialize Dispatch Metrics & Alerts
     dispatchMetrics = new DispatchMetrics(db);
     dispatchAlerts = new DispatchAlerts(db);
@@ -480,6 +494,16 @@ async function initializePlatformHub() {
     // Initialize Dispatch Queue (retry for failed assignments)
     dispatchQueue = new DispatchQueue(db, smartDispatchService, platformRegistry, dispatchMetrics);
     dispatchQueue.start();
+
+    // Plan 29 Faz 2.3 — Pre-dispatch buffer (geriye uyumlu: bufferSeconds=0 default → buffer atlanır)
+    preDispatchBuffer = new PreDispatchBuffer(db, smartDispatchService, platformRegistry, dispatchQueue);
+    preDispatchBuffer.start();
+
+    // Plan 29 Faz 2.4 — Audit log (her atama için "neden bu kurye" karar dokümanı)
+    dispatchAudit = new DispatchAudit(db);
+    if (typeof smartDispatchService.setAudit === 'function') {
+        smartDispatchService.setAudit(dispatchAudit);
+    }
 
     // Initialize Delayed API Call Queue (GetirYemek 1-minute rule — RAILWAY_DELAYED_QUEUE_PLAN.md Faz 1.3)
     // Worker stays dormant until Faz 1.4 wires connector.executeAction.
@@ -525,15 +549,21 @@ class SmartDispatchService {
         // [FIX-3] Mutex: serializes assignBestCourier calls to prevent race conditions
         this._assignmentQueue = Promise.resolve();
 
-        // Default scoring weights (matching WPF DispatchWeights defaults)
+        // Default scoring weights (Plan 29 Faz 1.1+1.2: recency + workload sertleştirme)
+        // Sektör ilhamı: DoorDash acceptance-rate tabanlı tie-breaker; workload'u şube avantajına karşı güçlendir
         this.defaultWeights = {
-            distanceToBranch: 0.25,
-            availability: 0.25,
-            workload: 0.20,
-            deliveryProximity: 0.15,
-            performance: 0.15
+            distanceToBranch: 0.18,
+            availability: 0.22,
+            workload: 0.25,
+            deliveryProximity: 0.10,
+            performance: 0.15,
+            recency: 0.10
         };
         this.weights = { ...this.defaultWeights };
+
+        // Recency thresholds (saniye) — son atamadan beri geçen süre
+        this.RECENCY_HOT_S = 60;       // <60s = tam ceza
+        this.RECENCY_WARM_S = 300;     // <300s = yarı ceza
 
         // Dynamic weights cache: Redis-backed with in-memory fallback
         this._weightCache = new Map(); // fallback when Redis unavailable
@@ -563,6 +593,11 @@ class SmartDispatchService {
 
     setAlerts(dispatchAlerts) {
         this.dispatchAlerts = dispatchAlerts;
+    }
+
+    // Plan 29 Faz 2.4 — Audit log injection
+    setAudit(dispatchAudit) {
+        this.dispatchAudit = dispatchAudit;
     }
 
     setCourierState(courierStateStore) {
@@ -647,7 +682,8 @@ class SmartDispatchService {
     }
 
     /**
-     * Validate weights object — must have all 5 keys, values must be numbers summing to ~1.0
+     * Validate weights object — 5 zorunlu key + opsiyonel recency (geriye uyumlu).
+     * Eski 5-key Firestore doc'ları kabul eder, recency=0 olarak normalize eder.
      */
     _validateWeights(data) {
         const requiredKeys = ['distanceToBranch', 'availability', 'workload', 'deliveryProximity', 'performance'];
@@ -659,6 +695,10 @@ class SmartDispatchService {
             }
             weights[key] = data[key];
         }
+
+        // Recency opsiyonel — yoksa 0 (eski 5-key dokümanlar geriye uyumlu)
+        weights.recency = (typeof data.recency === 'number' && data.recency >= 0 && data.recency <= 1)
+            ? data.recency : 0;
 
         const sum = Object.values(weights).reduce((a, b) => a + b, 0);
         if (Math.abs(sum - 1.0) > 0.05) {
@@ -712,7 +752,9 @@ class SmartDispatchService {
                             dailyDeliveryCount: data.dailyDeliveryCount || data.totalDeliveriesToday || 0,
                             rating: data.rating || 0,
                             isApproved: data.isApproved !== undefined ? data.isApproved : true,
-                            fcmToken: data.fcmToken || null
+                            fcmToken: data.fcmToken || null,
+                            // Plan 29 Faz 1.1 — round-robin için son atama zamanı (Firestore Timestamp veya null)
+                            lastAssignedAt: data.lastAssignedAt || null
                         };
                     })
                     .filter(c => c.isApproved);
@@ -786,6 +828,34 @@ class SmartDispatchService {
     }
 
     /**
+     * Plan 29 Faz 2.2 — readyAt-aware availability scoring
+     * estimatedReadyAt verilirse, kuryenin "ne zaman serbest olacağı" ile yemeğin "ne zaman hazır olacağı" karşılaştırılır.
+     * Δ = freeAt - readyAt (dakika): -10 ≤ Δ ≤ 5 mükemmel pencere (0 puan), Δ > 15 kabul edilemez (100 puan).
+     * estimatedReadyAt yoksa → eski formüle düşer (geriye uyumlu).
+     */
+    _calcAvailabilityScoreReadyAware(courier, estimatedReadyAt, branchDistanceInfo) {
+        if (!estimatedReadyAt) return null; // Sinyal yoksa caller eski formüle düşsün
+
+        const readyMs = typeof estimatedReadyAt.toMillis === 'function'
+            ? estimatedReadyAt.toMillis()
+            : new Date(estimatedReadyAt).getTime();
+        if (!Number.isFinite(readyMs)) return null;
+
+        // freeAt(courier) = now + activeOrderCount × 20 dk + (yoldaysa) returnDistanceMin
+        let busyMinutes = (courier.activeOrderCount || 0) * 20;
+        if (branchDistanceInfo && branchDistanceInfo.isSuccess && !branchDistanceInfo.isFallback) {
+            busyMinutes += branchDistanceInfo.durationMinutes || 0;
+        }
+        const freeAtMs = Date.now() + busyMinutes * 60 * 1000;
+        const deltaMin = (freeAtMs - readyMs) / 60000;
+
+        if (deltaMin < -10) return 50;            // Kurye 10dk+ erken — boşa bekler
+        if (deltaMin <= 5) return 0;              // Mükemmel pencere
+        if (deltaMin <= 15) return 50;            // Yemek 5-15 dk soğur
+        return 100;                                // Kabul edilemez geç
+    }
+
+    /**
      * Availability score (0-100, low = available soon = good)
      */
     _calcAvailabilityScore(courier, branchLocation, branchDistanceInfo) {
@@ -820,10 +890,110 @@ class SmartDispatchService {
 
     /**
      * Workload score (0-100, low = light workload = good)
+     * Plan 29 Faz 1.2 — eksponansiyel: şubedeki kuryenin avantajını kırmak için
+     * lineer formül 1 sipariş = 20 puan veriyordu, çok zayıf ceza. Yeni: hızlı doygunluk
      */
     _calcWorkloadScore(activeOrderCount) {
-        if (activeOrderCount === 0) return 0;
-        return Math.min(activeOrderCount / this.MAX_ACTIVE_ORDERS, 1.0) * 100;
+        const tiers = [0, 30, 60, 85, 100];
+        return tiers[Math.min(activeOrderCount, tiers.length - 1)];
+    }
+
+    /**
+     * Plan 29 Faz 3.1 — Batch alignment bonus (negatif puan = kurye lehine).
+     * Kurye yoldaki son aktif siparişinin teslimat noktasına yakın yeni sipariş gelirse, atanması verim sağlar (DoorDash/Uber Eats batching mantığı).
+     * Mesafe bandı:
+     *   < 1.5 km  → -15 (güçlü bonus)
+     *   < 3.0 km  → -8  (orta bonus)
+     *   ≥ 3.0 km  → 0   (bonus yok)
+     * Sınır: kuryenin aktif sipariş sayısı maxBatchSize'dan büyükse skor 9999 (atanamaz emniyeti).
+     */
+    _calcBatchAlignmentScore(courier, newDeliveryLoc, recentDeliveryLoc, maxBatchSize) {
+        if (!recentDeliveryLoc || !this._isValidCoordinate(recentDeliveryLoc.latitude, recentDeliveryLoc.longitude)) return 0;
+        if (!newDeliveryLoc || !this._isValidCoordinate(newDeliveryLoc.latitude, newDeliveryLoc.longitude)) return 0;
+        if ((courier.activeOrderCount || 0) >= maxBatchSize) return 9999; // emniyet — overload
+
+        const distMeters = geolib.getDistance(
+            { latitude: recentDeliveryLoc.latitude, longitude: recentDeliveryLoc.longitude },
+            { latitude: newDeliveryLoc.latitude, longitude: newDeliveryLoc.longitude }
+        );
+        const distKm = distMeters / 1000;
+        if (distKm < 1.5) return -15;
+        if (distKm < 3.0) return -8;
+        return 0;
+    }
+
+    /**
+     * Plan 29 Faz 3.1 — Şube batching policy (5 dk cache).
+     * branches/{id}/settings/dispatchSettings.batchingEnabled (default false), maxBatchSize (default 3).
+     */
+    async getBatchPolicyForBranch(branchId) {
+        if (!this.db || !branchId) return { enabled: false, maxBatchSize: 3 };
+        const cached = this._batchPolicyCache?.get(branchId);
+        if (cached && Date.now() < cached.expiresAt) return cached.policy;
+
+        if (!this._batchPolicyCache) this._batchPolicyCache = new Map();
+
+        let policy = { enabled: false, maxBatchSize: 3 };
+        try {
+            const doc = await this.db.doc(`branches/${branchId}/settings/dispatchSettings`).get();
+            if (doc.exists) {
+                const data = doc.data();
+                policy = {
+                    enabled: data.batchingEnabled === true,
+                    maxBatchSize: typeof data.maxBatchSize === 'number' ? Math.min(Math.max(2, data.maxBatchSize), 5) : 3
+                };
+            }
+        } catch (err) {
+            console.warn('[SmartDispatch] batch policy read fail:', err.message);
+        }
+
+        this._batchPolicyCache.set(branchId, { policy, expiresAt: Date.now() + 5 * 60 * 1000 });
+        return policy;
+    }
+
+    /**
+     * Plan 29 Faz 3.1 — Kuryenin son aktif teslimat lokasyonu (5 platform collectionGroup).
+     * Index hatasında sessizce null döner (geriye uyumlu, batching kapalı kalır).
+     */
+    async getRecentDeliveryLocationForCourier(courierId, branchId) {
+        if (!this.db || !courierId) return null;
+        const platforms = ['yemekSepetiOrders', 'getirYemekOrders', 'trendyolGoOrders', 'migrosYemekOrders', 'fuudyOrders'];
+        for (const platform of platforms) {
+            try {
+                let q = this.db.collectionGroup(platform)
+                    .where('assignedCourierId', '==', courierId)
+                    .where('Status', 'in', ['ACCEPTED', 'PREPARING', 'PICKED_UP', 'ON_THE_WAY']);
+                if (branchId) q = q.where('branchId', '==', branchId);
+                const snap = await q.limit(1).get();
+                if (!snap.empty) {
+                    const data = snap.docs[0].data();
+                    const lat = data.deliveryLatitude || data.customerLatitude || data?.Customer?.Address?.Latitude || 0;
+                    const lng = data.deliveryLongitude || data.customerLongitude || data?.Customer?.Address?.Longitude || 0;
+                    if (lat && lng) return { latitude: lat, longitude: lng };
+                }
+            } catch (err) {
+                // index hatası → sessiz devam (batching opsiyonel)
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Recency score (0-100, low = atanmaz, yüksek = ceza)
+     * Plan 29 Faz 1.1 — round-robin sinyali. Eşit skorlu kuryelerde son atanan ceza alır.
+     * lastAssignedAt: Firestore Timestamp | Date | null. null ise hiç ceza yok (yeni kurye veya hiç atanmamış).
+     */
+    _calcRecencyScore(lastAssignedAt) {
+        if (!lastAssignedAt) return 0;
+        const lastMs = typeof lastAssignedAt.toMillis === 'function'
+            ? lastAssignedAt.toMillis()
+            : new Date(lastAssignedAt).getTime();
+        if (!Number.isFinite(lastMs)) return 0;
+
+        const deltaS = (Date.now() - lastMs) / 1000;
+        if (deltaS < this.RECENCY_HOT_S) return 100;   // <60s = tam ceza
+        if (deltaS < this.RECENCY_WARM_S) return 50;   // <300s = yarı ceza
+        return 0;                                        // ≥300s = ceza yok
     }
 
     /**
@@ -873,20 +1043,29 @@ class SmartDispatchService {
      * Calculate full weighted score for a courier
      * Lower total = better courier match
      */
-    calculateCourierScore(courier, deliveryLocation, branchLocation, deliveryDistanceInfo, branchDistanceInfo, weights) {
+    calculateCourierScore(courier, deliveryLocation, branchLocation, deliveryDistanceInfo, branchDistanceInfo, weights, context) {
         const w = weights || this.defaultWeights;
+        const ctx = context || {};
         const distanceToBranchScore = this._calcDistanceToBranchScore(courier, branchLocation, branchDistanceInfo);
-        const availabilityScore = this._calcAvailabilityScore(courier, branchLocation, branchDistanceInfo);
+        // Plan 29 Faz 2.2 — estimatedReadyAt varsa freeAt vs readyAt formülü, yoksa eski formül (geriye uyumlu)
+        const readyAwareScore = this._calcAvailabilityScoreReadyAware(courier, ctx.estimatedReadyAt, branchDistanceInfo);
+        const availabilityScore = readyAwareScore !== null
+            ? readyAwareScore
+            : this._calcAvailabilityScore(courier, branchLocation, branchDistanceInfo);
         const workloadScore = this._calcWorkloadScore(courier.activeOrderCount);
         const deliveryProximityScore = this._calcDeliveryProximityScore(courier, deliveryLocation, deliveryDistanceInfo);
         const performanceScore = this._calcPerformanceScore(courier);
+        const recencyScore = this._calcRecencyScore(courier.lastAssignedAt);
+
+        const recencyWeight = typeof w.recency === 'number' ? w.recency : 0;
 
         const totalScore =
             (distanceToBranchScore * w.distanceToBranch) +
             (availabilityScore * w.availability) +
             (workloadScore * w.workload) +
             (deliveryProximityScore * w.deliveryProximity) +
-            ((100 - performanceScore) * w.performance); // Performance inverted
+            ((100 - performanceScore) * w.performance) + // Performance inverted
+            (recencyScore * recencyWeight);              // Plan 29 Faz 1.1 — round-robin
 
         return {
             totalScore,
@@ -895,7 +1074,8 @@ class SmartDispatchService {
                 availability: availabilityScore,
                 workload: workloadScore,
                 deliveryProximity: deliveryProximityScore,
-                performance: performanceScore
+                performance: performanceScore,
+                recency: recencyScore
             }
         };
     }
@@ -944,12 +1124,13 @@ class SmartDispatchService {
 
     /**
      * Public entry: queued to prevent race conditions between concurrent calls
+     * Plan 29 Faz 2.2 — context: { estimatedReadyAt, orderId, retryAttempt } opsiyonel
      */
-    assignBestCourier(branchId, deliveryLocation) {
-        return this._enqueue(() => this._assignBestCourierInternal(branchId, deliveryLocation));
+    assignBestCourier(branchId, deliveryLocation, context) {
+        return this._enqueue(() => this._assignBestCourierInternal(branchId, deliveryLocation, context || {}));
     }
 
-    async _assignBestCourierInternal(branchId, deliveryLocation) {
+    async _assignBestCourierInternal(branchId, deliveryLocation, context = {}) {
         if (!this.db) {
             console.log('[SmartDispatch] Firebase disabled - skipping auto-assignment');
             return null;
@@ -1011,6 +1192,9 @@ class SmartDispatchService {
                 console.warn('[SmartDispatch] Google Maps error, using geolib fallback:', gmError.message);
             }
 
+            // Plan 29 Faz 3.1 — Şube batching policy (5 dk cache, default kapalı)
+            const batchPolicy = await this.getBatchPolicyForBranch(branchId);
+
             const scoredCouriers = await Promise.all(
                 couriers.map(async (courier) => {
                     const activeOrders = await this.getActiveOrderCount(courier.id);
@@ -1020,10 +1204,24 @@ class SmartDispatchService {
                     const branchDistInfo = branchDistances ? branchDistances.get(courier.id) : null;
 
                     const { totalScore, details } = this.calculateCourierScore(
-                        courier, deliveryLocation, branchLocation, deliveryDistInfo, branchDistInfo, weights
+                        courier, deliveryLocation, branchLocation, deliveryDistInfo, branchDistInfo, weights, context
                     );
 
-                    return { courier, score: totalScore, details, source: deliveryDistInfo?.source || 'geolib' };
+                    // Plan 29 Faz 3.1 — Batch alignment bonus (sadece flag açık + kurye boş değilse)
+                    let batchScore = 0;
+                    if (batchPolicy.enabled && courier.activeOrderCount > 0) {
+                        const recentLoc = await this.getRecentDeliveryLocationForCourier(courier.id, branchId);
+                        batchScore = this._calcBatchAlignmentScore(courier, deliveryLocation, recentLoc, batchPolicy.maxBatchSize);
+                        details.batchAlignment = batchScore;
+                    }
+
+                    return {
+                        courier,
+                        score: totalScore + batchScore, // negatif batchScore = bonus (lehine)
+                        details,
+                        source: deliveryDistInfo?.source || 'geolib',
+                        wasBatched: batchScore < 0
+                    };
                 })
             );
 
@@ -1040,7 +1238,8 @@ class SmartDispatchService {
             console.log(`[SmartDispatch] Best courier: ${bestMatch.courier.name} (score: ${bestMatch.score.toFixed(1)}, ` +
                 `D:${bestMatch.details.distanceToBranch.toFixed(0)} A:${bestMatch.details.availability.toFixed(0)} ` +
                 `W:${bestMatch.details.workload.toFixed(0)} P:${bestMatch.details.deliveryProximity.toFixed(0)} ` +
-                `R:${bestMatch.details.performance.toFixed(0)}, source: ${bestMatch.source}, ${scoreTimeMs}ms)`);
+                `R:${bestMatch.details.performance.toFixed(0)} Rc:${(bestMatch.details.recency || 0).toFixed(0)}, ` +
+                `source: ${bestMatch.source}, ${scoreTimeMs}ms)`);
 
             if (scoredCouriers.length > 1) {
                 const runner = scoredCouriers[1];
@@ -1050,10 +1249,36 @@ class SmartDispatchService {
             // [FIX-2] Track assignment with counter (not single entry)
             await this._trackAssignment(bestMatch.courier.id);
 
+            // Plan 29 Faz 1.4 — Pilot Mod telemetri
+            const runnerUp = scoredCouriers[1];
+            const tieBreakerUsed = !!runnerUp && Math.abs(bestMatch.score - runnerUp.score) < this.TIE_BREAKER_THRESHOLD;
+
+            // Plan 29 Faz 2.4 — Audit log: "neden bu kurye" karar dokümanı (non-fatal)
+            if (this.dispatchAudit) {
+                this.dispatchAudit.recordDecision({
+                    orderId: context.orderId || null,
+                    branchId,
+                    decidedBy: context.retryAttempt > 0 ? 'retry' : 'auto',
+                    candidates: scoredCouriers.slice(0, 5).map(c => ({
+                        courierId: c.courier.id,
+                        name: c.courier.name,
+                        score: c.score,
+                        breakdown: c.details
+                    })),
+                    weights,
+                    selectedCourierId: bestMatch.courier.id,
+                    tieBreakerUsed,
+                    scoreTimeMs,
+                    context: { ...context, wasBatched: bestMatch.wasBatched || false, batchPolicy }
+                }).catch(() => {}); // fire-and-forget
+            }
+
             // Record metric
             if (this.dispatchMetrics) {
                 await this.dispatchMetrics.recordAssignment(branchId, bestMatch.courier.id, scoreTimeMs, true, {
-                    score: bestMatch.score
+                    score: bestMatch.score,
+                    tieBreakerUsed,
+                    recencyScore: bestMatch.details.recency || 0
                 });
             }
 
@@ -1191,14 +1416,38 @@ async function processPlatformOrderWebhook(platformId, rawOrder, branchId, optio
     const firebaseResult = await writeOrderToFirebaseUnified(transformedOrder, platformId, branchId);
 
     if (firebaseResult.success && shouldDispatch && smartDispatchService && deliveryLocation) {
-        const courier = await smartDispatchService.assignBestCourier(branchId, deliveryLocation);
-        metrics.increment('dispatch_assignments_total', { status: courier ? 'success' : 'queued' });
+        // Plan 29 Faz 2.3 — preDispatchBuffer wrapper (bufferSeconds=0 → eski akış, buffer atlanır)
+        // Geriye uyumlu: preDispatchBuffer yoksa direkt assignBestCourier
+        const estimatedReadyAt = transformedOrder?.EstimatedReadyAt || transformedOrder?.estimatedReadyAt || null;
+        let courier = null;
+        let buffered = false;
+
+        if (preDispatchBuffer) {
+            const result = await preDispatchBuffer.enqueueOrAssign({
+                orderId: firebaseResult.orderId,
+                platformId,
+                branchId,
+                deliveryLocation,
+                estimatedReadyAt
+            });
+            courier = result.courier || null;
+            buffered = result.buffered;
+        } else {
+            courier = await smartDispatchService.assignBestCourier(branchId, deliveryLocation, {
+                orderId: firebaseResult.orderId, estimatedReadyAt
+            });
+        }
+
+        metrics.increment('dispatch_assignments_total', {
+            status: courier ? 'success' : (buffered ? 'buffered' : 'queued')
+        });
+
         if (courier) {
             if (connector && connector.assignCourier) {
                 await connector.assignCourier(firebaseResult.orderId, courier.id, courier.name);
             }
             await notifyCourierNewOrder(courier, transformedOrder, platformDisplayName || platformId);
-        } else if (dispatchQueue) {
+        } else if (!buffered && dispatchQueue) {
             await dispatchQueue.enqueue({
                 orderId: firebaseResult.orderId,
                 platformId,
@@ -1374,6 +1623,35 @@ app.use('/api/v2/orders', (req, res, next) => {
 }));
 
 app.use('/api/v2/platforms', createPlatformsApi(platformRegistry, db));
+
+// ==================== Plan 29 Faz 1.5B — Anlık dispatch tetik ====================
+// Express "Görevdeyim" toggle olduğunda bu endpoint'i çağırır.
+// Mevcut işleyişi BOZMAZ: çağrılmasa bile 15sn polling devam eder.
+// Eski APK'lar bu endpoint'i bilmez → mevcut akış sürer.
+// Yeni APK'lar çağırınca: kuyruktaki bekleyen siparişler ANINDA değerlendirilir.
+app.post('/api/v2/couriers/:branchId/:courierId/notify-availability', async (req, res) => {
+    // Auth: aynı x-branch-id pattern'ı (Express NetworkModule zaten gönderiyor)
+    const headerBranchId = req.headers['x-branch-id'];
+    const { branchId, courierId } = req.params;
+
+    if (!headerBranchId || headerBranchId !== branchId) {
+        return res.status(401).json({ success: false, error: 'branch_mismatch' });
+    }
+
+    if (!dispatchQueue) {
+        // Servis henüz başlatılmadı — sessiz başarı (mevcut polling devralır)
+        return res.json({ success: true, processed: 0, assigned: 0, note: 'queue_not_ready' });
+    }
+
+    try {
+        const result = await dispatchQueue.processQueueForBranch(branchId);
+        console.log(`[NotifyAvailability] courier=${courierId} branch=${branchId} → processed=${result.processed} assigned=${result.assigned}`);
+        return res.json({ success: true, ...result });
+    } catch (error) {
+        console.error('[NotifyAvailability] error:', error.message);
+        return res.status(500).json({ success: false, error: error.message });
+    }
+});
 
 // Delayed API call queue (RAILWAY_DELAYED_QUEUE_PLAN.md Faz 1.5)
 // Lazy-mount: queue is initialized inside initializePlatformHub() (async after this point)

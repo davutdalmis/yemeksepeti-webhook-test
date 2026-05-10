@@ -6,8 +6,11 @@
 
 const admin = require('firebase-admin');
 
-const MAX_ATTEMPTS = 5;
-const PROCESS_INTERVAL_MS = 30 * 1000; // 30 seconds
+// Plan 29 Faz 1.5A — pencere genişletme
+// Eski: 5 deneme × 30sn = 2.5 dk (kurye geç Görevdeyim'e basarsa kayıp)
+// Yeni: 30 deneme × 15sn = 7.5 dk (canlı incident: kurye 3 dk sonra açtı, sipariş kayboldu)
+const MAX_ATTEMPTS = 30;
+const PROCESS_INTERVAL_MS = 15 * 1000;
 
 class DispatchQueue {
     constructor(db, smartDispatch, registry, dispatchMetrics) {
@@ -137,6 +140,46 @@ class DispatchQueue {
     }
 
     /**
+     * Plan 29 Faz 1.5B — Anlık tetik (kurye Görevdeyim'e bastığında çağrılır)
+     * Sadece belirli şubenin pending dispatch'lerini hemen işler. Polling cycle beklenmez.
+     * Geriye uyumlu: çağrılmazsa mevcut 15 sn polling devam eder.
+     * @param {string} branchId
+     * @returns {Promise<{processed: number, assigned: number}>}
+     */
+    async processQueueForBranch(branchId) {
+        if (!this.db || !this.smartDispatch || !branchId) {
+            return { processed: 0, assigned: 0 };
+        }
+
+        try {
+            const snapshot = await this.db.collection('pendingDispatches')
+                .where('status', '==', 'pending')
+                .where('branchId', '==', branchId)
+                .orderBy('createdAt', 'asc')
+                .limit(20)
+                .get();
+
+            if (snapshot.empty) return { processed: 0, assigned: 0 };
+
+            console.log(`[DispatchQueue] Branch trigger ${branchId} — processing ${snapshot.size} pending`);
+
+            let assigned = 0;
+            for (const doc of snapshot.docs) {
+                const before = doc.data().status;
+                await this._processOne(doc.ref, doc.data());
+                // Re-read to check if assigned
+                const after = await doc.ref.get();
+                if (after.exists && after.data().status === 'assigned') assigned++;
+            }
+
+            return { processed: snapshot.size, assigned };
+        } catch (error) {
+            console.error('[DispatchQueue] processQueueForBranch error:', error.message);
+            return { processed: 0, assigned: 0 };
+        }
+    }
+
+    /**
      * Process a single pending dispatch
      */
     async _processOne(docRef, data) {
@@ -161,8 +204,32 @@ class DispatchQueue {
         await this._incrementAttempt(docRef);
 
         try {
+            // Plan 29 Faz 2.2 — Firestore'dan EstimatedReadyAt'i çek (WPF accept sonrası yazılmış olabilir)
+            const context = { orderId, retryAttempt: attempts + 1 };
+            try {
+                const collectionMap = {
+                    yemeksepeti: 'yemekSepetiOrders',
+                    getiryemek: 'getirYemekOrders',
+                    trendyolgo: 'trendyolGoOrders',
+                    migrosyemek: 'migrosYemekOrders',
+                    fuudy: 'fuudyOrders'
+                };
+                const collName = collectionMap[platformId];
+                if (collName) {
+                    const orderDoc = await this.db.collection(collName).doc(orderId).get();
+                    if (orderDoc.exists) {
+                        const orderData = orderDoc.data();
+                        if (orderData.EstimatedReadyAt) {
+                            context.estimatedReadyAt = orderData.EstimatedReadyAt;
+                        }
+                    }
+                }
+            } catch (readyErr) {
+                // Sessiz: EstimatedReadyAt yoksa eski formül devreye girer
+            }
+
             // Try to assign
-            const courier = await this.smartDispatch.assignBestCourier(branchId, deliveryLocation);
+            const courier = await this.smartDispatch.assignBestCourier(branchId, deliveryLocation, context);
 
             if (!courier) {
                 console.log(`[DispatchQueue] Attempt ${attempts + 1}/${MAX_ATTEMPTS}: No courier for ${platformId}/${orderId}`);

@@ -47,6 +47,14 @@ class DispatchMetrics {
                 updateData[`courierDistribution.${courierId}`] = admin.firestore.FieldValue.increment(1);
             }
 
+            // Plan 29 Faz 1.4 — Pilot Mod sayaçları
+            if (extra.tieBreakerUsed === true) {
+                updateData.tieBreakerCount = admin.firestore.FieldValue.increment(1);
+            }
+            if (success && typeof extra.recencyScore === 'number' && extra.recencyScore > 0) {
+                updateData.recencyPenalizedCount = admin.firestore.FieldValue.increment(1);
+            }
+
             await this.db.collection('dispatchMetrics').doc(docId).set(updateData, { merge: true });
 
         } catch (error) {

@@ -7,6 +7,26 @@ const axios = require('axios');
 
 const API_TIMEOUT = 10000; // 10 seconds
 
+// GY müşteri telefonu santral + extension formatında verir: "+90 (850) 000-00000 / 000000"
+// Express APK Android tel: URI'sinde DTMF post-dial digits için santral ve extension'ı ayrı tutmamız gerekiyor.
+// Geriye uyumlu: CustomerPhone raw string olarak da yazılır, eski Express sürümleri bozulmaz.
+function cleanPhone(str) {
+    if (!str) return '';
+    return String(str).replace(/[^\d+]/g, '');
+}
+
+function parsePhoneWithExtension(raw) {
+    if (!raw) return { main: '', extension: '' };
+    const str = String(raw).trim();
+    // Format: "<santral> / <extension>" — santral telefon karakterleri (+, rakam, parantez, tire, boşluk),
+    // ardından / ile ayrılmış sadece rakamlardan oluşan extension
+    const m = str.match(/^([\d+\s()\-]+)\s*\/\s*(\d+)\s*$/);
+    if (m) {
+        return { main: cleanPhone(m[1]), extension: m[2].replace(/\D/g, '') };
+    }
+    return { main: cleanPhone(str), extension: '' };
+}
+
 class GetirYemekConnector extends BasePlatformConnector {
     constructor(db, registry) {
         super('getiryemek', db, registry);
@@ -22,6 +42,12 @@ class GetirYemekConnector extends BasePlatformConnector {
 
     transformOrder(rawOrder, branchId) {
         const now = new Date();
+
+        // Müşteri telefonu santral + extension parse (Express otomatik DTMF arama için)
+        const rawPhonePrimary = rawOrder.client?.clientPhoneNumber || '';
+        const rawPhoneFallback = rawOrder.client?.maskedPhoneNumber || rawOrder.client?.contactPhoneNumber || '';
+        const rawPhone = rawPhonePrimary || rawPhoneFallback;
+        const parsedPhone = parsePhoneWithExtension(rawPhone);
 
         return {
             OrderId: rawOrder.id || '',
@@ -92,6 +118,10 @@ class GetirYemekConnector extends BasePlatformConnector {
             // Flat customer fields (WPF/Android compatibility)
             CustomerName: rawOrder.client?.name || '',
             CustomerPhone: rawOrder.client?.clientPhoneNumber || rawOrder.client?.maskedPhoneNumber || '',
+            // GY santral/extension ayrıştırması — Express APK auto-dial DTMF (geriye uyumlu, eski sürümler CustomerPhone'u okur)
+            CustomerPhoneClean: parsedPhone.main,
+            CustomerPhoneExtension: parsedPhone.extension,
+            CustomerPhoneRaw: rawPhone,
             CustomerAddress: rawOrder.client?.deliveryAddress?.address || '',
             CustomerCity: rawOrder.client?.deliveryAddress?.city || '',
             CustomerDistrict: rawOrder.client?.deliveryAddress?.district || '',

@@ -169,11 +169,16 @@ class YemekSepetiConnector extends BasePlatformConnector {
                 UnitPrice: parseFloat(p.unitPrice) || 0,
                 TotalPrice: parseFloat(p.paidPrice) || 0,
                 Note: p.comment || p.description || '',
+                // YS Discount Transparency (15.05.2026): ürün bazlı indirim + sponsorship breakdown.
+                // Eski payload'da bu alan yok → boş array döner (backward compat).
+                Discounts: this._extractDiscounts(p.discounts),
                 Options: (p.selectedToppings || []).map(o => ({
                     Name: o.name || '',
                     Value: o.value || '',
                     Price: parseFloat(o.price) || 0,
-                    Type: o.type || ''
+                    Type: o.type || '',
+                    // Topping bazlı indirim (15.05.2026 sonrası).
+                    Discounts: this._extractDiscounts(o.discounts)
                 }))
             })),
 
@@ -181,6 +186,8 @@ class YemekSepetiConnector extends BasePlatformConnector {
             TotalAmount: parseFloat(rawOrder.price?.grandTotal) || 0,
             DeliveryFee: parseFloat(rawOrder.price?.deliveryFee) || 0,
             DiscountAmount: parseFloat(rawOrder.price?.discountAmountTotal) || 0,
+            // Order-level indirim listesi (15.05.2026 sonrası, sponsorship breakdown için).
+            Discounts: this._extractDiscounts(rawOrder.discounts),
             // DH resmi alan: kuryenin/restoranın müşteriden tahsil edeceği tutar.
             // 0 → tam online ödenmiş, >0 → kapıda tahsil edilecek (miktar kadar).
             // Online/kapıda ayrımı için en kesin sinyal. Yok ise null (eski siparişler).
@@ -221,6 +228,32 @@ class YemekSepetiConnector extends BasePlatformConnector {
             ItemCount: (rawOrder.products || []).length,
             TotalQuantity: (rawOrder.products || []).reduce((sum, p) => sum + (parseInt(p.quantity) || 0), 0)
         };
+    }
+
+    /**
+     * YS Discount Transparency (15.05.2026): DH discounts[] dizisini normalize et.
+     *
+     * Üç seviyede aynı şema kullanılır: order-level, product-level, topping-level.
+     * Her discount: { name, amount, sponsorships[] }.
+     * Her sponsorship: { sponsor: "PLATFORM"|"VENDOR"|"THIRD_PARTY", amount }.
+     *
+     * Backward compat: 15.05 öncesi DH bu alanı göndermez, undefined/null/non-array → boş array.
+     *
+     * Not: name enum (Food Discount / Delivery Fee Discount / Loyalty) doğrulanmaz —
+     * defensive parsing, gelen ne ise yazılır. WPF/raporlama tarafında ele alınır.
+     */
+    _extractDiscounts(rawDiscounts) {
+        if (!Array.isArray(rawDiscounts) || rawDiscounts.length === 0) return [];
+        return rawDiscounts.map(d => ({
+            Name: d.name || '',
+            Amount: parseFloat(d.amount) || 0,
+            Sponsorships: Array.isArray(d.sponsorships)
+                ? d.sponsorships.map(s => ({
+                    Sponsor: s.sponsor || '',
+                    Amount: parseFloat(s.amount) || 0
+                }))
+                : []
+        }));
     }
 
     /**

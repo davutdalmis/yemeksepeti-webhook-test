@@ -8,6 +8,54 @@ const admin = require('firebase-admin');
 function createOrdersApi(registry, smartDispatch, { sendPushNotification, notifyCourierNewOrder, db, dispatchMetrics, dispatchQueue, io } = {}) {
     const router = express.Router();
 
+    // YemigoSync: dispatchAudit yazıcı — Express "geri atıyor" şikayeti teşhisi için
+    // (memory: project_dispatch_disappear_investigation.md). Her dispatch/status event'i
+    // `dispatchAudit` koleksiyonuna yazılır; Plan 29 batching/Hungarian/race senaryoları
+    // 5 dakika içinde Firestore'da görülebilir. Fire-and-forget — endpoint cevabını bloklamaz.
+    function writeDispatchAudit(eventData) {
+        if (!db) return;
+        try {
+            const doc = {
+                ...eventData,
+                timestamp: admin.firestore.FieldValue.serverTimestamp(),
+                serverInstance: process.env.RAILWAY_DEPLOYMENT_ID || process.env.RAILWAY_REPLICA_ID || 'local',
+                serviceName: process.env.RAILWAY_SERVICE_NAME || 'platforms'
+            };
+            // Fire-and-forget — promise dönmez, hata loglanır
+            db.collection('dispatchAudit').add(doc).catch((err) => {
+                console.warn('[OrdersAPI] dispatchAudit write failed (non-fatal):', err.message);
+            });
+        } catch (e) {
+            console.warn('[OrdersAPI] dispatchAudit prep failed (non-fatal):', e.message);
+        }
+    }
+
+    // BEFORE state okuyucu — endpoint çağrısı öncesi doc'un hangi durumda olduğunu yakala.
+    // Pickup/deliver gibi event'lerde "ne değişti" görmek için. Hata olursa null döner, audit yine yazılır.
+    async function snapshotDocBefore(connector, orderId) {
+        try {
+            const docRef = connector.db.collection(connector.collectionName).doc(orderId);
+            const snap = await docRef.get();
+            if (!snap.exists) return null;
+            const d = snap.data();
+            return {
+                Status: d.Status || null,
+                packageStatus: d.packageStatus || null,
+                rawStatus: d.rawStatus !== undefined ? d.rawStatus : null,
+                orderStatus: d.orderStatus || null,
+                IsDelivered: d.IsDelivered === undefined ? null : d.IsDelivered,
+                isDelivered: d.isDelivered === undefined ? null : d.isDelivered,
+                IsPrepared: d.IsPrepared === undefined ? null : d.IsPrepared,
+                assignedCourierId: d.assignedCourierId || d.AssignedCourierId || null,
+                updatedBy: d.updatedBy || null,
+                branchId: d.branchId || null
+            };
+        } catch (e) {
+            console.warn('[OrdersAPI] snapshotDocBefore failed:', e.message);
+            return null;
+        }
+    }
+
     // API Key authentication middleware
     const authenticateApiKey = (req, res, next) => {
         const apiKey = req.headers['x-api-key'];
@@ -45,10 +93,15 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
         const { platformId, orderId } = req.params;
         const { autoAssign = true } = req.body || {};
         const branchId = req.branchId;
+        const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
         try {
             const connector = registry.getConnector(platformId);
             if (!connector) {
+                writeDispatchAudit({
+                    requestId, action: 'accept', platformId, orderId, branchId,
+                    success: false, errorReason: 'PLATFORM_NOT_FOUND', source: 'orders-api'
+                });
                 return res.status(404).json({
                     success: false,
                     error: `Platform not found: ${platformId}`,
@@ -56,10 +109,16 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
                 });
             }
 
+            console.log(`[OrdersAPI] ACCEPT REQ | reqId=${requestId} | ${platformId}/${orderId} | branchId=${branchId} | autoAssign=${autoAssign}`);
+
             const branchConfig = registry.getBranchPlatformConfig(branchId, platformId) || {};
             const result = await connector.acceptOrder(orderId, branchConfig);
 
             if (!result.success) {
+                writeDispatchAudit({
+                    requestId, action: 'accept', platformId, orderId, branchId,
+                    success: false, errorReason: result.reason, source: 'orders-api'
+                });
                 return res.status(400).json({
                     success: false,
                     error: result.reason,
@@ -68,6 +127,10 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
             }
 
             console.log(`[OrdersAPI] Order accepted: ${platformId}/${orderId}`);
+            writeDispatchAudit({
+                requestId, action: 'accept', platformId, orderId, branchId,
+                success: true, source: 'orders-api', autoAssignRequested: autoAssign !== false
+            });
 
             // Push event: sipariş kabul edildi
             if (io && branchId) {
@@ -107,9 +170,25 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
                                 }
 
                                 console.log(`[OrdersAPI] Auto-assigned courier: ${courier.name} -> ${platformId}/${orderId}`);
+                                writeDispatchAudit({
+                                    requestId, action: 'auto-assign-on-accept', platformId, orderId, branchId,
+                                    success: true, source: 'orders-api',
+                                    courierId: courier.id, courierName: courier.name, autoAssigned: true
+                                });
+                            } else {
+                                writeDispatchAudit({
+                                    requestId, action: 'auto-assign-on-accept', platformId, orderId, branchId,
+                                    success: false, errorReason: assignResult.reason, source: 'orders-api',
+                                    courierId: courier.id, courierName: courier.name
+                                });
                             }
                         } else {
                             console.log(`[OrdersAPI] No courier available for auto-assign: ${platformId}/${orderId}`);
+                            writeDispatchAudit({
+                                requestId, action: 'auto-assign-on-accept', platformId, orderId, branchId,
+                                success: false, errorReason: 'NO_COURIER_AVAILABLE', source: 'orders-api',
+                                enqueuedForRetry: !!dispatchQueue
+                            });
                             // Enqueue for retry if dispatch queue is available
                             if (dispatchQueue) {
                                 await dispatchQueue.enqueue({
@@ -124,6 +203,10 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
                 } catch (assignError) {
                     // Non-fatal: order is accepted even if courier assignment fails
                     console.warn(`[OrdersAPI] Auto-assign failed for ${platformId}/${orderId}:`, assignError.message);
+                    writeDispatchAudit({
+                        requestId, action: 'auto-assign-on-accept', platformId, orderId, branchId,
+                        success: false, errorReason: assignError.message, source: 'orders-api'
+                    });
                 }
             }
 
@@ -269,16 +352,25 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
     router.post('/:platformId/:orderId/pickup', async (req, res) => {
         const { platformId, orderId } = req.params;
         const branchId = req.branchId;
+        const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
         try {
             const connector = registry.getConnector(platformId);
             if (!connector) {
+                writeDispatchAudit({
+                    requestId, action: 'pickup', platformId, orderId, branchId,
+                    success: false, errorReason: 'PLATFORM_NOT_FOUND', source: 'orders-api'
+                });
                 return res.status(404).json({
                     success: false,
                     error: `Platform not found: ${platformId}`,
                     code: 'PLATFORM_NOT_FOUND'
                 });
             }
+
+            // BEFORE state — flicker analizi için
+            const before = await snapshotDocBefore(connector, orderId);
+            console.log(`[OrdersAPI] PICKUP REQ | reqId=${requestId} | ${platformId}/${orderId} | branchId=${branchId} | before=${JSON.stringify(before)}`);
 
             // Call platform API (non-blocking for Firestore update)
             const branchConfig = registry.getBranchPlatformConfig(branchId, platformId) || {};
@@ -311,6 +403,16 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
 
             console.log(`[OrdersAPI] Order picked up: ${platformId}/${orderId} (platform API: ${platformResult.success})`);
 
+            // AFTER state + audit — Express'in göreceği doc'u doğrula
+            const after = await snapshotDocBefore(connector, orderId);
+            console.log(`[OrdersAPI] PICKUP DONE | reqId=${requestId} | ${platformId}/${orderId} | platformApi=${platformResult.success} | after=${JSON.stringify(after)}`);
+            writeDispatchAudit({
+                requestId, action: 'pickup', platformId, orderId, branchId,
+                success: true, source: 'orders-api',
+                platformApiSuccess: platformResult.success, platformApiReason: platformResult.reason || null,
+                statusBefore: before, statusAfter: after
+            });
+
             // Push event: kurye siparişi aldı
             if (io && branchId) {
                 io.to(`branch:${branchId}`).emit('order:status_changed', {
@@ -327,6 +429,10 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
             });
         } catch (error) {
             console.error(`[OrdersAPI] Pickup error:`, error.message);
+            writeDispatchAudit({
+                requestId, action: 'pickup', platformId, orderId, branchId,
+                success: false, errorReason: error.message, source: 'orders-api'
+            });
             res.status(500).json({
                 success: false,
                 error: error.message,
@@ -343,16 +449,25 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
     router.post('/:platformId/:orderId/deliver', async (req, res) => {
         const { platformId, orderId } = req.params;
         const branchId = req.branchId;
+        const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
         try {
             const connector = registry.getConnector(platformId);
             if (!connector) {
+                writeDispatchAudit({
+                    requestId, action: 'deliver', platformId, orderId, branchId,
+                    success: false, errorReason: 'PLATFORM_NOT_FOUND', source: 'orders-api'
+                });
                 return res.status(404).json({
                     success: false,
                     error: `Platform not found: ${platformId}`,
                     code: 'PLATFORM_NOT_FOUND'
                 });
             }
+
+            // BEFORE state — flicker analizi için
+            const before = await snapshotDocBefore(connector, orderId);
+            console.log(`[OrdersAPI] DELIVER REQ | reqId=${requestId} | ${platformId}/${orderId} | branchId=${branchId} | before=${JSON.stringify(before)}`);
 
             // Call platform API (non-blocking for Firestore update)
             const branchConfig = registry.getBranchPlatformConfig(branchId, platformId) || {};
@@ -413,6 +528,17 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
 
             console.log(`[OrdersAPI] Order delivered: ${platformId}/${orderId} (platform API: ${platformResult.success})`);
 
+            // AFTER state + audit
+            const after = await snapshotDocBefore(connector, orderId);
+            console.log(`[OrdersAPI] DELIVER DONE | reqId=${requestId} | ${platformId}/${orderId} | platformApi=${platformResult.success} | after=${JSON.stringify(after)}`);
+            writeDispatchAudit({
+                requestId, action: 'deliver', platformId, orderId, branchId,
+                success: true, source: 'orders-api',
+                platformApiSuccess: platformResult.success, platformApiReason: platformResult.reason || null,
+                courierId: assignedCourierId || null,
+                statusBefore: before, statusAfter: after
+            });
+
             // Push event: sipariş teslim edildi
             if (io && branchId) {
                 io.to(`branch:${branchId}`).emit('order:status_changed', {
@@ -429,6 +555,10 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
             });
         } catch (error) {
             console.error(`[OrdersAPI] Deliver error:`, error.message);
+            writeDispatchAudit({
+                requestId, action: 'deliver', platformId, orderId, branchId,
+                success: false, errorReason: error.message, source: 'orders-api'
+            });
             res.status(500).json({
                 success: false,
                 error: error.message,
@@ -448,16 +578,26 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
         const { platformId, orderId } = req.params;
         const { courierId, courierName, autoAssign, deliveryLatitude, deliveryLongitude } = req.body || {};
         const branchId = req.branchId;
+        const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
         try {
             const connector = registry.getConnector(platformId);
             if (!connector) {
+                writeDispatchAudit({
+                    requestId, action: 'assign-courier', platformId, orderId, branchId,
+                    success: false, errorReason: 'PLATFORM_NOT_FOUND', source: 'orders-api'
+                });
                 return res.status(404).json({
                     success: false,
                     error: `Platform not found: ${platformId}`,
                     code: 'PLATFORM_NOT_FOUND'
                 });
             }
+
+            // BEFORE state — eski kurye atamasını yakala (reassignment teşhisi için kritik)
+            const before = await snapshotDocBefore(connector, orderId);
+            const oldCourierId = before?.assignedCourierId || null;
+            console.log(`[OrdersAPI] ASSIGN REQ | reqId=${requestId} | ${platformId}/${orderId} | branchId=${branchId} | oldCourier=${oldCourierId} | requestedCourier=${courierId || '<auto>'} | autoAssign=${autoAssign !== false}`);
 
             let assignedCourierId = courierId;
             let assignedCourierName = courierName;
@@ -498,6 +638,11 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
             }
 
             if (!assignedCourierId) {
+                writeDispatchAudit({
+                    requestId, action: 'assign-courier', platformId, orderId, branchId,
+                    success: false, errorReason: 'NO_COURIER', source: 'orders-api',
+                    statusBefore: before
+                });
                 return res.status(400).json({
                     success: false,
                     error: 'No courier specified or available',
@@ -509,6 +654,15 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
 
             if (result.success) {
                 console.log(`[OrdersAPI] Courier assigned: ${platformId}/${orderId} -> ${assignedCourierName}`);
+                const isReassignment = oldCourierId && oldCourierId !== assignedCourierId;
+                writeDispatchAudit({
+                    requestId, action: 'assign-courier', platformId, orderId, branchId,
+                    success: true, source: 'orders-api',
+                    courierId: assignedCourierId, courierName: assignedCourierName,
+                    oldCourierId, isReassignment,
+                    autoAssigned: !courierId,
+                    statusBefore: before
+                });
 
                 // Send push notification to assigned courier
                 if (notifyCourierNewOrder) {
@@ -531,6 +685,13 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
                     courierName: assignedCourierName
                 });
             } else {
+                writeDispatchAudit({
+                    requestId, action: 'assign-courier', platformId, orderId, branchId,
+                    success: false, errorReason: result.reason, source: 'orders-api',
+                    courierId: assignedCourierId, courierName: assignedCourierName,
+                    oldCourierId,
+                    statusBefore: before
+                });
                 res.status(400).json({
                     success: false,
                     error: result.reason,
@@ -539,6 +700,10 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
             }
         } catch (error) {
             console.error(`[OrdersAPI] Assign courier error:`, error.message);
+            writeDispatchAudit({
+                requestId, action: 'assign-courier', platformId, orderId, branchId,
+                success: false, errorReason: error.message, source: 'orders-api'
+            });
             res.status(500).json({
                 success: false,
                 error: error.message,

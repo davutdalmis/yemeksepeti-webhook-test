@@ -114,8 +114,21 @@ class BasePlatformConnector {
             const orderDoc = await orderRef.get();
 
             if (!orderDoc.exists) {
+                console.warn(`[${this.platformId}] updateOrderStatus: order_not_found ${orderId}`);
                 return { success: false, reason: 'order_not_found' };
             }
+
+            // BEFORE state — flicker analizi için (project_dispatch_disappear_investigation.md)
+            // Express'in beklediği alan adlarını birleştirilmiş şekilde dump et.
+            const beforeData = orderDoc.data() || {};
+            const beforeSummary = {
+                Status: beforeData.Status, packageStatus: beforeData.packageStatus,
+                rawStatus: beforeData.rawStatus, orderStatus: beforeData.orderStatus,
+                IsDelivered: beforeData.IsDelivered, isDelivered: beforeData.isDelivered,
+                IsPrepared: beforeData.IsPrepared, isPrepared: beforeData.isPrepared,
+                assignedCourierId: beforeData.assignedCourierId || beforeData.AssignedCourierId,
+                updatedBy: beforeData.updatedBy
+            };
 
             const updateData = {
                 Status: status,
@@ -123,10 +136,16 @@ class BasePlatformConnector {
                 ...additionalData
             };
 
+            // YemigoSync: Express mapper'ları platform-spesifik field'lara bakar (TG packageStatus,
+            // GY rawStatus). Burada Status yazıldığında ama platform field değişmediğinde flicker olur.
+            // additionalData içinde packageStatus/rawStatus var mı kontrol etmek için log.
+            const additionalKeys = Object.keys(additionalData).join(',');
+            console.log(`[${this.platformId}] STATUS-WRITE | orderId=${orderId} | newStatus=${status} | beforeStatus=${beforeData.Status} | beforePackageStatus=${beforeData.packageStatus || '<n/a>'} | beforeRawStatus=${beforeData.rawStatus || '<n/a>'} | additionalKeys=[${additionalKeys}] | before=${JSON.stringify(beforeSummary)}`);
+
             await orderRef.update(updateData);
 
             console.log(`[${this.platformId}] Order status updated: ${orderId} -> ${status}`);
-            return { success: true, orderId, status };
+            return { success: true, orderId, status, beforeStatus: beforeData.Status };
 
         } catch (error) {
             console.error(`[${this.platformId}] Status update error:`, error.message);
@@ -164,6 +183,14 @@ class BasePlatformConnector {
             let oldCourierRef = null;
             const orderData = orderDoc.data();
             const oldCourierId = orderData.assignedCourierId;
+
+            // YemigoSync: reassignment teşhisi — kurye değişikliği "geri atıyor" şikayetinin
+            // ana sebeplerinden biri (Plan 29 Faz 3 batching, Hungarian global matcher).
+            if (oldCourierId && oldCourierId !== courierId) {
+                console.warn(`[${this.platformId}] REASSIGN-DETECTED | orderId=${orderId} | oldCourier=${oldCourierId} | newCourier=${courierId} (${courierName}) | currentStatus=${orderData.Status} | isDelivered=${orderData.IsDelivered || orderData.isDelivered}`);
+            } else if (!oldCourierId) {
+                console.log(`[${this.platformId}] FIRST-ASSIGN | orderId=${orderId} | newCourier=${courierId} (${courierName}) | currentStatus=${orderData.Status}`);
+            }
 
             try {
                 const courierQuery = await this.db.collectionGroup('couriers')
@@ -225,10 +252,11 @@ class BasePlatformConnector {
                     transaction.update(ref, updateData);
                 }
 
-                // Increment new courier's activeOrderCount
+                // Increment new courier's activeOrderCount + Plan 29 Faz 1.1 round-robin sinyali
                 if (courierRef) {
                     transaction.update(courierRef, {
-                        activeOrderCount: admin.firestore.FieldValue.increment(1)
+                        activeOrderCount: admin.firestore.FieldValue.increment(1),
+                        lastAssignedAt: admin.firestore.FieldValue.serverTimestamp()
                     });
                 }
 

@@ -11,12 +11,14 @@ class SmartDispatchServiceTestable {
         // [FIX-2] Counter-based tracking (not single-entry)
         this.pendingAssignments = new Map();
         this._assignmentQueue = Promise.resolve();
+        // Plan 29 Faz 1.1+1.2 — yeni 6-key default weights
         this.weights = {
-            distanceToBranch: 0.25,
-            availability: 0.25,
-            workload: 0.20,
-            deliveryProximity: 0.15,
-            performance: 0.15
+            distanceToBranch: 0.18,
+            availability: 0.22,
+            workload: 0.25,
+            deliveryProximity: 0.10,
+            performance: 0.15,
+            recency: 0.10
         };
         this.MAX_DISTANCE_KM = 10.0;
         this.MAX_AVAILABILITY_MINUTES = 60.0;
@@ -24,6 +26,8 @@ class SmartDispatchServiceTestable {
         this.MAX_RATING = 5.0;
         this.ASSIGNMENT_TRACKING_TTL_MS = 60 * 1000;
         this.TIE_BREAKER_THRESHOLD = 5.0;
+        this.RECENCY_HOT_S = 60;
+        this.RECENCY_WARM_S = 300;
     }
 
     _isValidCoordinate(lat, lon) {
@@ -79,9 +83,23 @@ class SmartDispatchServiceTestable {
         return Math.min(estimatedBusyMinutes / this.MAX_AVAILABILITY_MINUTES, 1.0) * 100;
     }
 
+    // Plan 29 Faz 1.2 — eksponansiyel
     _calcWorkloadScore(activeOrderCount) {
-        if (activeOrderCount === 0) return 0;
-        return Math.min(activeOrderCount / this.MAX_ACTIVE_ORDERS, 1.0) * 100;
+        const tiers = [0, 30, 60, 85, 100];
+        return tiers[Math.min(activeOrderCount, tiers.length - 1)];
+    }
+
+    // Plan 29 Faz 1.1 — round-robin sinyali
+    _calcRecencyScore(lastAssignedAt) {
+        if (!lastAssignedAt) return 0;
+        const lastMs = typeof lastAssignedAt.toMillis === 'function'
+            ? lastAssignedAt.toMillis()
+            : new Date(lastAssignedAt).getTime();
+        if (!Number.isFinite(lastMs)) return 0;
+        const deltaS = (Date.now() - lastMs) / 1000;
+        if (deltaS < this.RECENCY_HOT_S) return 100;
+        if (deltaS < this.RECENCY_WARM_S) return 50;
+        return 0;
     }
 
     _calcDeliveryProximityScore(courier, deliveryLocation, deliveryDistanceInfo) {
@@ -118,13 +136,16 @@ class SmartDispatchServiceTestable {
         const workloadScore = this._calcWorkloadScore(courier.activeOrderCount);
         const deliveryProximityScore = this._calcDeliveryProximityScore(courier, deliveryLocation, deliveryDistanceInfo);
         const performanceScore = this._calcPerformanceScore(courier);
+        const recencyScore = this._calcRecencyScore(courier.lastAssignedAt);
+        const recencyWeight = typeof this.weights.recency === 'number' ? this.weights.recency : 0;
 
         const totalScore =
             (distanceToBranchScore * this.weights.distanceToBranch) +
             (availabilityScore * this.weights.availability) +
             (workloadScore * this.weights.workload) +
             (deliveryProximityScore * this.weights.deliveryProximity) +
-            ((100 - performanceScore) * this.weights.performance);
+            ((100 - performanceScore) * this.weights.performance) +
+            (recencyScore * recencyWeight);
 
         return {
             totalScore,
@@ -133,7 +154,8 @@ class SmartDispatchServiceTestable {
                 availability: availabilityScore,
                 workload: workloadScore,
                 deliveryProximity: deliveryProximityScore,
-                performance: performanceScore
+                performance: performanceScore,
+                recency: recencyScore
             }
         };
     }
@@ -204,12 +226,13 @@ describe('SmartDispatchService - 5-Factor Scoring', () => {
             expect(sum).toBeCloseTo(1.0, 5);
         });
 
-        test('weights match WPF DispatchWeights defaults', () => {
-            expect(service.weights.distanceToBranch).toBe(0.25);
-            expect(service.weights.availability).toBe(0.25);
-            expect(service.weights.workload).toBe(0.20);
-            expect(service.weights.deliveryProximity).toBe(0.15);
+        test('weights match Plan 29 Faz 1 defaults (6-key)', () => {
+            expect(service.weights.distanceToBranch).toBe(0.18);
+            expect(service.weights.availability).toBe(0.22);
+            expect(service.weights.workload).toBe(0.25);
+            expect(service.weights.deliveryProximity).toBe(0.10);
             expect(service.weights.performance).toBe(0.15);
+            expect(service.weights.recency).toBe(0.10);
         });
     });
 
@@ -337,25 +360,63 @@ describe('SmartDispatchService - 5-Factor Scoring', () => {
 
     // ==================== WORKLOAD SCORE ====================
 
-    describe('Workload Score', () => {
+    describe('Workload Score (Plan 29 Faz 1.2 — eksponansiyel)', () => {
         test('0 active orders = 0', () => {
             expect(service._calcWorkloadScore(0)).toBe(0);
         });
 
-        test('1 active order = 20', () => {
-            expect(service._calcWorkloadScore(1)).toBe(20);
+        test('1 active order = 30 (sertleştirildi: eski 20)', () => {
+            expect(service._calcWorkloadScore(1)).toBe(30);
         });
 
-        test('3 active orders = 60', () => {
-            expect(service._calcWorkloadScore(3)).toBe(60);
+        test('2 active orders = 60', () => {
+            expect(service._calcWorkloadScore(2)).toBe(60);
         });
 
-        test('5 active orders = 100', () => {
+        test('3 active orders = 85 (sertleştirildi: eski 60)', () => {
+            expect(service._calcWorkloadScore(3)).toBe(85);
+        });
+
+        test('4 active orders = 100 (sertleştirildi: eski 80)', () => {
+            expect(service._calcWorkloadScore(4)).toBe(100);
+        });
+
+        test('5+ active orders capped at 100', () => {
             expect(service._calcWorkloadScore(5)).toBe(100);
+            expect(service._calcWorkloadScore(10)).toBe(100);
+        });
+    });
+
+    // ==================== RECENCY SCORE (Plan 29 Faz 1.1) ====================
+
+    describe('Recency Score (Plan 29 Faz 1.1 — round-robin sinyali)', () => {
+        test('lastAssignedAt null = 0 (yeni kurye, ceza yok)', () => {
+            expect(service._calcRecencyScore(null)).toBe(0);
+            expect(service._calcRecencyScore(undefined)).toBe(0);
         });
 
-        test('10 active orders capped at 100', () => {
-            expect(service._calcWorkloadScore(10)).toBe(100);
+        test('30 saniye önce atandı = 100 (tam ceza)', () => {
+            const thirtySecAgo = new Date(Date.now() - 30 * 1000);
+            expect(service._calcRecencyScore(thirtySecAgo)).toBe(100);
+        });
+
+        test('2 dakika önce atandı = 50 (yarı ceza)', () => {
+            const twoMinAgo = new Date(Date.now() - 120 * 1000);
+            expect(service._calcRecencyScore(twoMinAgo)).toBe(50);
+        });
+
+        test('10 dakika önce atandı = 0 (ceza yok)', () => {
+            const tenMinAgo = new Date(Date.now() - 600 * 1000);
+            expect(service._calcRecencyScore(tenMinAgo)).toBe(0);
+        });
+
+        test('Firestore Timestamp (toMillis) desteği', () => {
+            const fakeTs = { toMillis: () => Date.now() - 30 * 1000 };
+            expect(service._calcRecencyScore(fakeTs)).toBe(100);
+        });
+
+        test('geçersiz değer = 0 (güvenli fallback)', () => {
+            expect(service._calcRecencyScore('not-a-date')).toBe(0);
         });
     });
 
@@ -469,21 +530,43 @@ describe('SmartDispatchService - 5-Factor Scoring', () => {
             expect(totalScore).toBeGreaterThan(70);
         });
 
-        test('score uses all 5 factors with correct weights', () => {
+        test('score uses all 6 factors with correct weights (Plan 29)', () => {
             const courier = createCourier({ activeOrderCount: 2 });
             const { totalScore, details } = service.calculateCourierScore(
                 courier, DELIVERY_LOCATION, BRANCH_LOCATION, null, null
             );
 
-            // Manually verify weighted sum
+            // Manually verify weighted sum (Plan 29 Faz 1 weights)
             const expected =
-                (details.distanceToBranch * 0.25) +
-                (details.availability * 0.25) +
-                (details.workload * 0.20) +
-                (details.deliveryProximity * 0.15) +
-                ((100 - details.performance) * 0.15);
+                (details.distanceToBranch * 0.18) +
+                (details.availability * 0.22) +
+                (details.workload * 0.25) +
+                (details.deliveryProximity * 0.10) +
+                ((100 - details.performance) * 0.15) +
+                (details.recency * 0.10);
 
             expect(totalScore).toBeCloseTo(expected, 5);
+            expect(details.recency).toBe(0); // courier with no lastAssignedAt
+        });
+
+        test('recently-assigned courier penalized vs idle courier (round-robin)', () => {
+            // İki özdeş kurye, biri 30sn önce atandı, diğeri hiç atanmadı
+            const justAssigned = createCourier({
+                id: 'just-assigned',
+                lastAssignedAt: new Date(Date.now() - 30 * 1000)
+            });
+            const idle = createCourier({ id: 'idle', lastAssignedAt: null });
+
+            const justScore = service.calculateCourierScore(
+                justAssigned, DELIVERY_LOCATION, BRANCH_LOCATION, null, null
+            );
+            const idleScore = service.calculateCourierScore(
+                idle, DELIVERY_LOCATION, BRANCH_LOCATION, null, null
+            );
+
+            // recency 100 × 0.10 = 10 puan ceza fark eder
+            expect(idleScore.totalScore).toBeLessThan(justScore.totalScore);
+            expect(justScore.totalScore - idleScore.totalScore).toBeCloseTo(10, 1);
         });
 
         test('better courier scores lower than worse courier', () => {
@@ -513,6 +596,76 @@ describe('SmartDispatchService - 5-Factor Scoring', () => {
             );
 
             expect(goodScore.totalScore).toBeLessThan(badScore.totalScore);
+        });
+    });
+
+    // ==================== READY-AWARE AVAILABILITY (Plan 29 Faz 2.2) ====================
+
+    describe('Ready-aware availability score (Plan 29 Faz 2.2)', () => {
+        // Test_double helper — prod kodu kopyası
+        function calcReadyAware(activeOrderCount, readyAtMinutesFromNow) {
+            const courier = { activeOrderCount };
+            const readyAt = new Date(Date.now() + readyAtMinutesFromNow * 60 * 1000);
+            return service._calcAvailabilityScoreReadyAware
+                ? service._calcAvailabilityScoreReadyAware(courier, readyAt, null)
+                : null;
+        }
+
+        beforeEach(() => {
+            // Test double class extension — Faz 2.2 method'unu eklemek için
+            if (!service._calcAvailabilityScoreReadyAware) {
+                service._calcAvailabilityScoreReadyAware = function(courier, estimatedReadyAt, branchDistanceInfo) {
+                    if (!estimatedReadyAt) return null;
+                    const readyMs = typeof estimatedReadyAt.toMillis === 'function'
+                        ? estimatedReadyAt.toMillis()
+                        : new Date(estimatedReadyAt).getTime();
+                    if (!Number.isFinite(readyMs)) return null;
+                    let busyMinutes = (courier.activeOrderCount || 0) * 20;
+                    if (branchDistanceInfo && branchDistanceInfo.isSuccess && !branchDistanceInfo.isFallback) {
+                        busyMinutes += branchDistanceInfo.durationMinutes || 0;
+                    }
+                    const freeAtMs = Date.now() + busyMinutes * 60 * 1000;
+                    const deltaMin = (freeAtMs - readyMs) / 60000;
+                    if (deltaMin < -10) return 50;
+                    if (deltaMin <= 5) return 0;
+                    if (deltaMin <= 15) return 50;
+                    return 100;
+                };
+            }
+        });
+
+        test('estimatedReadyAt yoksa null döner (eski formüle düşer)', () => {
+            expect(service._calcAvailabilityScoreReadyAware({ activeOrderCount: 0 }, null, null)).toBe(null);
+        });
+
+        test('boş kurye, yemek 15 dk sonra hazır → 50 (kurye 10dk+ erken)', () => {
+            // freeAt=now, readyAt=now+15dk → Δ=-15 → 50
+            expect(calcReadyAware(0, 15)).toBe(50);
+        });
+
+        test('boş kurye, yemek 3 dk sonra hazır → 0 (mükemmel pencere)', () => {
+            // freeAt=now, readyAt=now+3 → Δ=-3 → mükemmel (-10≤Δ≤5)
+            expect(calcReadyAware(0, 3)).toBe(0);
+        });
+
+        test('1 aktif sipariş (20 dk meşgul), yemek 15 dk sonra → 0 (mükemmel: Δ=5)', () => {
+            // freeAt=now+20, readyAt=now+15 → Δ=5 → mükemmel
+            expect(calcReadyAware(1, 15)).toBe(0);
+        });
+
+        test('1 aktif sipariş (20 dk), yemek 5 dk sonra hazır → 50 (yemek 15 dk soğur)', () => {
+            // freeAt=now+20, readyAt=now+5 → Δ=15 → soğuma penceresi
+            expect(calcReadyAware(1, 5)).toBe(50);
+        });
+
+        test('2 aktif sipariş (40 dk meşgul), yemek hemen hazır → 100 (kabul edilemez geç)', () => {
+            // freeAt=now+40, readyAt=now → Δ=40 → 100
+            expect(calcReadyAware(2, 0)).toBe(100);
+        });
+
+        test('Firestore Timestamp toMillis desteği', () => {
+            const fakeTs = { toMillis: () => Date.now() + 3 * 60 * 1000 };
+            expect(service._calcAvailabilityScoreReadyAware({ activeOrderCount: 0 }, fakeTs, null)).toBe(0);
         });
     });
 
@@ -693,16 +846,16 @@ describe('SmartDispatchService - 5-Factor Scoring', () => {
             const activeA = 0 + service._getPendingCount('courier-A'); // simulating getActiveOrderCount
             expect(activeA).toBe(2);
 
-            // Workload score for 2 active orders = 40
-            expect(service._calcWorkloadScore(activeA)).toBe(40);
+            // Plan 29 Faz 1.2: 2 active orders = 60 (eksponansiyel, eski 40)
+            expect(service._calcWorkloadScore(activeA)).toBe(60);
 
             // Courier B: 0 Firestore + 0 pending = 0 active
             const activeB = 0 + service._getPendingCount('courier-B');
             expect(activeB).toBe(0);
             expect(service._calcWorkloadScore(activeB)).toBe(0);
 
-            // B's workload score (0) is clearly better than A's (40)
-            // This 8-point difference (40*0.20 = 8) is enough to shift scoring
+            // B's workload score (0) much better than A's (60)
+            // Yeni ağırlık 0.25 ile fark: 60*0.25 = 15 puan (eski: 40*0.20=8) — şubedeki kuryenin baskınlığını kırar
         });
     });
 
