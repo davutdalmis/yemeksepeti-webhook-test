@@ -714,9 +714,11 @@ class SmartDispatchService {
 
         return this.firestoreBreaker.execute(
             async () => {
-                const allBranches = await this.db.collectionGroup('branches').where('id', '==', branchId).get();
-                if (!allBranches.empty) {
-                    const data = allBranches.docs[0].data();
+                // Branches root collection; doc id == branchId. Earlier collectionGroup('branches')
+                // .where('id','==',branchId) silently returned empty because docs have no 'id' field.
+                const branchDoc = await this.db.doc(`branches/${branchId}`).get();
+                if (branchDoc.exists) {
+                    const data = branchDoc.data();
                     return {
                         latitude: data.latitude || data.lat || 0,
                         longitude: data.longitude || data.lng || 0
@@ -733,7 +735,10 @@ class SmartDispatchService {
 
         return this.firestoreBreaker.execute(
             async () => {
-                const couriersSnapshot = await this.db.collectionGroup('couriers')
+                // Couriers live in root /couriers/. Avoid collectionGroup (requires composite
+                // COLLECTION_GROUP index on branchId+isOnDuty+isActive that is not deployed —
+                // before this fix every probe failed and tripped firestore-read circuit breaker).
+                const couriersSnapshot = await this.db.collection('couriers')
                     .where('branchId', '==', branchId)
                     .where('isOnDuty', '==', true)
                     .where('isActive', '==', true)
@@ -775,7 +780,9 @@ class SmartDispatchService {
                 // [FIX-1] Include 'NEW' and 'PREPARING' statuses — orders assigned during
                 // webhook flow keep Status:'NEW', accept flow keeps Status:'ACCEPTED'
                 for (const platform of platforms) {
-                    const ordersSnapshot = await this.db.collectionGroup(platform)
+                    // Orders live in root collections. collectionGroup variant needs COLLECTION_GROUP
+                    // composite index on (assignedCourierId, Status) which is not deployed.
+                    const ordersSnapshot = await this.db.collection(platform)
                         .where('assignedCourierId', '==', courierId)
                         .where('Status', 'in', ['NEW', 'PREPARING', 'ASSIGNED', 'ACCEPTED', 'PICKED_UP', 'ON_THE_WAY'])
                         .get();
