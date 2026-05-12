@@ -703,21 +703,26 @@ class ParasutProvider {
     /**
      * Listele 'person' tipindeki contact'lari (Yemigo'da bunlar surucu olarak kullanilir).
      * Paraşüt'te merkezi sürücü/carrier CRUD yok; person contacts kullanılır.
+     *
+     * NOT: Paraşüt API'sinde `filter[contact_type]` parametresi YOK (swagger:2304).
+     * Tüm contact'lar çekilir, client-side `attributes.contact_type === 'person'` filtresi.
+     *
      * @returns {Promise<Array<{id, name, taxNumber, phone, email, archived}>>}
      */
-    async listPersonContacts(token, { limit = 100 } = {}) {
+    async listPersonContacts(token, { limit = 200 } = {}) {
         const out = [];
         let page = 1;
-        // Paraşüt JSON:API sayfalama: page[number]=N, page[size]=M (max 25 default)
-        // 4 sayfaya kadar tarar (toplam 100 kayit)
+        // Paraşüt page[size] max 25 (swagger:2304)
         const maxPages = Math.ceil(limit / 25);
         while (page <= maxPages) {
-            const suffix = `/contacts?filter[contact_type]=person&page[number]=${page}&page[size]=25&sort=name`;
+            const suffix = `/contacts?page[number]=${page}&page[size]=25&sort=name`;
             const data = await this._get(token, suffix);
             const items = Array.isArray(data?.data) ? data.data : [];
             if (items.length === 0) break;
             for (const it of items) {
                 const a = it.attributes || {};
+                // Client-side filter: yalniz 'person' tipindekiler
+                if (a.contact_type !== 'person') continue;
                 out.push({
                     id: it.id,
                     name: a.name || '',
