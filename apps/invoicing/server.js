@@ -229,6 +229,24 @@ app.get('/invoicing/tenants/:tenantId', requireApiKey, async (req, res) => {
     }
 });
 
+// ---------------- Paraşüt 'person' contacts (driver candidates) ----------------
+
+app.get('/invoicing/parasut/:tenantId/contacts/persons', requireApiKey, async (req, res) => {
+    try {
+        const { tenantId } = req.params;
+        if (!tenantId) return res.status(400).json({ error: 'missing_tenantId' });
+
+        const provider = await providerFactory(tenantId);
+        const token = await tokenManager.getValidToken(tenantId);
+        const contacts = await provider.listPersonContacts(token, { limit: 200 });
+        res.json({ ok: true, count: contacts.length, contacts });
+    } catch (e) {
+        console.error('[invoicing-engine] persons contacts error:', e.message);
+        const status = e.status || (e instanceof InvoiceProviderError && e.status) || 500;
+        res.status(status).json({ ok: false, error: e.code || 'internal_error', message: e.message });
+    }
+});
+
 // ---------------- Faz 2: Lifecycle (queue + worker + listener) ----------------
 // Init iki aşamalı:
 //   1. ApprovalProcessor (Plan 28) — sadece Firestore + provider gerektirir, Redis bağımsız.

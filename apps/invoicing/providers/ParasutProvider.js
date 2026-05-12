@@ -700,6 +700,42 @@ class ParasutProvider {
         return `/v4/${this.companyId}${s}`;
     }
 
+    /**
+     * Listele 'person' tipindeki contact'lari (Yemigo'da bunlar surucu olarak kullanilir).
+     * Paraşüt'te merkezi sürücü/carrier CRUD yok; person contacts kullanılır.
+     * @returns {Promise<Array<{id, name, taxNumber, phone, email, archived}>>}
+     */
+    async listPersonContacts(token, { limit = 100 } = {}) {
+        const out = [];
+        let page = 1;
+        // Paraşüt JSON:API sayfalama: page[number]=N, page[size]=M (max 25 default)
+        // 4 sayfaya kadar tarar (toplam 100 kayit)
+        const maxPages = Math.ceil(limit / 25);
+        while (page <= maxPages) {
+            const suffix = `/contacts?filter[contact_type]=person&page[number]=${page}&page[size]=25&sort=name`;
+            const data = await this._get(token, suffix);
+            const items = Array.isArray(data?.data) ? data.data : [];
+            if (items.length === 0) break;
+            for (const it of items) {
+                const a = it.attributes || {};
+                out.push({
+                    id: it.id,
+                    name: a.name || '',
+                    taxNumber: a.tax_number || '',
+                    phone: a.phone || '',
+                    email: a.email || '',
+                    city: a.city || '',
+                    district: a.district || '',
+                    address: a.address || '',
+                    archived: a.archived === true,
+                });
+            }
+            if (items.length < 25) break;
+            page += 1;
+        }
+        return out;
+    }
+
     async _get(token, suffix) {
         const url = `${this.baseUrl}${this._basePath(suffix)}`;
         try {
