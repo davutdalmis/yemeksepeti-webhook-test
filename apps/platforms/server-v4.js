@@ -1368,17 +1368,42 @@ async function sendPushNotification(fcmToken, title, body, data = {}) {
 }
 
 async function notifyCourierNewOrder(courier, order, platform) {
-    if (!courier || !courier.fcmToken) return false;
+    if (!courier) return false;
+
+    // fcmToken eksikse couriers dokümanından çek. orders-api manuel/yeniden atama yolu
+    // notifyCourierNewOrder'a sadece { id, name } geçiriyor — token olmadan push sessizce
+    // düşerdi. Buradaki lookup ile auto + manuel atamanın ikisi de atanan kuryeye push atar.
+    let fcmToken = courier.fcmToken || null;
+    if (!fcmToken && courier.id && firebaseInitialized && db) {
+        try {
+            const courierDoc = await db.collection('couriers').doc(courier.id).get();
+            if (courierDoc.exists) fcmToken = courierDoc.data().fcmToken || null;
+        } catch (err) {
+            console.warn(`[FCM] courier fcmToken lookup failed (${courier.id}):`, err.message);
+        }
+    }
+    if (!fcmToken) {
+        console.warn(`[FCM] courier ${courier.id || '?'} has no fcmToken — push skipped`);
+        return false;
+    }
 
     const customerName = order.Customer?.FirstName || order.customerName || 'Müşteri';
     const address = order.Customer?.Address?.FullAddress || order.deliveryAddress || '';
     const shortAddress = address.length > 50 ? address.substring(0, 50) + '...' : address;
 
     return await sendPushNotification(
-        courier.fcmToken,
+        fcmToken,
         `Yeni ${platform} Siparişi`,
         `${customerName} - ${shortAddress}`,
-        { type: 'NEW_ORDER', orderId: order.OrderId || order.id, platform, branchId: order.branchId || '' }
+        // courierId payload'da gönderilir — Express tarafı bildirimi sadece atanan
+        // kuryeye gösterir (bayat/paylaşılan token'a karşı istemci tarafı güvence).
+        {
+            type: 'NEW_ORDER',
+            orderId: order.OrderId || order.id,
+            platform,
+            branchId: order.branchId || '',
+            courierId: courier.id || ''
+        }
     );
 }
 
