@@ -33,6 +33,7 @@ const createPlatformsApi = require('./services/api/platforms-api');
 const createDelayedCallApi = require('./services/api/delayed-call-api');
 // SMS_BRANDING_MIGRATION_PLAN.md F2 — telefon OTP doğrulama
 const createOtpApi = require('./services/api/otp-api');
+const createAuthApi = require('./services/api/auth-api');
 const OtpService = require('./services/otp/otp-service');
 const TwilioProvider = require('./services/sms/twilio-provider');
 const GoogleMapsDistanceService = require('./services/google-maps-distance');
@@ -474,6 +475,14 @@ try {
     }
 } catch (e) {
     console.error('[OTP] OtpService init hatası:', e.message);
+}
+
+// F3 — /api/v2/auth/phone-signin için Firebase Auth (custom token üretimi)
+let firebaseAuth = null;
+try {
+    if (firebaseInitialized) firebaseAuth = admin.auth();
+} catch (e) {
+    console.error('[Auth] firebaseAuth init hatası:', e.message);
 }
 
 async function initializePlatformHub() {
@@ -1700,6 +1709,9 @@ app.use('/api/v2/delayed-call', (req, res, next) => {
 // OTP telefon doğrulama (SMS_BRANDING_MIGRATION_PLAN.md F2)
 // otpService startup'ta kurulur; env eksikse null → router 503 döner.
 app.use('/api/v2/otp', createOtpApi(otpService));
+
+// OTP → Firebase Custom Token sign-in (SMS_BRANDING_MIGRATION_PLAN.md F3)
+app.use('/api/v2/auth', createAuthApi(otpService, firebaseAuth));
 
 // ==================== YEMEKSEPETI WEBHOOKS (LEGACY COMPATIBILITY) ====================
 
