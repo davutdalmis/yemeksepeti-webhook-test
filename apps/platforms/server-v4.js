@@ -31,6 +31,10 @@ const MigrosYemekConnector = require('./services/platforms/connectors/migrosyeme
 const createOrdersApi = require('./services/api/orders-api');
 const createPlatformsApi = require('./services/api/platforms-api');
 const createDelayedCallApi = require('./services/api/delayed-call-api');
+// SMS_BRANDING_MIGRATION_PLAN.md F2 — telefon OTP doğrulama
+const createOtpApi = require('./services/api/otp-api');
+const OtpService = require('./services/otp/otp-service');
+const TwilioProvider = require('./services/sms/twilio-provider');
 const GoogleMapsDistanceService = require('./services/google-maps-distance');
 const DispatchMetrics = require('./services/dispatch/dispatch-metrics');
 const DispatchQueue = require('./services/dispatch/dispatch-queue');
@@ -453,6 +457,24 @@ let dispatchQueue = null;
 let preDispatchBuffer = null; // Plan 29 Faz 2.3
 let dispatchAudit = null;     // Plan 29 Faz 2.4
 let delayedCallQueue = null;
+
+// SMS_BRANDING_MIGRATION_PLAN.md F2 — OTP doğrulama servisi.
+// Env eksikse otpService null kalır, /api/v2/otp/* uçları 503 döner (server çökmez).
+let otpService = null;
+try {
+    if (process.env.OTP_TOKEN_SECRET && process.env.TWILIO_ACCOUNT_SID) {
+        otpService = new OtpService({
+            db,
+            smsProvider: new TwilioProvider(),
+            tokenSecret: process.env.OTP_TOKEN_SECRET
+        });
+        console.log('[OTP] OtpService hazır (sağlayıcı: twilio)');
+    } else {
+        console.warn('[OTP] OTP_TOKEN_SECRET / TWILIO_* env tanımlı değil — /api/v2/otp/* devre dışı');
+    }
+} catch (e) {
+    console.error('[OTP] OtpService init hatası:', e.message);
+}
 
 async function initializePlatformHub() {
     console.log('[PlatformHub] Initializing...');
@@ -1674,6 +1696,10 @@ app.use('/api/v2/delayed-call', (req, res, next) => {
         code: 'SERVICE_UNAVAILABLE'
     });
 });
+
+// OTP telefon doğrulama (SMS_BRANDING_MIGRATION_PLAN.md F2)
+// otpService startup'ta kurulur; env eksikse null → router 503 döner.
+app.use('/api/v2/otp', createOtpApi(otpService));
 
 // ==================== YEMEKSEPETI WEBHOOKS (LEGACY COMPATIBILITY) ====================
 
