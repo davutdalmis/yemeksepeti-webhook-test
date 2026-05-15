@@ -29,7 +29,7 @@ const DEFAULTS = {
 };
 
 class OtpService {
-    constructor({ db, smsProvider, tokenSecret, config = {}, now } = {}) {
+    constructor({ db, smsProvider, tokenSecret, config = {}, now, testNumbers = {} } = {}) {
         if (!db) throw new Error('OtpService requires a Firestore db instance');
         if (!smsProvider) throw new Error('OtpService requires an smsProvider');
         if (!tokenSecret) throw new Error('OtpService requires a tokenSecret');
@@ -39,6 +39,9 @@ class OtpService {
         this.tokenSecret = tokenSecret;
         this.config = { ...DEFAULTS, ...config };
         this._now = now || (() => Date.now()); // test enjeksiyonu için
+        // App Store / Play Store inceleme ekibi için sabit-kodlu test numaraları.
+        // { '+905XXXXXXXXX': '123456' } — bu numaralara gerçek SMS gönderilmez.
+        this.testNumbers = testNumbers;
     }
 
     _collection() {
@@ -58,6 +61,32 @@ class OtpService {
 
     async sendOtp(phone, { ip } = {}) {
         const nowMs = this._now();
+
+        // Test numarası: gerçek SMS gönderilmez, sabit kod saklanır.
+        // App Store / Play Store inceleme girişleri için. Cooldown/rate-limit muaf.
+        const testCode = this.testNumbers[phone];
+        if (testCode) {
+            await this._collection().doc(phone).set({
+                phone,
+                codeHash: this._hashCode(phone, String(testCode)),
+                expiresAtMs: nowMs + this.config.expirySeconds * 1000,
+                createdAtMs: nowMs,
+                lastSentAtMs: nowMs,
+                windowStartMs: nowMs,
+                sendCount: 1,
+                attempts: 0,
+                consumed: false,
+                requestIp: ip || null,
+                isTestNumber: true
+            });
+            return {
+                success: true,
+                expiresInSeconds: this.config.expirySeconds,
+                resendAvailableInSeconds: 0,
+                sendsRemaining: this.config.maxSendsPerWindow
+            };
+        }
+
         const ref = this._collection().doc(phone);
         const snap = await ref.get();
         const existing = snap.exists ? snap.data() : null;

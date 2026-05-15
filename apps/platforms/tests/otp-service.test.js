@@ -43,12 +43,12 @@ function codeFromLastSms(sms) {
 const PHONE = '+905320563400';
 const SECRET = 'test-secret-key';
 
-function makeService({ sms, clock, config } = {}) {
+function makeService({ sms, clock, config, testNumbers } = {}) {
     const db = makeFakeDb();
     const smsProvider = sms || makeFakeSms();
     let t = clock || { ms: 1_700_000_000_000 };
     const service = new OtpService({
-        db, smsProvider, tokenSecret: SECRET, config,
+        db, smsProvider, tokenSecret: SECRET, config, testNumbers,
         now: () => t.ms
     });
     return { db, smsProvider, service, clock: t };
@@ -191,6 +191,48 @@ describe('verifyOtp', () => {
         const result = await service.verifyOtp(PHONE, code);
         expect(result.success).toBe(false);
         expect(result.code).toBe('ALREADY_USED');
+    });
+});
+
+// ---------- test numaraları (App/Play review) ----------
+describe('test numbers', () => {
+    const TEST_PHONE = '+905324691077';
+    const TEST_CODE = '400273';
+
+    test('test numarasına gerçek SMS gönderilmez', async () => {
+        const { service, smsProvider } = makeService({ testNumbers: { [TEST_PHONE]: TEST_CODE } });
+        const result = await service.sendOtp(TEST_PHONE);
+        expect(result.success).toBe(true);
+        expect(smsProvider.sent).toHaveLength(0);
+    });
+
+    test('test numarası sabit kod ile doğrulanır', async () => {
+        const { service } = makeService({ testNumbers: { [TEST_PHONE]: TEST_CODE } });
+        await service.sendOtp(TEST_PHONE);
+        const result = await service.verifyOtp(TEST_PHONE, TEST_CODE);
+        expect(result.success).toBe(true);
+        expect(typeof result.verificationToken).toBe('string');
+    });
+
+    test('test numarası yanlış kodu reddeder', async () => {
+        const { service } = makeService({ testNumbers: { [TEST_PHONE]: TEST_CODE } });
+        await service.sendOtp(TEST_PHONE);
+        const result = await service.verifyOtp(TEST_PHONE, '000000');
+        expect(result.success).toBe(false);
+        expect(result.code).toBe('INVALID_CODE');
+    });
+
+    test('test numarası cooldown muaf — arka arkaya gönderim', async () => {
+        const { service } = makeService({ testNumbers: { [TEST_PHONE]: TEST_CODE } });
+        await service.sendOtp(TEST_PHONE);
+        const second = await service.sendOtp(TEST_PHONE);
+        expect(second.success).toBe(true);
+    });
+
+    test('normal numara test listesinde değilse SMS gider', async () => {
+        const { service, smsProvider } = makeService({ testNumbers: { [TEST_PHONE]: TEST_CODE } });
+        await service.sendOtp(PHONE);
+        expect(smsProvider.sent).toHaveLength(1);
     });
 });
 

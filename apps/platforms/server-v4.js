@@ -464,12 +464,25 @@ let delayedCallQueue = null;
 let otpService = null;
 try {
     if (process.env.OTP_TOKEN_SECRET && process.env.TWILIO_ACCOUNT_SID) {
+        // OTP_TEST_NUMBERS="+905XXXXXXXXX:123456,..." → App/Play review test numaraları
+        const testNumbers = {};
+        if (process.env.OTP_TEST_NUMBERS) {
+            for (const pair of process.env.OTP_TEST_NUMBERS.split(',')) {
+                const idx = pair.lastIndexOf(':');
+                if (idx > 0) {
+                    const num = pair.slice(0, idx).trim();
+                    const code = pair.slice(idx + 1).trim();
+                    if (num && code) testNumbers[num] = code;
+                }
+            }
+        }
         otpService = new OtpService({
             db,
             smsProvider: new TwilioProvider(),
-            tokenSecret: process.env.OTP_TOKEN_SECRET
+            tokenSecret: process.env.OTP_TOKEN_SECRET,
+            testNumbers
         });
-        console.log('[OTP] OtpService hazır (sağlayıcı: twilio)');
+        console.log(`[OTP] OtpService hazır (sağlayıcı: twilio, test numarası: ${Object.keys(testNumbers).length})`);
     } else {
         console.warn('[OTP] OTP_TOKEN_SECRET / TWILIO_* env tanımlı değil — /api/v2/otp/* devre dışı');
     }
