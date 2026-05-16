@@ -1,5 +1,10 @@
 // ==================================================================================
-// Base Connector - assignCourier with Atomic Increment Tests
+// Base Connector - assignCourier (atomic transaction + direct doc lookup) Tests
+//
+// NOT: assignCourier collectionGroup('couriers') sorgusundan doğrudan
+// collection('couriers').doc(id) lookup'a geçti (composite index / 500 fix —
+// memory: project_dispatch_collectionGroup_index_fix). Mock buna göre kuruludur:
+// db.collection(name).doc(id) -> sabit docRef, db.runTransaction(fn) -> fn(transaction).
 // ==================================================================================
 
 // Mock firebase-admin before requiring the module
@@ -22,53 +27,63 @@ const admin = require('firebase-admin');
 
 // ==================== MOCK DB HELPERS ====================
 
-function createMockDoc(data = {}, id = 'doc-1') {
-    return {
-        id,
-        data: () => data,
-        ref: {
-            update: jest.fn().mockResolvedValue(true)
-        }
-    };
-}
-
+/**
+ * createMockDb — collection().doc().get()/update() + runTransaction destekli mock.
+ *
+ * options:
+ *   noOrders          : sipariş dokümanı yok (order_not_found senaryosu)
+ *   orderData         : sipariş dokümanı verisi (default { OrderId: 'TEST-001' })
+ *   noCourier         : kurye dokümanı yok (counter atlanır senaryosu)
+ *   courierData       : kurye dokümanı verisi (default { name:'Ahmet', activeOrderCount:0 })
+ *   oldCourierId      : reassignment — eski kurye id'si
+ *   oldCourierData    : eski kurye dokümanı verisi
+ */
 function createMockDb(options = {}) {
-    const orderDocs = options.orderDocs || [createMockDoc({ OrderId: 'TEST-001' })];
-    const courierDocs = options.courierDocs || [createMockDoc({ name: 'Ahmet' }, 'courier-1')];
+    const ORDER_COLLECTION = 'yemekSepetiOrders';
+    const store = {}; // `${collection}/${id}` -> data object
+    const refCache = {};
 
-    const orderSnapshot = {
-        empty: options.noOrders ? true : false,
-        docs: options.noOrders ? [] : orderDocs
-    };
+    if (!options.noOrders) {
+        store[`${ORDER_COLLECTION}/TEST-001`] = options.orderData || { OrderId: 'TEST-001' };
+    }
+    if (!options.noCourier) {
+        store['couriers/courier-1'] = options.courierData || { name: 'Ahmet', activeOrderCount: 0 };
+    }
+    if (options.oldCourierId && options.oldCourierData) {
+        store[`couriers/${options.oldCourierId}`] = options.oldCourierData;
+    }
 
-    const courierSnapshot = {
-        empty: options.noCourier ? true : false,
-        docs: options.noCourier ? [] : courierDocs
-    };
-
-    // Track which collection group was queried
-    const queries = [];
-
-    const mockQuery = (collectionName) => {
-        return {
-            where: jest.fn().mockReturnThis(),
-            limit: jest.fn().mockReturnThis(),
-            get: jest.fn().mockImplementation(() => {
-                queries.push(collectionName);
-                // If querying couriers collection, return courier snapshot
-                if (collectionName === 'couriers') {
-                    return Promise.resolve(courierSnapshot);
-                }
-                return Promise.resolve(orderSnapshot);
-            })
+    function docRef(collection, id) {
+        const key = `${collection}/${id}`;
+        if (refCache[key]) return refCache[key];
+        const ref = {
+            id,
+            _key: key,
+            get: jest.fn().mockImplementation(() => Promise.resolve({
+                exists: store[key] !== undefined,
+                id,
+                data: () => store[key],
+                ref
+            })),
+            update: jest.fn().mockResolvedValue(true)
         };
-    };
+        refCache[key] = ref;
+        return ref;
+    }
 
     return {
-        collectionGroup: jest.fn().mockImplementation((name) => mockQuery(name)),
-        _queries: queries,
-        _orderDocs: orderDocs,
-        _courierDocs: courierDocs
+        _store: store,
+        _ref: (collection, id) => docRef(collection, id),
+        collection: jest.fn().mockImplementation((collection) => ({
+            doc: (id) => docRef(collection, id)
+        })),
+        runTransaction: jest.fn().mockImplementation(async (fn) => {
+            const transaction = {
+                get: (ref) => ref.get(),
+                update: (ref, data) => { ref.update(data); }
+            };
+            return fn(transaction);
+        })
     };
 }
 
@@ -86,13 +101,13 @@ describe('BasePlatformConnector - assignCourier', () => {
             expect(result.success).toBe(true);
             expect(result.orderId).toBe('TEST-001');
 
-            // Verify order document was updated
-            const orderDoc = db._orderDocs[0];
-            expect(orderDoc.ref.update).toHaveBeenCalledWith(expect.objectContaining({
-                assignedCourierId: 'courier-1',
-                assignedCourierName: 'Ahmet',
-                assignedAt: 'SERVER_TIMESTAMP'
-            }));
+            expect(db._ref('yemekSepetiOrders', 'TEST-001').update).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    assignedCourierId: 'courier-1',
+                    assignedCourierName: 'Ahmet',
+                    assignedAt: 'SERVER_TIMESTAMP'
+                })
+            );
         });
 
         test('returns error when order not found', async () => {
@@ -113,53 +128,100 @@ describe('BasePlatformConnector - assignCourier', () => {
             expect(result.success).toBe(false);
             expect(result.reason).toBe('firebase_disabled');
         });
-    });
 
-    describe('Atomic activeOrderCount increment', () => {
-        test('increments courier activeOrderCount after assignment', async () => {
-            const courierDoc = createMockDoc({ name: 'Ahmet', activeOrderCount: 2 }, 'courier-1');
-            const db = createMockDb({ courierDocs: [courierDoc] });
+        test('uses direct doc lookup — never collectionGroup', async () => {
+            const db = createMockDb();
+            db.collectionGroup = jest.fn(); // çağrılırsa testi düşürmek için
             const connector = new BasePlatformConnector('yemeksepeti', db, {});
 
             await connector.assignCourier('TEST-001', 'courier-1', 'Ahmet');
 
-            // Verify courier doc was updated with increment
-            expect(courierDoc.ref.update).toHaveBeenCalledWith({
-                activeOrderCount: 'INCREMENT(1)'
-            });
+            expect(db.collectionGroup).not.toHaveBeenCalled();
+            expect(db.collection).toHaveBeenCalledWith('couriers');
+        });
+    });
 
-            // Verify FieldValue.increment was called with 1
+    describe('Atomic activeOrderCount increment', () => {
+        test('increments courier activeOrderCount after assignment', async () => {
+            const db = createMockDb({ courierData: { name: 'Ahmet', activeOrderCount: 2 } });
+            const connector = new BasePlatformConnector('yemeksepeti', db, {});
+
+            await connector.assignCourier('TEST-001', 'courier-1', 'Ahmet');
+
+            expect(db._ref('couriers', 'courier-1').update).toHaveBeenCalledWith(
+                expect.objectContaining({ activeOrderCount: 'INCREMENT(1)' })
+            );
             expect(admin.firestore.FieldValue.increment).toHaveBeenCalledWith(1);
         });
 
-        test('assignment succeeds even if counter update fails', async () => {
-            const courierDoc = createMockDoc({ name: 'Ahmet' }, 'courier-1');
-            courierDoc.ref.update = jest.fn()
-                .mockRejectedValueOnce(new Error('Firestore timeout')); // First call fails (counter)
-
-            const orderDoc = createMockDoc({ OrderId: 'TEST-001' });
-
-            const db = createMockDb({
-                orderDocs: [orderDoc],
-                courierDocs: [courierDoc]
-            });
-            const connector = new BasePlatformConnector('yemeksepeti', db, {});
-
-            // The order update uses orderDoc.ref.update (which succeeds)
-            // The courier counter uses courierDoc.ref.update (which fails)
-            const result = await connector.assignCourier('TEST-001', 'courier-1', 'Ahmet');
-
-            // Assignment itself should still succeed
-            expect(result.success).toBe(true);
-        });
-
-        test('handles missing courier document gracefully', async () => {
+        test('skips counter when courier document missing (non-fatal)', async () => {
             const db = createMockDb({ noCourier: true });
             const connector = new BasePlatformConnector('yemeksepeti', db, {});
 
             const result = await connector.assignCourier('TEST-001', 'courier-1', 'Ahmet');
 
-            // Assignment succeeds - courier not found for counter is non-fatal
+            // Atama başarılı — kurye doc'u yoksa sayaç sessizce atlanır
+            expect(result.success).toBe(true);
+            expect(db._ref('couriers', 'courier-1').update).not.toHaveBeenCalled();
+            // Sipariş yine de atanmış olmalı
+            expect(db._ref('yemekSepetiOrders', 'TEST-001').update).toHaveBeenCalled();
+        });
+
+        test('rejects assignment when courier at capacity', async () => {
+            const db = createMockDb({
+                courierData: { name: 'Ahmet', activeOrderCount: 5, maxCapacity: 5 }
+            });
+            const connector = new BasePlatformConnector('yemeksepeti', db, {});
+
+            const result = await connector.assignCourier('TEST-001', 'courier-1', 'Ahmet');
+
+            expect(result.success).toBe(false);
+            expect(result.reason).toBe('courier_at_capacity');
+        });
+
+        test('honours maxPackageCapacity field as capacity fallback', async () => {
+            const db = createMockDb({
+                courierData: { name: 'Ahmet', activeOrderCount: 3, maxPackageCapacity: 3 }
+            });
+            const connector = new BasePlatformConnector('yemeksepeti', db, {});
+
+            const result = await connector.assignCourier('TEST-001', 'courier-1', 'Ahmet');
+
+            expect(result.success).toBe(false);
+            expect(result.reason).toBe('courier_at_capacity');
+        });
+    });
+
+    describe('Reassignment', () => {
+        test('decrements old courier activeOrderCount on reassignment', async () => {
+            const db = createMockDb({
+                orderData: { OrderId: 'TEST-001', assignedCourierId: 'courier-old' },
+                oldCourierId: 'courier-old',
+                oldCourierData: { name: 'Mehmet', activeOrderCount: 3 }
+            });
+            const connector = new BasePlatformConnector('yemeksepeti', db, {});
+
+            const result = await connector.assignCourier('TEST-001', 'courier-1', 'Ahmet');
+
+            expect(result.success).toBe(true);
+            // Yeni kurye +1
+            expect(db._ref('couriers', 'courier-1').update).toHaveBeenCalledWith(
+                expect.objectContaining({ activeOrderCount: 'INCREMENT(1)' })
+            );
+            // Eski kurye -1
+            expect(db._ref('couriers', 'courier-old').update).toHaveBeenCalledWith(
+                expect.objectContaining({ activeOrderCount: 'INCREMENT(-1)' })
+            );
+        });
+
+        test('does not touch old courier when reassigned to same courier', async () => {
+            const db = createMockDb({
+                orderData: { OrderId: 'TEST-001', assignedCourierId: 'courier-1' }
+            });
+            const connector = new BasePlatformConnector('yemeksepeti', db, {});
+
+            const result = await connector.assignCourier('TEST-001', 'courier-1', 'Ahmet');
+
             expect(result.success).toBe(true);
         });
     });
@@ -171,25 +233,8 @@ describe('BasePlatformConnector - assignCourier', () => {
 
             await connector.assignCourier('TEST-001', 'courier-1', 'Ahmet');
 
-            const orderDoc = db._orderDocs[0];
-            const updateCall = orderDoc.ref.update.mock.calls[0][0];
+            const updateCall = db._ref('yemekSepetiOrders', 'TEST-001').update.mock.calls[0][0];
             expect(updateCall.assignedAt).toBe('SERVER_TIMESTAMP');
-        });
-    });
-
-    describe('Multiple order documents', () => {
-        test('updates all matching order documents', async () => {
-            const doc1 = createMockDoc({ OrderId: 'TEST-001' });
-            const doc2 = createMockDoc({ OrderId: 'TEST-001' });
-
-            const db = createMockDb({ orderDocs: [doc1, doc2] });
-            const connector = new BasePlatformConnector('yemeksepeti', db, {});
-
-            await connector.assignCourier('TEST-001', 'courier-1', 'Ahmet');
-
-            // Both docs should be updated
-            expect(doc1.ref.update).toHaveBeenCalled();
-            expect(doc2.ref.update).toHaveBeenCalled();
         });
     });
 

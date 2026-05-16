@@ -47,6 +47,7 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
                 isDelivered: d.isDelivered === undefined ? null : d.isDelivered,
                 IsPrepared: d.IsPrepared === undefined ? null : d.IsPrepared,
                 assignedCourierId: d.assignedCourierId || d.AssignedCourierId || null,
+                assignedCourierName: d.assignedCourierName || d.AssignedCourierName || null,
                 updatedBy: d.updatedBy || null,
                 branchId: d.branchId || null
             };
@@ -492,15 +493,13 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
             // Decrement courier's activeOrderCount
             if (assignedCourierId && db) {
                 try {
-                    const courierQuery = await db.collectionGroup('couriers')
-                        .where('branchId', '==', branchId || order?.branchId)
-                        .where('isActive', '==', true)
-                        .get();
-
-                    const courierDoc = courierQuery.docs.find(doc => doc.id === assignedCourierId);
-                    if (courierDoc) {
+                    // Doğrudan doc lookup — couriers root koleksiyonunda; collectionGroup +
+                    // composite index gereksiz (memory: project_dispatch_collectionGroup_index_fix).
+                    const courierRef = db.collection('couriers').doc(assignedCourierId);
+                    const courierDoc = await courierRef.get();
+                    if (courierDoc.exists) {
                         const currentCount = courierDoc.data().activeOrderCount || 0;
-                        await courierDoc.ref.update({
+                        await courierRef.update({
                             activeOrderCount: Math.max(0, currentCount - 1),
                             dailyDeliveryCount: admin.firestore.FieldValue.increment(1)
                         });
@@ -598,6 +597,31 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
             const before = await snapshotDocBefore(connector, orderId);
             const oldCourierId = before?.assignedCourierId || null;
             console.log(`[OrdersAPI] ASSIGN REQ | reqId=${requestId} | ${platformId}/${orderId} | branchId=${branchId} | oldCourier=${oldCourierId} | requestedCourier=${courierId || '<auto>'} | autoAssign=${autoAssign !== false}`);
+
+            // IDEMPOTENCY GUARD — sipariş zaten bir kuryeye atanmışsa ve bu OTOMATİK atama
+            // isteğiyse (body'de courierId yok) tekrar atama. Aksi halde webhook auto-assign +
+            // WPF assign-courier + WPF retry üst üste binip kuryeyi A->B->C diye değiştirir;
+            // sipariş kuryenin Express ekranında "düşüp anında kayboluyor"
+            // (memory: project_dispatch_disappear_investigation). Round-robin recency penalty
+            // ikinci atamayı kasıtlı olarak farklı kuryeye yönelttiği için her tekrar atama
+            // kesin el değiştirmeye yol açar. Manuel atama (body.courierId dolu) muaftır —
+            // o kasıtlı reassign'dır.
+            if (oldCourierId && !courierId) {
+                console.log(`[OrdersAPI] ASSIGN SKIP (already assigned) | reqId=${requestId} | ${platformId}/${orderId} | courier=${oldCourierId}`);
+                writeDispatchAudit({
+                    requestId, action: 'assign-courier', platformId, orderId, branchId,
+                    success: true, source: 'orders-api', courierId: oldCourierId,
+                    alreadyAssigned: true, statusBefore: before
+                });
+                return res.json({
+                    success: true,
+                    orderId,
+                    platform: platformId,
+                    courierId: oldCourierId,
+                    courierName: before?.assignedCourierName || null,
+                    alreadyAssigned: true
+                });
+            }
 
             let assignedCourierId = courierId;
             let assignedCourierName = courierName;

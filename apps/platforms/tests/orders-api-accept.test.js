@@ -32,6 +32,20 @@ function createMockRegistry(options = {}) {
         assignCourier: jest.fn().mockResolvedValue({ success: true, orderId: 'TEST-001' }),
     };
 
+    // snapshotDocBefore (assign-courier / pickup / deliver) connector.db üzerinden okur.
+    // docData.assignedCourierId verilirse "sipariş zaten atanmış" senaryosu kurulur.
+    mockConnector.collectionName = 'yemekSepetiOrders';
+    mockConnector.db = {
+        collection: jest.fn().mockReturnValue({
+            doc: jest.fn().mockReturnValue({
+                get: jest.fn().mockResolvedValue({
+                    exists: options.docExists !== false,
+                    data: () => options.docData || { Status: 'ACCEPTED' }
+                })
+            })
+        })
+    };
+
     if (options.acceptFails) {
         mockConnector.acceptOrder.mockResolvedValue({ success: false, reason: 'Platform error' });
     }
@@ -255,5 +269,71 @@ describe('Orders API - Accept with Auto-Assign', () => {
                 { latitude: 41.05, longitude: 29.01 }
             );
         });
+    });
+});
+
+// ==================================================================================
+// assign-courier IDEMPOTENCY — "sipariş kuryeye düşüp anında kayboluyor" fix.
+// Sipariş zaten bir kuryeye atanmışsa OTOMATİK atama isteği onu yeniden atamamalı;
+// aksi halde webhook auto-assign + WPF assign-courier + retry kuryeyi A->B->C diye
+// değiştirir. Manuel atama (body.courierId dolu) bu kuraldan muaftır.
+// ==================================================================================
+
+describe('Orders API - assign-courier idempotency', () => {
+
+    test('skips re-assignment when order already has a courier (auto mode)', async () => {
+        const registry = createMockRegistry({
+            docData: { Status: 'ACCEPTED', assignedCourierId: 'courier-old', assignedCourierName: 'Mehmet' }
+        });
+        const smartDispatch = createMockSmartDispatch();
+        const app = createTestApp(registry, smartDispatch);
+
+        const res = await makeRequest(app, 'POST', '/api/v2/orders/yemeksepeti/TEST-001/assign-courier', {});
+
+        expect(res.status).toBe(200);
+        expect(res.body.success).toBe(true);
+        expect(res.body.alreadyAssigned).toBe(true);
+        expect(res.body.courierId).toBe('courier-old');
+        // Yeniden atama YAPILMAMALI
+        expect(smartDispatch.assignBestCourier).not.toHaveBeenCalled();
+        expect(registry._connector.assignCourier).not.toHaveBeenCalled();
+    });
+
+    test('manual re-assignment still works even when already assigned', async () => {
+        const registry = createMockRegistry({
+            docData: { Status: 'ACCEPTED', assignedCourierId: 'courier-old', assignedCourierName: 'Mehmet' }
+        });
+        const smartDispatch = createMockSmartDispatch();
+        const app = createTestApp(registry, smartDispatch);
+
+        const res = await makeRequest(app, 'POST', '/api/v2/orders/yemeksepeti/TEST-001/assign-courier', {
+            courierId: 'courier-new', courierName: 'Veli'
+        });
+
+        expect(res.status).toBe(200);
+        expect(res.body.success).toBe(true);
+        expect(res.body.alreadyAssigned).toBeUndefined();
+        // Manuel atama kasıtlı reassign — connector.assignCourier çağrılmalı
+        expect(registry._connector.assignCourier).toHaveBeenCalledWith(
+            'TEST-001', 'courier-new', 'Veli'
+        );
+    });
+
+    test('auto-assigns normally when order has no courier yet', async () => {
+        const registry = createMockRegistry({
+            docData: { Status: 'ACCEPTED' } // assignedCourierId yok
+        });
+        const smartDispatch = createMockSmartDispatch();
+        const app = createTestApp(registry, smartDispatch);
+
+        const res = await makeRequest(app, 'POST', '/api/v2/orders/yemeksepeti/TEST-001/assign-courier', {});
+
+        expect(res.status).toBe(200);
+        expect(res.body.success).toBe(true);
+        expect(res.body.alreadyAssigned).toBeUndefined();
+        expect(smartDispatch.assignBestCourier).toHaveBeenCalled();
+        expect(registry._connector.assignCourier).toHaveBeenCalledWith(
+            'TEST-001', 'courier-1', 'Ahmet'
+        );
     });
 });

@@ -192,47 +192,35 @@ class BasePlatformConnector {
                 console.log(`[${this.platformId}] FIRST-ASSIGN | orderId=${orderId} | newCourier=${courierId} (${courierName}) | currentStatus=${orderData.Status}`);
             }
 
-            try {
-                const courierQuery = await this.db.collectionGroup('couriers')
-                    .where('branchId', '==', orderData.branchId)
-                    .where('isActive', '==', true)
-                    .get();
-
-                const newCourierDoc = courierQuery.docs.find(doc => doc.id === courierId);
-                if (newCourierDoc) {
-                    courierRef = newCourierDoc.ref;
-                }
-
-                // Resolve old courier ref for reassignment (decrement their count)
-                if (oldCourierId && oldCourierId !== courierId) {
-                    const oldCourierDoc = courierQuery.docs.find(doc => doc.id === oldCourierId);
-                    if (oldCourierDoc) {
-                        oldCourierRef = oldCourierDoc.ref;
-                    }
-                }
-            } catch (lookupError) {
-                console.warn(`[${this.platformId}] Courier lookup failed, proceeding without counter:`, lookupError.message);
+            // Courier doc ref'leri doğrudan couriers root koleksiyonundan çözülür.
+            // Eski collectionGroup('couriers').where('branchId').where('isActive') sorgusu
+            // composite index istiyordu; index yoksa FAILED_PRECONDITION -> circuit breaker -> 500,
+            // ve courier counter sessizce atlanıp activeOrderCount drift ederdi.
+            // (memory: project_dispatch_collectionGroup_index_fix — server-v4.js bu fix'i almıştı,
+            //  base-connector + orders-api atlanmıştı.) Doğrudan doc lookup hiçbir index gerektirmez.
+            courierRef = this.db.collection('couriers').doc(courierId);
+            if (oldCourierId && oldCourierId !== courierId) {
+                oldCourierRef = this.db.collection('couriers').doc(oldCourierId);
             }
 
             // Step 2: Run transaction — atomically check guards + update
             const result = await this.db.runTransaction(async (transaction) => {
+                // ÖNEMLI: Firestore transaction'da tüm read'ler write'lardan ÖNCE yapılmalı.
                 // Read order inside transaction to check for concurrent assignment
                 const orderDoc = await transaction.get(orderRefs[0]);
                 if (!orderDoc.exists) {
                     throw new Error('order_not_found');
                 }
 
-                const orderData = orderDoc.data();
-
-                // Reassignment: if already assigned to another courier, decrement old courier's count
-                // (no longer a guard — allows reassignment atomically)
-
-                // Guard: check courier capacity
+                // Guard: check courier capacity + kurye doc'unun var olup olmadığı
+                let newCourierExists = false;
                 if (courierRef) {
                     const courierDoc = await transaction.get(courierRef);
+                    newCourierExists = courierDoc.exists;
                     if (courierDoc.exists) {
                         const courierData = courierDoc.data();
-                        const maxCapacity = courierData.maxCapacity || 5;
+                        // maxPackageCapacity fallback — kurye doc'unda field adı bu olabilir
+                        const maxCapacity = courierData.maxCapacity || courierData.maxPackageCapacity || 5;
                         const activeCount = courierData.activeOrderCount || 0;
                         if (activeCount >= maxCapacity) {
                             throw new Error(`courier_at_capacity:${activeCount}/${maxCapacity}`);
@@ -240,7 +228,14 @@ class BasePlatformConnector {
                     }
                 }
 
-                // All guards passed — write
+                // Reassignment: eski kurye doc'u var mı — transaction.update yok olan doc'ta fail eder
+                let oldCourierExists = false;
+                if (oldCourierRef) {
+                    const oldCourierDoc = await transaction.get(oldCourierRef);
+                    oldCourierExists = oldCourierDoc.exists;
+                }
+
+                // All reads done — write
                 const updateData = {
                     assignedCourierId: courierId,
                     assignedCourierName: courierName,
@@ -253,7 +248,7 @@ class BasePlatformConnector {
                 }
 
                 // Increment new courier's activeOrderCount + Plan 29 Faz 1.1 round-robin sinyali
-                if (courierRef) {
+                if (courierRef && newCourierExists) {
                     transaction.update(courierRef, {
                         activeOrderCount: admin.firestore.FieldValue.increment(1),
                         lastAssignedAt: admin.firestore.FieldValue.serverTimestamp()
@@ -261,7 +256,7 @@ class BasePlatformConnector {
                 }
 
                 // Decrement old courier's activeOrderCount (reassignment)
-                if (oldCourierRef) {
+                if (oldCourierRef && oldCourierExists) {
                     transaction.update(oldCourierRef, {
                         activeOrderCount: admin.firestore.FieldValue.increment(-1)
                     });
