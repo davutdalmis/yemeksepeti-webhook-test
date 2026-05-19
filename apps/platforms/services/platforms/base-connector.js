@@ -162,6 +162,70 @@ class BasePlatformConnector {
         });
     }
 
+    // ==================================================================
+    // KURYE KAPASITE — DRIFT'E BAĞIŞIK GERÇEK SAYIM
+    // ==================================================================
+    // couriers/{id}.activeOrderCount alanı +1/-1 incremental tutuluyordu.
+    // Teslim azaltması SADECE Railway POST /deliver çağrılınca işliyordu;
+    // sipariş WPF'ten doğrudan Firestore'a yazılarak kapatılınca azaltma
+    // hiç tetiklenmiyor → sayaç sonsuza dek şişiyor → activeCount >= maxCapacity
+    // → her atama 'courier_at_capacity' ile reddediliyor (drift bug'ı).
+    //
+    // Çözüm: kapasite kararını kalıcı (şişebilen) alana göre değil, sipariş
+    // koleksiyonlarından hesaplanan GERÇEK aktif sipariş sayısına göre ver.
+
+    // Kuryenin sipariş taşıyabileceği koleksiyonlar.
+    static get COURIER_ORDER_COLLECTIONS() {
+        return [
+            'yemekSepetiOrders',
+            'getirYemekOrders',
+            'trendyolGoOrders',
+            'migrosYemekOrders',
+            'fuudyOrders',
+            'tableOrders',
+            'qrOrders',
+        ];
+    }
+
+    // Bir sipariş dokümanı terminal (teslim/iptal/kapalı) mı? Capacity DIŞI sayılır.
+    static isOrderTerminal(data) {
+        if (!data) return true;
+        if (data.IsDelivered === true || data.isDelivered === true) return true;
+        if (data.IsCancelled === true || data.isCancelled === true) return true;
+        // Kapatılmış sipariş referansı varsa POS sipariş akışını bitirmiş demek.
+        if (typeof data.closedOrderId === 'string' && data.closedOrderId.length > 0) return true;
+        if (typeof data.ClosedOrderId === 'string' && data.ClosedOrderId.length > 0) return true;
+        const TERMINAL = new Set([
+            'DELIVERED', 'CANCELLED', 'CANCELED', 'REJECTED', 'COMPLETED', 'CLOSED',
+        ]);
+        const status = String(data.Status || data.status || data.packageStatus || '')
+            .trim().toUpperCase();
+        return TERMINAL.has(status);
+    }
+
+    // Bir kuryenin GERÇEK aktif (terminal olmayan) sipariş sayısını hesapla.
+    // Tek-alan sorgusu (assignedCourierId) — composite index gerektirmez;
+    // terminal filtresi client-side yapılır (bu codebase'de index'siz tasarım tercih).
+    async computeRealActiveOrderCount(courierId) {
+        if (!this.db || !courierId) return 0;
+        let total = 0;
+        for (const collection of BasePlatformConnector.COURIER_ORDER_COLLECTIONS) {
+            try {
+                const snap = await this.db.collection(collection)
+                    .where('assignedCourierId', '==', courierId)
+                    .get();
+                for (const doc of snap.docs) {
+                    if (!BasePlatformConnector.isOrderTerminal(doc.data())) total++;
+                }
+            } catch (err) {
+                // Bir koleksiyon fail olursa diğerleri devam — sayım eksik kalmaktansa
+                // devam etmek daha güvenli (capacity guard yine de maxCapacity ile sınırlı).
+                console.error(`[${this.platformId}] computeRealActiveOrderCount ${collection} hata:`, err.message);
+            }
+        }
+        return total;
+    }
+
     // Siparişe kurye ata (status değiştirmez - mevcut status korunur)
     // Firestore Transaction ile atomik atama — çift atama riskini önler
     async assignCourier(orderId, courierId, courierName) {
@@ -203,6 +267,15 @@ class BasePlatformConnector {
                 oldCourierRef = this.db.collection('couriers').doc(oldCourierId);
             }
 
+            // Kapasite kararı için GERÇEK aktif sipariş sayısını transaction'dan
+            // once hesapla (sipariş koleksiyonu sorguları transaction içinde index
+            // ister; ayrıca drift'e bağışık tek doğru kaynak budur).
+            // Zaten bu siparişe atanmışsa (idempotent retry) çift saymamak için 1 düş.
+            let realActiveCount = await this.computeRealActiveOrderCount(courierId);
+            if (orderData.assignedCourierId === courierId && realActiveCount > 0) {
+                realActiveCount -= 1;
+            }
+
             // Step 2: Run transaction — atomically check guards + update
             const result = await this.db.runTransaction(async (transaction) => {
                 // ÖNEMLI: Firestore transaction'da tüm read'ler write'lardan ÖNCE yapılmalı.
@@ -221,9 +294,10 @@ class BasePlatformConnector {
                         const courierData = courierDoc.data();
                         // maxPackageCapacity fallback — kurye doc'unda field adı bu olabilir
                         const maxCapacity = courierData.maxCapacity || courierData.maxPackageCapacity || 5;
-                        const activeCount = courierData.activeOrderCount || 0;
-                        if (activeCount >= maxCapacity) {
-                            throw new Error(`courier_at_capacity:${activeCount}/${maxCapacity}`);
+                        // Kapasite kontrolü kalıcı (drift eden) activeOrderCount alanına
+                        // DEĞİL, sipariş koleksiyonlarından hesaplanan gerçek sayıma göre.
+                        if (realActiveCount >= maxCapacity) {
+                            throw new Error(`courier_at_capacity:${realActiveCount}/${maxCapacity}`);
                         }
                     }
                 }
@@ -247,10 +321,13 @@ class BasePlatformConnector {
                     transaction.update(ref, updateData);
                 }
 
-                // Increment new courier's activeOrderCount + Plan 29 Faz 1.1 round-robin sinyali
+                // Yeni kuryenin activeOrderCount'unu GERÇEK değere SET et (increment değil)
+                // — bu atamayla birlikte doğru sayı realActiveCount + 1'dir. Böylece
+                // sayaç her atamada kendiliğinden gerçeğe sıfırlanır (self-heal).
+                // + Plan 29 Faz 1.1 round-robin sinyali (lastAssignedAt).
                 if (courierRef && newCourierExists) {
                     transaction.update(courierRef, {
-                        activeOrderCount: admin.firestore.FieldValue.increment(1),
+                        activeOrderCount: realActiveCount + 1,
                         lastAssignedAt: admin.firestore.FieldValue.serverTimestamp()
                     });
                 }
