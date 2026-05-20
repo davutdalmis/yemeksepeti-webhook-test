@@ -403,4 +403,62 @@ describe('BasePlatformConnector - assignCourier', () => {
             expect(count).toBe(0);
         });
     });
+
+    // QR self-claim (claim-courier endpoint) — sipariş BAŞKA kuryedeyse
+    // requireUnassigned:true ile transaction içinde reddedilir.
+    describe('requireUnassigned guard (QR self-claim)', () => {
+        test('assigns when order is unassigned', async () => {
+            const db = createMockDb();
+            const connector = new BasePlatformConnector('yemeksepeti', db, {});
+
+            const result = await connector.assignCourier(
+                'TEST-001', 'courier-1', 'Ahmet', { requireUnassigned: true });
+
+            expect(result.success).toBe(true);
+        });
+
+        test('assigns when order is already on the same courier (idempotent)', async () => {
+            const db = createMockDb({
+                orderData: { OrderId: 'TEST-001', assignedCourierId: 'courier-1' }
+            });
+            const connector = new BasePlatformConnector('yemeksepeti', db, {});
+
+            const result = await connector.assignCourier(
+                'TEST-001', 'courier-1', 'Ahmet', { requireUnassigned: true });
+
+            expect(result.success).toBe(true);
+        });
+
+        test('rejects when order is assigned to a DIFFERENT courier', async () => {
+            const db = createMockDb({
+                orderData: { OrderId: 'TEST-001', assignedCourierId: 'courier-old' }
+            });
+            const connector = new BasePlatformConnector('yemeksepeti', db, {});
+
+            const result = await connector.assignCourier(
+                'TEST-001', 'courier-1', 'Ahmet', { requireUnassigned: true });
+
+            expect(result.success).toBe(false);
+            expect(result.reason).toBe('already_assigned');
+            expect(result.assignedTo).toBe('courier-old');
+            // Sipariş dokümanı DEĞİŞMEMELİ — atama yapılmadı
+            expect(db._ref('yemekSepetiOrders', 'TEST-001').update).not.toHaveBeenCalled();
+        });
+
+        test('regression: without requireUnassigned, reassignment still works', async () => {
+            // requireUnassigned verilmezse mevcut assign-courier davranışı korunur:
+            // başka kuryedeki sipariş koşulsuz devralınır.
+            const db = createMockDb({
+                orderData: { OrderId: 'TEST-001', assignedCourierId: 'courier-old' },
+                oldCourierId: 'courier-old',
+                oldCourierData: { name: 'Mehmet', activeOrderCount: 2 }
+            });
+            const connector = new BasePlatformConnector('yemeksepeti', db, {});
+
+            const result = await connector.assignCourier('TEST-001', 'courier-1', 'Ahmet');
+
+            expect(result.success).toBe(true);
+            expect(db._ref('yemekSepetiOrders', 'TEST-001').update).toHaveBeenCalled();
+        });
+    });
 });

@@ -736,6 +736,170 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
         }
     });
 
+    /**
+     * POST /api/v2/orders/:platformId/:orderId/claim-courier
+     * Kurye, WPF kurye fişindeki QR'ı Yemigo Express'te okutarak KENDİNİ siparişe atar.
+     * Sonuç assign-courier (manuel atama) ile birebir aynı transaction'ı kullanır —
+     * order doc'a assignedCourierId/Name/At yazılır, courier sayaç güncellenir.
+     *
+     * "Sahipsizlik" kuralı: sipariş atanmamışsa VEYA zaten bu kuryeye atanmışsa devam;
+     * BAŞKA kuryedeyse atama yapılmaz (409). Yarış durumu base-connector transaction'ı
+     * içinde requireUnassigned guard'ı ile de kapatılır.
+     *
+     * Headers: x-api-key, x-branch-id
+     * Body: { courierId, courierName }
+     */
+    router.post('/:platformId/:orderId/claim-courier', async (req, res) => {
+        const { platformId, orderId } = req.params;
+        const { courierId, courierName } = req.body || {};
+        const branchId = req.branchId;
+        const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const resolvedCourierName = courierName || courierId;
+
+        const audit = (extra) => writeDispatchAudit({
+            requestId, action: 'claim-courier', platformId, orderId, branchId,
+            source: 'orders-api', assignSource: 'qr-self-claim', autoAssigned: false,
+            courierId: courierId || null, ...extra
+        });
+
+        try {
+            // 1 — courierId zorunlu (kurye kimliği QR akışında Express'ten gelir)
+            if (!courierId) {
+                audit({ success: false, errorReason: 'NO_COURIER' });
+                return res.status(400).json({
+                    success: false, error: 'courierId required', code: 'NO_COURIER'
+                });
+            }
+
+            // 2 — connector
+            const connector = registry.getConnector(platformId);
+            if (!connector) {
+                audit({ success: false, errorReason: 'PLATFORM_NOT_FOUND' });
+                return res.status(404).json({
+                    success: false, error: `Platform not found: ${platformId}`,
+                    code: 'PLATFORM_NOT_FOUND'
+                });
+            }
+
+            // 3 — BEFORE snapshot (sipariş var mı + mevcut durum)
+            const before = await snapshotDocBefore(connector, orderId);
+            if (!before) {
+                audit({ success: false, errorReason: 'ORDER_NOT_FOUND' });
+                return res.status(404).json({
+                    success: false, error: 'Order not found', code: 'ORDER_NOT_FOUND'
+                });
+            }
+
+            console.log(`[OrdersAPI] CLAIM REQ | reqId=${requestId} | ${platformId}/${orderId} | branchId=${branchId} | courier=${courierId} | oldCourier=${before.assignedCourierId || '<none>'}`);
+
+            // 4 — branch izolasyonu: kurye, başka şubenin siparişini claim edemez
+            if (branchId && before.branchId && before.branchId !== branchId) {
+                audit({ success: false, errorReason: 'BRANCH_MISMATCH', statusBefore: before });
+                return res.status(403).json({
+                    success: false, error: 'Order belongs to a different branch',
+                    code: 'BRANCH_MISMATCH'
+                });
+            }
+
+            // 5 — sipariş kapalı mı (teslim edilmiş / iptal)
+            const isDelivered = before.IsDelivered === true || before.isDelivered === true;
+            const statusStr = (before.Status || '').toString().toUpperCase();
+            const isCancelled = statusStr.includes('CANCEL')
+                || statusStr.includes('İPTAL')
+                || statusStr.includes('IPTAL')
+                || statusStr.includes('REJECT');
+            if (isDelivered || isCancelled) {
+                audit({ success: false, errorReason: 'ORDER_CLOSED', statusBefore: before });
+                return res.status(409).json({
+                    success: false, error: 'Order is already delivered or cancelled',
+                    code: 'ORDER_CLOSED'
+                });
+            }
+
+            // 6 — sahipsizlik guard'ı (ön-kontrol)
+            const oldCourierId = before.assignedCourierId;
+            if (oldCourierId && oldCourierId !== courierId) {
+                console.log(`[OrdersAPI] CLAIM REJECT (already assigned) | reqId=${requestId} | ${platformId}/${orderId} | owner=${oldCourierId}`);
+                audit({
+                    success: false, errorReason: 'ALREADY_ASSIGNED',
+                    courierId, oldCourierId, statusBefore: before
+                });
+                return res.status(409).json({
+                    success: false,
+                    error: 'Order is already assigned to another courier',
+                    code: 'ALREADY_ASSIGNED',
+                    assignedCourierId: oldCourierId,
+                    assignedCourierName: before.assignedCourierName || null
+                });
+            }
+
+            // Zaten bu kuryeye atanmış — idempotent no-op
+            if (oldCourierId === courierId) {
+                console.log(`[OrdersAPI] CLAIM NO-OP (already mine) | reqId=${requestId} | ${platformId}/${orderId} | courier=${courierId}`);
+                audit({
+                    success: true, courierId, courierName: resolvedCourierName,
+                    idempotent: true, statusBefore: before
+                });
+                return res.json({
+                    success: true, orderId, platform: platformId,
+                    courierId, courierName: before.assignedCourierName || resolvedCourierName,
+                    alreadyAssigned: true
+                });
+            }
+
+            // 7 — atama (manuel atamayla aynı transaction; requireUnassigned ile yarış kapalı)
+            const result = await connector.assignCourier(
+                orderId, courierId, resolvedCourierName, { requireUnassigned: true });
+
+            if (result.success) {
+                console.log(`[OrdersAPI] CLAIM OK | reqId=${requestId} | ${platformId}/${orderId} -> ${resolvedCourierName}`);
+                audit({
+                    success: true, courierId, courierName: resolvedCourierName,
+                    statusBefore: before
+                });
+                return res.json({
+                    success: true, orderId, platform: platformId,
+                    courierId, courierName: resolvedCourierName
+                });
+            }
+
+            // Atama başarısız — reason'a göre HTTP kodu
+            audit({
+                success: false, errorReason: result.reason,
+                courierId, courierName: resolvedCourierName, statusBefore: before
+            });
+            if (result.reason === 'already_assigned') {
+                return res.status(409).json({
+                    success: false,
+                    error: 'Order was claimed by another courier',
+                    code: 'ALREADY_ASSIGNED',
+                    assignedCourierId: result.assignedTo || null
+                });
+            }
+            if (result.reason === 'courier_at_capacity') {
+                return res.status(422).json({
+                    success: false, error: 'Courier is at capacity',
+                    code: 'AT_CAPACITY'
+                });
+            }
+            if (result.reason === 'order_not_found') {
+                return res.status(404).json({
+                    success: false, error: 'Order not found', code: 'ORDER_NOT_FOUND'
+                });
+            }
+            return res.status(400).json({
+                success: false, error: result.reason || 'Claim failed',
+                code: 'CLAIM_FAILED'
+            });
+        } catch (error) {
+            console.error(`[OrdersAPI] Claim courier error:`, error.message);
+            audit({ success: false, errorReason: error.message });
+            return res.status(500).json({
+                success: false, error: error.message, code: 'SERVER_ERROR'
+            });
+        }
+    });
+
     // ==================== BRANCH OPERATIONS ====================
 
     /**

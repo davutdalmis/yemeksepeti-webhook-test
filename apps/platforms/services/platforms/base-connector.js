@@ -228,7 +228,13 @@ class BasePlatformConnector {
 
     // Siparişe kurye ata (status değiştirmez - mevcut status korunur)
     // Firestore Transaction ile atomik atama — çift atama riskini önler
-    async assignCourier(orderId, courierId, courierName) {
+    //
+    // options.requireUnassigned (default false): true ise transaction içinde sipariş
+    // zaten BAŞKA bir kuryedeyse atama reddedilir (`already_assigned` reason). QR
+    // self-claim akışı (claim-courier endpoint) bunu kullanır — ön-kontrol ile atama
+    // arasındaki TOCTOU yarışını transaction seviyesinde kapatır. Verilmezse mevcut
+    // assign-courier davranışı (koşulsuz yeniden atama) aynen korunur.
+    async assignCourier(orderId, courierId, courierName, options = {}) {
         if (!this.db) return { success: false, reason: 'firebase_disabled' };
 
         try {
@@ -283,6 +289,17 @@ class BasePlatformConnector {
                 const orderDoc = await transaction.get(orderRefs[0]);
                 if (!orderDoc.exists) {
                     throw new Error('order_not_found');
+                }
+
+                // Sahipsizlik guard'ı (QR self-claim) — sipariş zaten BAŞKA kuryedeyse
+                // reddet. Ön-kontrol ile bu transaction arasında başka bir atama olmuş
+                // olabilir (yarış); bu kontrol kesin kararı transaction içinde verir.
+                if (options.requireUnassigned) {
+                    const txOrderData = orderDoc.data();
+                    if (txOrderData.assignedCourierId
+                        && txOrderData.assignedCourierId !== courierId) {
+                        throw new Error('already_assigned:' + txOrderData.assignedCourierId);
+                    }
                 }
 
                 // Guard: check courier capacity + kurye doc'unun var olup olmadığı
