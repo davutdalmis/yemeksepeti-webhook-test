@@ -235,9 +235,47 @@ function timingSafeCompare(a, b) {
 }
 
 // Platform webhook'ları için auth (DH/GetirYemek/TrendyolGo kendi secret'larını göndermez)
+//
+// 2026-05-24 (Pentest Faz 2.2.a): IP audit log mode etkin. Enforcement YOK.
+// Her webhook çağrısı `webhookIpAudit` koleksiyonuna kaydedilir (fire-and-forget).
+// 1 hafta sonra docs/security/FAZ_2_2_WEBHOOK_HARDENING.md aşama 2.2.c'de
+// gerçek IP CIDR aralıkları çıkarılıp allowlist enforce edilecek.
 function authenticatePlatformWebhook(req, res, next) {
-    // Platform webhook'ları doğrudan gelir, x-webhook-secret göndermezler
-    // Gelecekte platform-bazlı doğrulama eklenebilir (IP whitelist, HMAC vs.)
+    try {
+        // Cloudflare/Railway proxy zinciri arkasındayız → X-Forwarded-For son IP
+        // genelde gerçek client IP (Railway routing layer + Cloudflare arasından geçer).
+        const xffHeader = req.headers['x-forwarded-for'] || '';
+        const xff = String(xffHeader).split(',').map(s => s.trim()).filter(Boolean);
+        const realIp = xff.length > 0
+            ? xff[xff.length - 1]
+            : (req.ip || (req.connection && req.connection.remoteAddress) || 'unknown');
+
+        // Path'ten platform tahmin et (audit için)
+        let platform = 'unknown';
+        const p = req.path || '';
+        if (p.startsWith('/order/')) platform = 'yemeksepeti';
+        else if (p === '/webhook/newOrder' || p === '/webhook/cancelOrder' ||
+                 p === '/webhook/courierArrival' || p === '/webhook/restaurantStatus') platform = 'getiryemek';
+        else if (p.startsWith('/webhook/trendyolgo')) platform = 'trendyolgo';
+        else if (p.startsWith('/webhook/fuudy')) platform = 'fuudy';
+
+        // Fire-and-forget Firestore yazımı — audit log hatası endpoint'i bloklamaz
+        if (typeof db !== 'undefined' && db) {
+            db.collection('webhookIpAudit').add({
+                platform,
+                ip: realIp,
+                xff,
+                userAgent: req.headers['user-agent'] || null,
+                path: p,
+                method: req.method,
+                timestamp: new Date()
+            }).catch(err => console.warn('[Pentest 2.2.a IpAudit] write fail:', err.message));
+        }
+    } catch (err) {
+        // Audit pipeline asla webhook'u bloklamaz
+        console.warn('[Pentest 2.2.a IpAudit] handler exception:', err.message);
+    }
+
     next();
 }
 
