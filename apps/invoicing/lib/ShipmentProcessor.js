@@ -31,20 +31,15 @@ function tsToMs(v) {
 }
 
 /**
- * Plan 28+++ — sevkiyat detaylarini Parasut description'a yazılabilir metne çevir.
- * Paraşüt API'sinde sürücü/plaka için doğrudan alan yok; kullanıcı GİB onayında
- * Paraşüt panelinden manuel doldurur. Description'a yazıyoruz ki açıklama
- * alanında görünsün, kullanıcı kopyalayabilsin.
+ * Plan 28+++ — Paraşüt description alanı belge BAŞLIĞINA basıldığı için sade tutulur.
+ * Sürücü/TCKN/plaka bilgisi description'a yazılmaz (başlık şişer); Yemigo Firestore'da
+ * shipmentDetails alanında saklanır. Yetkili GİB onayı sırasında Paraşüt panelinden
+ * "Sürücü Bilgileri" alanını manuel doldurur (Paraşüt API'sinde bu alan yok).
+ *
+ * Description = baseDescription (sadece sevkiyat no). Boşsa Paraşüt default başlık koyar.
  */
-function buildShipmentDescription(baseDescription, shipmentDetails) {
-    const parts = [];
-    if (baseDescription) parts.push(baseDescription);
-    if (shipmentDetails) {
-        if (shipmentDetails.driverName) parts.push(`Sürücü: ${shipmentDetails.driverName}`);
-        if (shipmentDetails.driverTckn) parts.push(`TCKN: ${shipmentDetails.driverTckn}`);
-        if (shipmentDetails.vehiclePlate) parts.push(`Plaka: ${shipmentDetails.vehiclePlate}`);
-    }
-    return parts.join(' | ');
+function buildShipmentDescription(baseDescription /* , shipmentDetails */) {
+    return baseDescription || '';
 }
 
 class ShipmentError extends Error {
@@ -164,7 +159,8 @@ class ShipmentProcessor {
                 address: ctx.branch && ctx.branch.address,
                 city: ctx.branch && ctx.branch.city,
                 district: ctx.branch && ctx.branch.district,
-                procurementNumber: doc.sourceTransferNumber || null,
+                // procurement_number kasten gönderilmiyor — Paraşüt otomatik üretir (BR0...).
+                // Yemigo'daki kaynak transfer no Firestore doc.sourceTransferNumber'da kalır.
                 inflow: false,
             });
         } catch (e) {

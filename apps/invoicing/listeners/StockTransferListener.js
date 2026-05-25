@@ -307,7 +307,7 @@ class StockTransferListener {
                 address: ctx.branch && ctx.branch.address,
                 city: ctx.branch && ctx.branch.city,
                 district: ctx.branch && ctx.branch.district,
-                procurementNumber: transfer.transferNumber || transfer.code,
+                // procurement_number kasten gönderilmiyor — Paraşüt otomatik üretir (BR0...).
                 inflow: false,
             });
 
