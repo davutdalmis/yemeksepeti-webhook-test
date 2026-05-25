@@ -303,11 +303,11 @@ class StockTransferListener {
                 items: itemsWithProductIds,
                 issueDate: ctx.issueDate,
                 shipmentDate,
-                description: ctx.description,
+                // description boş — Paraşüt default "Giden İrsaliye" başlığını kullansın.
+                // procurement_number kasten gönderilmiyor — Paraşüt otomatik üretir (BR0...).
                 address: ctx.branch && ctx.branch.address,
                 city: ctx.branch && ctx.branch.city,
                 district: ctx.branch && ctx.branch.district,
-                // procurement_number kasten gönderilmiyor — Paraşüt otomatik üretir (BR0...).
                 inflow: false,
             });
 

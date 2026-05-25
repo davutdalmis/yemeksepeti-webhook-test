@@ -31,15 +31,13 @@ function tsToMs(v) {
 }
 
 /**
- * Plan 28+++ — Paraşüt description alanı belge BAŞLIĞINA basıldığı için sade tutulur.
- * Sürücü/TCKN/plaka bilgisi description'a yazılmaz (başlık şişer); Yemigo Firestore'da
- * shipmentDetails alanında saklanır. Yetkili GİB onayı sırasında Paraşüt panelinden
- * "Sürücü Bilgileri" alanını manuel doldurur (Paraşüt API'sinde bu alan yok).
- *
- * Description = baseDescription (sadece sevkiyat no). Boşsa Paraşüt default başlık koyar.
+ * Plan 28+++ — Paraşüt shipment_document description alanı belge BAŞLIĞINA basılıyor.
+ * Hem sürücü hem "Sevkiyat: IM-..." başlığı şişiriyor → her ikisi de yazılmaz.
+ * Default "Giden İrsaliye" başlığı kalır. Yemigo kaynak transfer no
+ * Firestore doc.sourceTransferNumber'da saklanır; sürücü Firestore shipmentDetails'ta.
  */
-function buildShipmentDescription(baseDescription /* , shipmentDetails */) {
-    return baseDescription || '';
+function buildShipmentDescription(/* baseDescription, shipmentDetails */) {
+    return '';
 }
 
 class ShipmentError extends Error {
