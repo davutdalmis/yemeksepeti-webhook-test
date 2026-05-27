@@ -271,6 +271,16 @@ function authenticatePlatformWebhook(req, res, next) {
                 timestamp: new Date()
             }).catch(err => console.warn('[Pentest 2.2.a IpAudit] write fail:', err.message));
         }
+
+        // 2026-05-27 (WPF Resilience İş 4-A): Signature discovery audit
+        // Sadece YS+TG için (push var), flag'e bağlı (default-off). Hiçbir 401 yok.
+        if (platform === 'yemeksepeti' || platform === 'trendyolgo') {
+            try {
+                const auditor = require('./services/webhook-signature-auditor');
+                auditor.recordRequest({ platform, req, body: req.body })
+                    .catch(() => { /* fail-soft */ });
+            } catch (_) { /* modül yüklenemezse sessiz geç — webhook akışı bozulmaz */ }
+        }
     } catch (err) {
         // Audit pipeline asla webhook'u bloklamaz
         console.warn('[Pentest 2.2.a IpAudit] handler exception:', err.message);
@@ -1459,41 +1469,60 @@ async function notifyCourierNewOrder(courier, order, platform) {
 }
 
 // ==================== UNIFIED FIREBASE WRITE ====================
-async function writeOrderToFirebaseUnified(order, platformId, branchId) {
+async function writeOrderToFirebaseUnified(order, platformId, branchId, rawPayload = null) {
     const connector = platformRegistry.getConnector(platformId);
+    let result;
+    let writeError = null;
+
     if (connector) {
-        return await connector.writeOrderToFirebase(order, branchId);
+        result = await connector.writeOrderToFirebase(order, branchId);
+    } else if (!firebaseInitialized) {
+        result = { success: false, reason: 'firebase_disabled' };
+    } else {
+        const collectionName = {
+            'yemeksepeti': 'yemekSepetiOrders',
+            'getiryemek': 'getirYemekOrders',
+            'trendyolgo': 'trendyolGoOrders'
+        }[platformId.toLowerCase()];
+
+        if (!collectionName) {
+            result = { success: false, reason: 'unknown_platform' };
+        } else {
+            try {
+                const orderId = order.OrderId || order.id || `${platformId}_${Date.now()}`;
+                await db.collection(collectionName).doc(orderId).set({
+                    ...order,
+                    Platform: platformId.toUpperCase(),
+                    Status: 'NEW',
+                    branchId,
+                    CreatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                    source: 'railway_webhook'
+                });
+                result = { success: true, orderId };
+            } catch (error) {
+                writeError = error;
+                result = { success: false, reason: error.message };
+            }
+        }
     }
 
-    // Fallback to direct write
-    if (!firebaseInitialized) {
-        return { success: false, reason: 'firebase_disabled' };
+    // 2026-05-27 (WPF Resilience İş 3): Fail → DLQ kaydı (fire-and-forget).
+    // 'duplicate_skipped' başarı sayılır (base-connector pattern), kayıt yapılmaz.
+    if (result && result.success === false && result.reason !== 'duplicate_skipped') {
+        try {
+            const collector = require('./services/failed-webhook-collector');
+            collector.record({
+                platform: platformId,
+                remoteOrderId: (order && (order.OrderId || order.id)) || null,
+                branchId,
+                rawPayload,
+                transformedOrder: order,
+                error: writeError || new Error(result.reason || 'unknown_write_failure'),
+            }).catch(() => { /* fail-soft */ });
+        } catch (_) { /* collector yüklenemezse sessiz geç */ }
     }
 
-    const collectionName = {
-        'yemeksepeti': 'yemekSepetiOrders',
-        'getiryemek': 'getirYemekOrders',
-        'trendyolgo': 'trendyolGoOrders'
-    }[platformId.toLowerCase()];
-
-    if (!collectionName) {
-        return { success: false, reason: 'unknown_platform' };
-    }
-
-    try {
-        const orderId = order.OrderId || order.id || `${platformId}_${Date.now()}`;
-        await db.collection(collectionName).doc(orderId).set({
-            ...order,
-            Platform: platformId.toUpperCase(),
-            Status: 'NEW',
-            branchId,
-            CreatedAt: admin.firestore.FieldValue.serverTimestamp(),
-            source: 'railway_webhook'
-        });
-        return { success: true, orderId };
-    } catch (error) {
-        return { success: false, reason: error.message };
-    }
+    return result;
 }
 
 // ==================== UNIFIED PLATFORM WEBHOOK HANDLER ====================
@@ -1527,7 +1556,7 @@ async function processPlatformOrderWebhook(platformId, rawOrder, branchId, optio
     const connector = platformRegistry.getConnector(platformId);
     const transformedOrder = connector ? connector.transformOrder(rawOrder, branchId) : rawOrder;
 
-    const firebaseResult = await writeOrderToFirebaseUnified(transformedOrder, platformId, branchId);
+    const firebaseResult = await writeOrderToFirebaseUnified(transformedOrder, platformId, branchId, rawOrder);
 
     if (firebaseResult.success && shouldDispatch && smartDispatchService && deliveryLocation) {
         // Plan 29 Faz 2.3 — preDispatchBuffer wrapper (bufferSeconds=0 → eski akış, buffer atlanır)
