@@ -154,7 +154,9 @@ app.post('/invoicing/credentials', requireApiKey, async (req, res) => {
             companyId: String(companyId),
             isEnabled: !!isEnabled,
             automationMode,
-            defaultDocumentType,
+            // Plan 28++++: 'auto' → ApprovalProcessor VKN'ye göre e_invoice/e_archive seçer.
+            // Bilinmeyen değer → 'sales_invoice' (geriye uyumlu fallback).
+            defaultDocumentType: ['sales_invoice', 'e_archive', 'e_invoice', 'auto'].includes(defaultDocumentType) ? defaultDocumentType : 'sales_invoice',
             defaultVatRate,
             invoiceSeriesPrefix,
             shipmentIncludedDefault: !!shipmentIncludedDefault,
@@ -408,6 +410,9 @@ async function buildInvoiceContext(tenantId, doc) {
         documentType: doc.documentType || settings.defaultDocumentType || 'sales_invoice',
         description: sourceData ? `Sevkiyat: ${sourceData.transferNumber || sourceData.code || doc.sourceId}` : '',
         invoiceSeriesPrefix: settings.invoiceSeriesPrefix || 'A',
+        // Plan 28++++ Görev B: e-arşiv internet_sale ctx override (default null → ParasutProvider fallback).
+        // Tenant ileride özelleştirebilsin diye settings'ten okur; UI henüz yok.
+        internetSale: settings.eArchiveInternetSale || null,
     };
 }
 

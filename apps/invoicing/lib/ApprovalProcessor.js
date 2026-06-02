@@ -221,11 +221,43 @@ class ApprovalProcessor {
                     }
                 }
 
-                // Resmilestir — convert_to_invoice
-                // documentType su an kullanmiyoruz; Parasut alici VKN'sine gore
-                // otomatik e_invoice (B2B) veya e_archive (B2C) secer. Ileride
-                // ctx.documentType'dan zorlanabilir.
-                const finalize = await provider.finalizeInvoice(token, doc.parasutInvoiceId, {});
+                // Plan 28++++ — B2B/B2C dinamik secim (defaultDocumentType='auto' opt-in).
+                //   ctx.documentType === 'auto' → branch.taxNumber varsa checkVknInbox
+                //     registered=true  → 'e_invoice' (B2B)
+                //     registered=false → 'e_archive' (B2C)
+                //     VKN yok / sorgu fail → 'e_archive' fallback
+                //   ctx.documentType in {'e_invoice','e_archive'} → zorla kullan
+                //   Yoksa (eski davranis) → bos options (Parasut otomatik secer)
+                let resolvedDocType = ctx.documentType;
+                let vknRegistered = null;
+                if (ctx.documentType === 'auto') {
+                    const branchVkn = ctx.branch && (ctx.branch.taxNumber || ctx.branch.vatNumber || ctx.branch.vergiNo);
+                    if (branchVkn) {
+                        try {
+                            const inbox = await provider.checkVknInbox(token, branchVkn);
+                            vknRegistered = !!inbox.registered;
+                            resolvedDocType = vknRegistered ? 'e_invoice' : 'e_archive';
+                        } catch (vknErr) {
+                            console.warn(`[ApprovalProcessor] checkVknInbox fail (B2C fallback): ${vknErr.message}`);
+                            resolvedDocType = 'e_archive';
+                        }
+                    } else {
+                        resolvedDocType = 'e_archive';
+                    }
+                }
+
+                const finalizeOpts = {};
+                if (resolvedDocType === 'e_invoice' || resolvedDocType === 'e_archive') {
+                    finalizeOpts.documentType = resolvedDocType;
+                    if (resolvedDocType === 'e_archive') {
+                        // Gorev B: tenant override (ctx.internetSale) → yoksa ParasutProvider default
+                        finalizeOpts.eArchiveAttrs = {
+                            internet_sale: ctx.internetSale || {},
+                        };
+                    }
+                }
+
+                const finalize = await provider.finalizeInvoice(token, doc.parasutInvoiceId, finalizeOpts);
                 parasutResult = {
                     providerInvoiceId: finalize.providerInvoiceId,
                     contactId: doc.parasutContactId || null,
@@ -234,9 +266,17 @@ class ApprovalProcessor {
                     eArchiveId: finalize.eDocType === 'e_archive' ? finalize.eDocId : null,
                     eInvoiceId: finalize.eDocType === 'e_invoice' ? finalize.eDocId : null,
                     eDocType: finalize.eDocType,
+                    documentTypeResolved: resolvedDocType || null,
+                    vknRegistered,
                 };
             } else {
-                // YOL B — Eski tek-atis (geriye uyumlu): listener Parasut'a yazmamissa
+                // YOL B — Eski tek-atis (geriye uyumlu): listener Parasut'a yazmamissa.
+                // Plan 28++++ NOT: createInvoice su an sadece e_archive destekliyor (sales_invoice
+                // + e_archives POST). 'auto' veya 'e_invoice' istense bile e_archive'a dusulur,
+                // warning loglanir. Future: createInvoice'i e_invoice destekleyecek sekilde genislet.
+                if (ctx.documentType === 'auto' || ctx.documentType === 'e_invoice') {
+                    console.warn(`[ApprovalProcessor] YOL B fallback: ctx.documentType='${ctx.documentType}' istendi ama createInvoice sadece e_archive destekler. e_archive kullanildi.`);
+                }
                 const contact = await provider.upsertContact(token, ctx.branch);
                 const itemsWithProductIds = [];
                 for (const it of items4Parasut) {
@@ -261,8 +301,11 @@ class ApprovalProcessor {
                     documentType: 'e_archive',
                     description: ctx.description,
                     invoiceSeries: ctx.invoiceSeriesPrefix,
+                    // Gorev B: internet_sale ctx override (yoksa ParasutProvider default kullanir)
+                    internetSale: ctx.internetSale || undefined,
                 });
                 parasutResult.contactId = contact.contactId;
+                parasutResult.documentTypeResolved = 'e_archive';
             }
         } catch (e) {
             // Paraşüt başarısız → status'u geri pending_approval'a çek + audit
@@ -463,6 +506,9 @@ class ApprovalProcessor {
             eDocType: parasutResult.eDocType || (parasutResult.eArchiveId ? 'e_archive' : null),
             twoPhase: !!useExistingDraft,
             fireTotal,
+            // Plan 28++++ debug: dinamik secim sonucu + VKN sorgu sonucu
+            documentTypeResolved: parasutResult.documentTypeResolved || null,
+            vknRegistered: typeof parasutResult.vknRegistered === 'boolean' ? parasutResult.vknRegistered : null,
         });
 
         return {
@@ -474,6 +520,8 @@ class ApprovalProcessor {
             invoiceNumber: parasutResult.invoiceNumber,
             fireQuantityTotal: fireTotal,
             pdfUrl: parasutResult.pdfUrl,
+            documentTypeResolved: parasutResult.documentTypeResolved || null,
+            vknRegistered: typeof parasutResult.vknRegistered === 'boolean' ? parasutResult.vknRegistered : null,
         };
     }
 }

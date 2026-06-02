@@ -450,3 +450,304 @@ describe('ApprovalProcessor — items-less legacy doc', () => {
         expect(movements.length).toBe(0);
     });
 });
+
+// ============================================================================
+// Plan 28++++ — YOL A (useExistingDraft) + 'auto' documentType + checkVknInbox
+// ============================================================================
+// Bu suite Plan 28+ taslak akisini test eder: seed doc'a parasutInvoiceId set edilir,
+// boylece ApprovalProcessor useExistingDraft=true ile YOL A (updateDraft + finalizeInvoice)
+// yoluna girer. checkVknInbox sonucuna gore documentType dinamik secilir.
+
+function makeYolAProvider(overrides = {}) {
+    let invCounter = 1;
+    const defaults = {
+        providerName: 'parasut',
+        upsertContact: jest.fn(async () => ({ contactId: 'contact-1' })),
+        upsertProduct: jest.fn(async (_t, p) => ({ productId: 'p-' + (p.productId || p.sku || 'x') })),
+        updateDraftInvoice: jest.fn(async () => ({
+            providerInvoiceId: 'draft-1',
+            invoiceNumber: null,
+            pdfUrl: 'https://parasut.test/draft/1',
+        })),
+        finalizeInvoice: jest.fn(async (_t, providerInvoiceId, _opts) => ({
+            providerInvoiceId,
+            eDocId: `e-doc-${invCounter++}`,
+            eDocType: 'e_archive', // default; specific tests override
+            pdfUrl: 'https://parasut.test/pdf/x',
+            invoiceNumber: 'IM2026-AUTO-0001',
+        })),
+        checkVknInbox: jest.fn(async () => ({ registered: false })),
+        deleteInvoice: jest.fn(async () => ({ ok: true })),
+    };
+    return { ...defaults, ...overrides };
+}
+
+async function seedDraftYolA(db, idem, overrides = {}) {
+    const r = await idem.ensureDraft({
+        tenantId: 'bafetto-001',
+        sourceType: 'stockTransfer',
+        sourceId: 'TR-YOL-A-0001',
+        data: {
+            branchId: 'b-kadikoy',
+            sourceTransferNumber: 'TRF-YOL-A',
+            amount: 1000,
+            currency: 'TRL',
+            items: [
+                { itemIndex: 0, productId: 'p1', productName: 'Pizza Hamuru', unit: 'paket', unitPrice: 25, vatRate: 20, originalQuantity: 40 },
+            ],
+            ...overrides.data,
+        },
+    });
+    // Plan 28+ listener mock: parasutInvoiceId zaten yazilmis (taslak mevcut)
+    await idem.update(r.id, { parasutInvoiceId: 'draft-1', parasutContactId: 'contact-1' });
+    await db.collection('stockTransfers').doc('TR-YOL-A-0001').set({
+        tenantId: 'bafetto-001',
+        status: 'shipped',
+        items: [
+            { productId: 'p1', productName: 'Pizza Hamuru', quantity: 40, unitPrice: 25, vatRate: 20, unit: 'paket' },
+        ],
+    });
+    return r.id;
+}
+
+describe('ApprovalProcessor — Plan 28++++ B2B/B2C dinamik secim (auto)', () => {
+    test("documentType='auto' + VKN registered=true → finalizeInvoice e_invoice ile cagrilir", async () => {
+        const db = makeFakeDb();
+        const idem = new IdempotencyService({ db });
+        const provider = makeYolAProvider({
+            checkVknInbox: jest.fn(async () => ({ registered: true, alias: 'urn:mail:b2b@firma.com' })),
+            finalizeInvoice: jest.fn(async (_t, id) => ({
+                providerInvoiceId: id,
+                eDocId: 'e-inv-100',
+                eDocType: 'e_invoice',
+                pdfUrl: 'https://parasut.test/pdf/inv-100',
+                invoiceNumber: 'EFT2026-001',
+            })),
+        });
+        const docId = await seedDraftYolA(db, idem);
+        const proc = makeProcessor({
+            provider,
+            db,
+            idem,
+            contextLoader: async () => ({
+                branch: { name: 'Bafetto Kadikoy', taxNumber: '1234567890' },
+                currency: 'TRL',
+                issueDate: '2026-05-23',
+                shipmentIncluded: false,
+                documentType: 'auto', // ← opt-in
+                description: 'Sevkiyat: TRF-YOL-A',
+                invoiceSeriesPrefix: 'IM',
+                productionLocationId: 'central',
+            }),
+        });
+
+        const result = await proc.approve(docId, {
+            tenantId: 'bafetto-001',
+            approvedBy: 'owner',
+            edits: [],
+        });
+
+        expect(result.ok).toBe(true);
+        expect(provider.checkVknInbox).toHaveBeenCalledWith('mock-token', '1234567890');
+        expect(provider.finalizeInvoice).toHaveBeenCalledTimes(1);
+        const finalizeArgs = provider.finalizeInvoice.mock.calls[0];
+        expect(finalizeArgs[2]).toMatchObject({ documentType: 'e_invoice' });
+        expect(finalizeArgs[2].eArchiveAttrs).toBeUndefined();
+        expect(result.eDocType).toBe('e_invoice');
+        expect(result.eInvoiceId).toBe('e-inv-100');
+        expect(result.eArchiveId).toBeNull();
+        expect(result.documentTypeResolved).toBe('e_invoice');
+        expect(result.vknRegistered).toBe(true);
+    });
+
+    test("documentType='auto' + VKN registered=false → finalizeInvoice e_archive ile cagrilir", async () => {
+        const db = makeFakeDb();
+        const idem = new IdempotencyService({ db });
+        const provider = makeYolAProvider({
+            checkVknInbox: jest.fn(async () => ({ registered: false })),
+            finalizeInvoice: jest.fn(async (_t, id) => ({
+                providerInvoiceId: id,
+                eDocId: 'e-arc-200',
+                eDocType: 'e_archive',
+                pdfUrl: 'https://parasut.test/pdf/arc-200',
+                invoiceNumber: 'A2026-200',
+            })),
+        });
+        const docId = await seedDraftYolA(db, idem);
+        const proc = makeProcessor({
+            provider,
+            db,
+            idem,
+            contextLoader: async () => ({
+                branch: { name: 'Bafetto Maltepe', taxNumber: '9876543210' },
+                currency: 'TRL',
+                issueDate: '2026-05-23',
+                shipmentIncluded: false,
+                documentType: 'auto',
+                description: 'Sevkiyat: TRF-YOL-A',
+                invoiceSeriesPrefix: 'IM',
+                productionLocationId: 'central',
+            }),
+        });
+
+        const result = await proc.approve(docId, {
+            tenantId: 'bafetto-001',
+            approvedBy: 'owner',
+            edits: [],
+        });
+
+        expect(result.ok).toBe(true);
+        expect(provider.checkVknInbox).toHaveBeenCalledWith('mock-token', '9876543210');
+        const finalizeArgs = provider.finalizeInvoice.mock.calls[0];
+        expect(finalizeArgs[2]).toMatchObject({
+            documentType: 'e_archive',
+            eArchiveAttrs: { internet_sale: {} },
+        });
+        expect(result.eDocType).toBe('e_archive');
+        expect(result.eArchiveId).toBe('e-arc-200');
+        expect(result.eInvoiceId).toBeNull();
+        expect(result.documentTypeResolved).toBe('e_archive');
+        expect(result.vknRegistered).toBe(false);
+    });
+
+    test("documentType='auto' + VKN bos → checkVknInbox cagrilmaz, e_archive fallback", async () => {
+        const db = makeFakeDb();
+        const idem = new IdempotencyService({ db });
+        const provider = makeYolAProvider();
+        const docId = await seedDraftYolA(db, idem);
+        const proc = makeProcessor({
+            provider,
+            db,
+            idem,
+            contextLoader: async () => ({
+                branch: { name: 'VKN siz sube', taxNumber: '' },
+                currency: 'TRL',
+                issueDate: '2026-05-23',
+                shipmentIncluded: false,
+                documentType: 'auto',
+                description: 'Sevkiyat: TRF-YOL-A',
+                invoiceSeriesPrefix: 'IM',
+                productionLocationId: 'central',
+            }),
+        });
+
+        const result = await proc.approve(docId, {
+            tenantId: 'bafetto-001',
+            approvedBy: 'owner',
+            edits: [],
+        });
+
+        expect(result.ok).toBe(true);
+        expect(provider.checkVknInbox).not.toHaveBeenCalled();
+        const finalizeArgs = provider.finalizeInvoice.mock.calls[0];
+        expect(finalizeArgs[2].documentType).toBe('e_archive');
+        expect(result.documentTypeResolved).toBe('e_archive');
+        expect(result.vknRegistered).toBeNull();
+    });
+
+    test("ctx.internetSale override → finalizeInvoice eArchiveAttrs.internet_sale'e gecer", async () => {
+        const db = makeFakeDb();
+        const idem = new IdempotencyService({ db });
+        const provider = makeYolAProvider();
+        const docId = await seedDraftYolA(db, idem);
+        const proc = makeProcessor({
+            provider,
+            db,
+            idem,
+            contextLoader: async () => ({
+                branch: { name: 'Sube', taxNumber: '' }, // VKN yok → e_archive yolu
+                currency: 'TRL',
+                issueDate: '2026-05-23',
+                shipmentIncluded: false,
+                documentType: 'auto',
+                description: 'Sevkiyat: TRF-YOL-A',
+                invoiceSeriesPrefix: 'IM',
+                productionLocationId: 'central',
+                internetSale: {
+                    payment_type: 'EFT/HAVALE',
+                    payment_platform: 'BANKA',
+                },
+            }),
+        });
+
+        await proc.approve(docId, {
+            tenantId: 'bafetto-001',
+            approvedBy: 'owner',
+            edits: [],
+        });
+
+        const finalizeArgs = provider.finalizeInvoice.mock.calls[0];
+        expect(finalizeArgs[2].eArchiveAttrs.internet_sale).toEqual({
+            payment_type: 'EFT/HAVALE',
+            payment_platform: 'BANKA',
+        });
+    });
+
+    test("documentType=undefined (eski davranis) → finalizeInvoice bos options ile cagrilir", async () => {
+        const db = makeFakeDb();
+        const idem = new IdempotencyService({ db });
+        const provider = makeYolAProvider();
+        const docId = await seedDraftYolA(db, idem);
+        const proc = makeProcessor({
+            provider,
+            db,
+            idem,
+            contextLoader: async () => ({
+                branch: { name: 'Sube', taxNumber: '1234567890' },
+                currency: 'TRL',
+                issueDate: '2026-05-23',
+                shipmentIncluded: false,
+                // documentType yok (eski tenant)
+                description: 'Sevkiyat: TRF-YOL-A',
+                invoiceSeriesPrefix: 'IM',
+                productionLocationId: 'central',
+            }),
+        });
+
+        await proc.approve(docId, {
+            tenantId: 'bafetto-001',
+            approvedBy: 'owner',
+            edits: [],
+        });
+
+        // Geriye uyumluluk: checkVknInbox cagrilmamali (sadece 'auto' opt-in tetikler)
+        expect(provider.checkVknInbox).not.toHaveBeenCalled();
+        const finalizeArgs = provider.finalizeInvoice.mock.calls[0];
+        expect(finalizeArgs[2]).toEqual({}); // bos options → Parasut otomatik
+    });
+
+    test("checkVknInbox throw → e_archive fallback, akis bozulmaz", async () => {
+        const db = makeFakeDb();
+        const idem = new IdempotencyService({ db });
+        const provider = makeYolAProvider({
+            checkVknInbox: jest.fn(async () => { throw new Error('parasut e_invoice_inboxes timeout'); }),
+        });
+        const docId = await seedDraftYolA(db, idem);
+        const proc = makeProcessor({
+            provider,
+            db,
+            idem,
+            contextLoader: async () => ({
+                branch: { name: 'Sube', taxNumber: '1234567890' },
+                currency: 'TRL',
+                issueDate: '2026-05-23',
+                shipmentIncluded: false,
+                documentType: 'auto',
+                description: 'Sevkiyat: TRF-YOL-A',
+                invoiceSeriesPrefix: 'IM',
+                productionLocationId: 'central',
+            }),
+        });
+
+        const result = await proc.approve(docId, {
+            tenantId: 'bafetto-001',
+            approvedBy: 'owner',
+            edits: [],
+        });
+
+        expect(result.ok).toBe(true);
+        const finalizeArgs = provider.finalizeInvoice.mock.calls[0];
+        expect(finalizeArgs[2].documentType).toBe('e_archive');
+        expect(result.documentTypeResolved).toBe('e_archive');
+    });
+});

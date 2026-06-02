@@ -46,15 +46,32 @@ describe('ParasutProvider', () => {
         expect(r.accessToken).toBe('AT2');
     });
 
-    test('ping -> ok=true on 200', async () => {
-        nock(BASE).get(`/v4/${COMPANY_ID}/me`).reply(200, { data: { attributes: { name: 'Test Co' } } });
+    test('ping -> ok=true when configured companyId is accessible', async () => {
+        // ping global /v4/me + /v4/companies cagirir (companyId prefix YOK) ve
+        // configure edilen companyId'nin erisilebilir oldugunu dogrular.
+        nock(BASE).get('/v4/me').reply(200, { data: { attributes: { email: 'u@example.com' } } });
+        nock(BASE).get('/v4/companies').reply(200, {
+            data: [{ id: COMPANY_ID, attributes: { name: 'Test Co' } }],
+        });
         const p = makeProvider();
         const r = await p.ping('AT');
-        expect(r).toEqual({ ok: true, company: { name: 'Test Co' } });
+        expect(r).toEqual({ ok: true, company: { id: COMPANY_ID, name: 'Test Co' } });
+    });
+
+    test('ping -> ok=false when companyId not accessible', async () => {
+        nock(BASE).get('/v4/me').reply(200, { data: { attributes: { email: 'u@example.com' } } });
+        nock(BASE).get('/v4/companies').reply(200, {
+            data: [{ id: '111', attributes: { name: 'Baska Co' } }],
+        });
+        const p = makeProvider();
+        const r = await p.ping('AT');
+        expect(r.ok).toBe(false);
+        expect(r.code).toBe('COMPANY_NOT_ACCESSIBLE');
     });
 
     test('ping -> ok=false on 401', async () => {
-        nock(BASE).get(`/v4/${COMPANY_ID}/me`).reply(401, { message: 'unauthorized' });
+        nock(BASE).get('/v4/me').reply(401, { message: 'unauthorized' });
+        nock(BASE).get('/v4/companies').reply(401, { message: 'unauthorized' });
         const p = makeProvider();
         const r = await p.ping('bad-token');
         expect(r.ok).toBe(false);
@@ -113,5 +130,62 @@ describe('ParasutProvider', () => {
 
     test('constructor rejects missing options', () => {
         expect(() => new ParasutProvider({ clientId: 'a' })).toThrow(/missing required option/);
+    });
+
+    // Plan 28++++ Gorev B: e_archive POST'unda internet_sale ctx'ten override edilebilmeli.
+    test("createInvoice e_archive -> internetSale override POST body'ye yansir", async () => {
+        nock(BASE)
+            .post(`/v4/${COMPANY_ID}/sales_invoices`)
+            .query({ include: 'active_e_document' })
+            .reply(201, {
+                data: { id: 'inv-9', type: 'sales_invoices', attributes: { invoice_no: 'A-009' } },
+                included: [],
+            });
+        let postedBody = null;
+        nock(BASE)
+            .post(`/v4/${COMPANY_ID}/e_archives`, (body) => { postedBody = body; return true; })
+            .reply(201, { data: { id: 'earc-9', type: 'e_archives' } });
+
+        const p = makeProvider();
+        const r = await p.createInvoice('AT', {
+            contactId: '42',
+            items: [{ productId: 'prod-1', quantity: 1, unitPrice: 100 }],
+            issueDate: '2026-05-23',
+            documentType: 'e_archive',
+            internetSale: { payment_type: 'EFT/HAVALE', payment_platform: 'BANKA' },
+        });
+
+        expect(r.eArchiveId).toBe('earc-9');
+        expect(postedBody.data.attributes.internet_sale).toEqual({
+            url: '',
+            payment_type: 'EFT/HAVALE',
+            payment_platform: 'BANKA',
+            payment_date: '2026-05-23', // issueDate'ten dustu
+        });
+    });
+
+    test("createInvoice e_archive -> internetSale verilmezse default 'KREDIKARTI/BANKAKARTI' (geriye uyumlu)", async () => {
+        nock(BASE)
+            .post(`/v4/${COMPANY_ID}/sales_invoices`)
+            .query({ include: 'active_e_document' })
+            .reply(201, {
+                data: { id: 'inv-10', type: 'sales_invoices', attributes: { invoice_no: 'A-010' } },
+                included: [],
+            });
+        let postedBody = null;
+        nock(BASE)
+            .post(`/v4/${COMPANY_ID}/e_archives`, (body) => { postedBody = body; return true; })
+            .reply(201, { data: { id: 'earc-10', type: 'e_archives' } });
+
+        const p = makeProvider();
+        await p.createInvoice('AT', {
+            contactId: '42',
+            items: [{ productId: 'prod-1', quantity: 1, unitPrice: 100 }],
+            issueDate: '2026-05-23',
+            documentType: 'e_archive',
+        });
+
+        expect(postedBody.data.attributes.internet_sale.payment_type).toBe('KREDIKARTI/BANKAKARTI');
+        expect(postedBody.data.attributes.internet_sale.payment_platform).toBe('SISTEM');
     });
 });

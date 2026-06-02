@@ -195,6 +195,9 @@ class ParasutProvider {
             description,
             shipmentIncluded = false,
             documentType = 'sales_invoice',
+            // Plan 28++++ Gorev B: e-arsiv internet_sale override (ctx'ten).
+            // {payment_type, payment_platform, url, payment_date} alanlari kismi/tam set edilebilir.
+            internetSale,
         } = payload;
 
         if (!contactId) throw new InvoiceProviderError('contactId required', { code: 'INVOICE_NO_CONTACT' });
@@ -249,10 +252,20 @@ class ParasutProvider {
         };
 
         if (documentType === 'e_archive') {
+            // Plan 28++++ Gorev B: internet_sale ctx override (default values geriye uyumlu).
+            const is = internetSale || {};
             const earchive = await this._post(token, '/e_archives', {
                 data: {
                     type: 'e_archives',
-                    attributes: { vat_withholding_code: '', internet_sale: { url: '', payment_type: 'KREDIKARTI/BANKAKARTI', payment_platform: 'SISTEM', payment_date: issueDate } },
+                    attributes: {
+                        vat_withholding_code: '',
+                        internet_sale: {
+                            url: is.url || '',
+                            payment_type: is.payment_type || 'KREDIKARTI/BANKAKARTI',
+                            payment_platform: is.payment_platform || 'SISTEM',
+                            payment_date: is.payment_date || issueDate,
+                        },
+                    },
                     relationships: {
                         sales_invoice: { data: { type: 'sales_invoices', id: created.data.id } },
                     },

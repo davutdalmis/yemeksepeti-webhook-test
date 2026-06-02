@@ -24,6 +24,8 @@
 // onaylayinca engine /invoicing/draft/:id/approve endpoint'i tetiklenir.
 // ==================================================================================
 
+const { validateTransition } = require('../lib/StatusTransitionValidator');
+
 /**
  * Firestore Timestamp / ms / Date / null degerlerini guvenle ms'e cevirir.
  * Plan 28++: shipped_at gibi alanlar `firestore.SERVER_TIMESTAMP` ile yazildigi zaman
@@ -66,6 +68,7 @@ class StockTransferListener {
         this.tokenManager = tokenManager || null;
         this.contextLoader = contextLoader || null;
         this._unsubscribe = null;
+        this._unsubscribeCancel = null;
     }
 
     start() {
@@ -89,6 +92,30 @@ class StockTransferListener {
             }
         );
         console.log(`[StockTransferListener] subscribed to ${this.collection} where status=shipped`);
+
+        // Plan 27 — IPTAL GUVENLIK AGI: shipped'ten sonra (parasutQueued=true) iptal edilen
+        // transferleri yakala. Belge zaten kesilmemisse (draft vb.) otomatik void et;
+        // GIB'e kesilmis (sent) belge varsa OTOMATIK BOZMA — manuel inceleme bayragi koy.
+        // Ayni (status, parasutQueued) composite index'i kapsar (shipped+false / cancelled+true).
+        const cancelQ = this.db.collection(this.collection)
+            .where('status', '==', 'cancelled')
+            .where('parasutQueued', '==', true);
+
+        this._unsubscribeCancel = cancelQ.onSnapshot(
+            (snapshot) => {
+                snapshot.docChanges().forEach(async (change) => {
+                    if (change.type === 'added' || change.type === 'modified') {
+                        await this._handleCancellation(change.doc).catch((e) => {
+                            console.error(`[StockTransferListener] cancel handle error for ${change.doc.id}:`, e.message);
+                        });
+                    }
+                });
+            },
+            (err) => {
+                console.error('[StockTransferListener] cancel snapshot error:', err.message);
+            }
+        );
+        console.log(`[StockTransferListener] subscribed to ${this.collection} where status=cancelled (cancellation safety net)`);
     }
 
     stop() {
@@ -96,6 +123,11 @@ class StockTransferListener {
             this._unsubscribe();
             this._unsubscribe = null;
             console.log('[StockTransferListener] unsubscribed');
+        }
+        if (this._unsubscribeCancel) {
+            this._unsubscribeCancel();
+            this._unsubscribeCancel = null;
+            console.log('[StockTransferListener] unsubscribed (cancel)');
         }
     }
 
@@ -247,6 +279,157 @@ class StockTransferListener {
         // Plan 28: auto-enqueue intentionally removed.
         // Owner approval (panel "Onayla" -> POST /invoicing/draft/:id/approve)
         // is now the sole trigger for Parasut finalization (convert_to_invoice).
+    }
+
+    /**
+     * Plan 27 — IPTAL GUVENLIK AGI.
+     * shipped sonrasi iptal edilen (status='cancelled', parasutQueued=true) bir transfer'in
+     * iliskili invoiceDocuments belgelerini guvenle ele alir:
+     *   - Belge KESILMEMIS (draft/pending_approval/approved/queued/failed):
+     *       otomatik void -> status='cancelled'. Parasut'ta taslak varsa best-effort sil.
+     *   - Belge KESILMIS (sent): durumu DEGISTIRME (GIB belgesi yasal olarak duruyor).
+     *       cancellationRequested=true bayragi + audit + uyari -> manuel inceleme
+     *       (iade faturasi / e-Arsiv iptali insan karari, runbook'a gore).
+     *   - sending: mid-flight, dokunma (cancelled gecisi gecersiz) -> sadece bayrak+uyari.
+     * Idempotency: transfer'e parasutCancellationHandled=true damgasi.
+     */
+    async _handleCancellation(docSnap) {
+        const transfer = docSnap.data();
+        const transferId = docSnap.id;
+
+        if (transfer.parasutCancellationHandled === true) return;
+
+        const docIds = [transfer.parasutDocumentId, transfer.parasutShipmentDocumentId]
+            .filter((id) => typeof id === 'string' && id.length > 0);
+
+        if (docIds.length === 0) {
+            // Hicbir belge yaratilmamis (ornegin shipmentMode/invoiceDraftMode disabled).
+            // Sadece damga vur, bir daha bakma.
+            await this._markCancellationHandled(docSnap, { documents: 0 });
+            return;
+        }
+
+        const tenantId = transfer.tenantId || null;
+        const results = [];
+
+        for (const docId of docIds) {
+            try {
+                const doc = await this.idempotency.getById(docId);
+                if (!doc) {
+                    results.push({ docId, action: 'missing' });
+                    continue;
+                }
+                const status = doc.status;
+
+                if (status === 'cancelled') {
+                    results.push({ docId, action: 'already_cancelled' });
+                    continue;
+                }
+
+                if (status === 'sent') {
+                    // GIB'e kesilmis belge — OTOMATIK BOZMA. Manuel inceleme bayragi.
+                    await this.idempotency.update(docId, {
+                        cancellationRequested: true,
+                        cancellationRequestedAt: Date.now(),
+                        cancellationReason: 'source_transfer_cancelled',
+                    });
+                    await this.idempotency.appendAudit(docId, 'transfer_cancelled_after_sent', 'listener', {
+                        transferId,
+                        note: 'GIB belgesi kesilmis — iade faturasi / e-Arsiv iptali MANUEL inceleme gerekir',
+                    }).catch(() => {});
+                    console.warn(`[StockTransferListener] MANUAL REVIEW: transfer ${transferId} iptal edildi ama doc ${docId} status=sent — iade faturasi/e-Arsiv iptali manuel ele alinmali`);
+                    results.push({ docId, action: 'flagged_manual_review' });
+                    continue;
+                }
+
+                if (status === 'sending') {
+                    // Mid-flight — gecis gecersiz, sadece bayrak.
+                    await this.idempotency.update(docId, {
+                        cancellationRequested: true,
+                        cancellationRequestedAt: Date.now(),
+                        cancellationReason: 'source_transfer_cancelled',
+                    });
+                    await this.idempotency.appendAudit(docId, 'transfer_cancelled_while_sending', 'listener', {
+                        transferId,
+                        note: 'Belge gonderiliyor — worker bittiginde tekrar degerlendirilmeli',
+                    }).catch(() => {});
+                    console.warn(`[StockTransferListener] transfer ${transferId} iptal edildi ama doc ${docId} status=sending — bayrak kondu`);
+                    results.push({ docId, action: 'flagged_sending' });
+                    continue;
+                }
+
+                // KESILMEMIS belge (draft/pending_approval/approved/queued/failed) — guvenli void.
+                // Parasut'ta taslak fatura varsa best-effort sil (DELETE sadece taslak icin gecerli).
+                if (doc.parasutInvoiceId && tenantId) {
+                    await this._voidParasutDraft(tenantId, docId, doc.parasutInvoiceId);
+                }
+
+                const check = validateTransition(status, 'cancelled');
+                if (!check.ok) {
+                    console.warn(`[StockTransferListener] doc ${docId} ${check.reason} — bayrakla birakildi`);
+                    await this.idempotency.update(docId, {
+                        cancellationRequested: true,
+                        cancellationRequestedAt: Date.now(),
+                        cancellationReason: 'source_transfer_cancelled',
+                    });
+                    results.push({ docId, action: `invalid_transition:${status}` });
+                    continue;
+                }
+
+                await this.idempotency.update(docId, {
+                    status: 'cancelled',
+                    cancellationReason: 'source_transfer_cancelled',
+                    cancelledAt: Date.now(),
+                });
+                await this.idempotency.appendAudit(docId, 'transfer_cancelled_auto_void', 'listener', {
+                    transferId,
+                    fromStatus: status,
+                }).catch(() => {});
+                console.log(`[StockTransferListener] doc ${docId} (status=${status}) -> cancelled (transfer ${transferId} iptal)`);
+                results.push({ docId, action: 'auto_voided', fromStatus: status });
+            } catch (e) {
+                console.warn(`[StockTransferListener] cancellation handling FAILED for doc ${docId}: ${e.message}`);
+                results.push({ docId, action: 'error', error: e.message });
+            }
+        }
+
+        await this._markCancellationHandled(docSnap, { documents: docIds.length, results });
+    }
+
+    /**
+     * Parasut'ta KESILMEMIS taslak fatura'yi best-effort siler (DELETE /sales_invoices/{id}).
+     * Hata fatal degil — Firestore void yine de ilerler, audit'e yazilir.
+     */
+    async _voidParasutDraft(tenantId, docId, parasutInvoiceId) {
+        if (!this.providerFactory || !this.tokenManager) return;
+        try {
+            const provider = await this.providerFactory(tenantId);
+            const token = await this.tokenManager.getValidToken(tenantId);
+            await provider.cancelDocument(token, parasutInvoiceId, 'source_transfer_cancelled');
+            await this.idempotency.appendAudit(docId, 'parasut_draft_deleted', 'listener', {
+                parasutInvoiceId,
+            }).catch(() => {});
+            console.log(`[StockTransferListener] Parasut draft ${parasutInvoiceId} silindi (doc ${docId})`);
+        } catch (e) {
+            await this.idempotency.appendAudit(docId, 'parasut_draft_delete_failed', 'listener', {
+                parasutInvoiceId,
+                error: e.message,
+                code: e.code,
+                status: e.status,
+            }).catch(() => {});
+            console.warn(`[StockTransferListener] Parasut draft delete FAILED ${parasutInvoiceId} (doc ${docId}): ${e.message}`);
+        }
+    }
+
+    async _markCancellationHandled(docSnap, meta) {
+        try {
+            await docSnap.ref.update({
+                parasutCancellationHandled: true,
+                parasutCancellationHandledAt: Date.now(),
+            });
+        } catch (e) {
+            console.warn(`[StockTransferListener] could not mark transfer ${docSnap.id} cancellation-handled:`, e.message);
+        }
     }
 
     /**
