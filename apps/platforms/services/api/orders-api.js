@@ -67,11 +67,13 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
         }
 
         // Validate API key (in production, check against Firebase)
+        // 2026-06-04 (Pentest Faz 1.6 / N2): her env değeri virgülle ayrılmış çoklu key
+        // olabilir (dual-accept rotate — eski+yeni geçiş penceresinde birlikte geçerli).
         const validKeys = [
             process.env.YEMEKSEPETI_POLLING_API_KEY,
             process.env.GETIRYEMEK_POLLING_API_KEY,
             process.env.UNIFIED_API_KEY
-        ].filter(Boolean);
+        ].filter(Boolean).flatMap(v => v.split(',').map(k => k.trim())).filter(Boolean);
 
         if (!validKeys.includes(apiKey)) {
             return res.status(401).json({ error: 'Invalid API key', code: 'INVALID_API_KEY' });

@@ -196,9 +196,20 @@ async function lazyCleanupOrders(branchId) {
 }
 
 // ==================== API KEY CONFIGURATION ====================
+// 2026-06-04 (Pentest Faz 1.6 / N2): polling key'leri virgülle ayrılmış ÇOKLU değer kabul eder.
+// Dual-accept rotate: anahtar yenilenirken eski+yeni geçiş penceresinde birlikte geçerli olur.
+// Tek değerle de geriye uyumlu (split tek elemanlı dizi döner).
+function parseKeySet(envVal) {
+    return (envVal || '').split(',').map(k => k.trim()).filter(Boolean);
+}
+function apiKeyMatches(provided, keySet) {
+    if (!provided) return false;
+    return Array.isArray(keySet) ? keySet.includes(provided) : provided === keySet;
+}
+
 const API_KEYS = {
-    YEMEKSEPETI_POLLING_KEY: process.env.YEMEKSEPETI_POLLING_API_KEY || null,
-    GETIRYEMEK_POLLING_KEY: process.env.GETIRYEMEK_POLLING_API_KEY || null,
+    YEMEKSEPETI_POLLING_KEY: parseKeySet(process.env.YEMEKSEPETI_POLLING_API_KEY),
+    GETIRYEMEK_POLLING_KEY: parseKeySet(process.env.GETIRYEMEK_POLLING_API_KEY),
     GETIRYEMEK_DEFAULT_RESTAURANT_SECRET: process.env.GETIRYEMEK_DEFAULT_RESTAURANT_SECRET || null,
     UNIFIED_API_KEY: process.env.UNIFIED_API_KEY || null,
     ADMIN_API_KEY: process.env.ADMIN_API_KEY || null
@@ -2504,7 +2515,7 @@ app.post('/webhook/migrosyemek/delivery-status', webhookLimiter, authenticateMig
 app.get('/api/yemeksepeti/pending-orders', pollingLimiter, async (req, res) => {
     metrics.increment('polling_requests_total', { platform: 'yemeksepeti' });
     const apiKey = req.headers['x-api-key'];
-    if (apiKey !== API_KEYS.YEMEKSEPETI_POLLING_KEY) {
+    if (!apiKeyMatches(apiKey, API_KEYS.YEMEKSEPETI_POLLING_KEY)) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
 
@@ -2537,7 +2548,7 @@ app.get('/api/yemeksepeti/pending-orders', pollingLimiter, async (req, res) => {
 
 app.delete('/api/yemeksepeti/orders/:orderId', async (req, res) => {
     const apiKey = req.headers['x-api-key'];
-    if (apiKey !== API_KEYS.YEMEKSEPETI_POLLING_KEY) {
+    if (!apiKeyMatches(apiKey, API_KEYS.YEMEKSEPETI_POLLING_KEY)) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
 
@@ -2573,7 +2584,7 @@ app.delete('/api/yemeksepeti/orders/:orderId', async (req, res) => {
 
 app.get('/api/yemeksepeti/cancellations', pollingLimiter, async (req, res) => {
     const apiKey = req.headers['x-api-key'];
-    if (apiKey !== API_KEYS.YEMEKSEPETI_POLLING_KEY) {
+    if (!apiKeyMatches(apiKey, API_KEYS.YEMEKSEPETI_POLLING_KEY)) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
 
@@ -2583,7 +2594,7 @@ app.get('/api/yemeksepeti/cancellations', pollingLimiter, async (req, res) => {
 
 app.delete('/api/yemeksepeti/cancellations/:cancellationId', async (req, res) => {
     const apiKey = req.headers['x-api-key'];
-    if (apiKey !== API_KEYS.YEMEKSEPETI_POLLING_KEY) {
+    if (!apiKeyMatches(apiKey, API_KEYS.YEMEKSEPETI_POLLING_KEY)) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
 
@@ -2598,7 +2609,7 @@ app.delete('/api/yemeksepeti/cancellations/:cancellationId', async (req, res) =>
 app.get('/poll/webhooks', pollingLimiter, async (req, res) => {
     metrics.increment('polling_requests_total', { platform: 'getiryemek' });
     const apiKey = req.headers['x-api-key'];
-    if (apiKey !== API_KEYS.GETIRYEMEK_POLLING_KEY) {
+    if (!apiKeyMatches(apiKey, API_KEYS.GETIRYEMEK_POLLING_KEY)) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
 
@@ -2612,7 +2623,7 @@ app.get('/poll/webhooks', pollingLimiter, async (req, res) => {
 
 app.delete('/api/getiryemek/webhooks/:webhookId', async (req, res) => {
     const apiKey = req.headers['x-api-key'];
-    if (apiKey !== API_KEYS.GETIRYEMEK_POLLING_KEY) {
+    if (!apiKeyMatches(apiKey, API_KEYS.GETIRYEMEK_POLLING_KEY)) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
 
@@ -2793,7 +2804,7 @@ app.get('/socket/status', async (req, res) => {
 
 app.get('/debug/last-getir-webhooks', async (req, res) => {
     const apiKey = req.headers['x-api-key'];
-    if (apiKey !== API_KEYS.YEMEKSEPETI_POLLING_KEY && apiKey !== API_KEYS.ADMIN_API_KEY) {
+    if (!apiKeyMatches(apiKey, API_KEYS.YEMEKSEPETI_POLLING_KEY) && apiKey !== API_KEYS.ADMIN_API_KEY) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
 
@@ -2823,7 +2834,7 @@ app.get('/debug/last-getir-webhooks', async (req, res) => {
 
 app.get('/debug/requests', async (req, res) => {
     const apiKey = req.headers['x-api-key'];
-    if (apiKey !== API_KEYS.YEMEKSEPETI_POLLING_KEY && apiKey !== API_KEYS.ADMIN_API_KEY) {
+    if (!apiKeyMatches(apiKey, API_KEYS.YEMEKSEPETI_POLLING_KEY) && apiKey !== API_KEYS.ADMIN_API_KEY) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
 
