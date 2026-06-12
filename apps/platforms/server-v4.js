@@ -45,6 +45,9 @@ const PreDispatchBuffer = require('./services/dispatch/pre-dispatch-buffer');
 const DispatchAudit = require('./services/dispatch/dispatch-audit');
 const DispatchAlerts = require('./services/dispatch/dispatch-alerts');
 const DelayedCallQueue = require('./services/queue/delayed-call-queue');
+// OUTAGE_RESILIENCE_PLAN Faz 1 — sahipsiz sipariş bekçisi + manager push
+const OrphanOrderWatchdog = require('./services/watchdog/orphan-order-watchdog');
+const ManagerPushService = require('./services/notifications/manager-push');
 const { getRedisClient, isRedisAvailable, getRedisStatus, getRedisFailoverInfo } = require('@yemigo/shared/redis-client');
 const { createAdapter } = require('@socket.io/redis-adapter');
 const OrderStore = require('./services/redis-orders');
@@ -517,6 +520,7 @@ let dispatchQueue = null;
 let preDispatchBuffer = null; // Plan 29 Faz 2.3
 let dispatchAudit = null;     // Plan 29 Faz 2.4
 let delayedCallQueue = null;
+let orphanOrderWatchdog = null; // OUTAGE_RESILIENCE_PLAN Faz 1
 
 // SMS_BRANDING_MIGRATION_PLAN.md F2 — OTP doğrulama servisi.
 // Env eksikse otpService null kalır, /api/v2/otp/* uçları 503 döner (server çökmez).
@@ -615,6 +619,20 @@ async function initializePlatformHub() {
         delayedCallQueue.start();
     } catch (delayedQueueErr) {
         console.error('[PlatformHub] DelayedCallQueue init failed (non-fatal):', delayedQueueErr.message);
+    }
+
+    // OUTAGE_RESILIENCE_PLAN Faz 1 — Sahipsiz sipariş bekçisi.
+    // Şube bazlı flag branches/{id}.orphanOrderAlertEnabled default kapalı → davranış değişikliği yok.
+    try {
+        if (firebaseInitialized) {
+            const managerPush = new ManagerPushService(db);
+            orphanOrderWatchdog = new OrphanOrderWatchdog(db, managerPush);
+            orphanOrderWatchdog.start();
+        } else {
+            console.warn('[PlatformHub] Firebase yok — OrphanOrderWatchdog başlatılmadı');
+        }
+    } catch (orphanErr) {
+        console.error('[PlatformHub] OrphanOrderWatchdog init failed (non-fatal):', orphanErr.message);
     }
 
     console.log('[PlatformHub] Initialized with connectors:', Array.from(platformRegistry.connectors.keys()));
