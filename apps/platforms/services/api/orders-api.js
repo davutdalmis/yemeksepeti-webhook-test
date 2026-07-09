@@ -5,7 +5,7 @@
 const express = require('express');
 const admin = require('firebase-admin');
 
-function createOrdersApi(registry, smartDispatch, { sendPushNotification, notifyCourierNewOrder, db, dispatchMetrics, dispatchQueue, io } = {}) {
+function createOrdersApi(registry, smartDispatch, { sendPushNotification, notifyCourierNewOrder, sendCourierMulticast, db, dispatchMetrics, dispatchQueue, io, dispatchMode } = {}) {
     const router = express.Router();
 
     // YemigoSync: dispatchAudit yazıcı — Express "geri atıyor" şikayeti teşhisi için
@@ -142,9 +142,22 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
                 });
             }
 
-            // Auto-assign courier after successful accept
+            // Auto-assign courier after successful accept.
+            // Dispatch mode gate: accept-time OTONOM autoAssign yalnızca otonom atamaya
+            // izinli şubede çalışır (gate kapalı VEYA useServerDispatch=true). Gate'liyse
+            // (client-dispatch mode) WPF EARLY DISPATCH atamayı üstlenir → çift atama önlenir.
+            // ⚠️ Bu yalnızca OTONOM autoAssign'i gate'ler; açık /assign-courier endpoint'i
+            // (manuel atama VEYA WPF auto-pick isteği) GATE'LENMEZ — istemci-modu dispatch'i
+            // oradan akar.
             let courierInfo = null;
-            if (autoAssign !== false && smartDispatch && branchId) {
+            const autonomousAllowed = !dispatchMode || (await dispatchMode.isAutonomousAssignmentAllowed(branchId));
+            if (autoAssign !== false && smartDispatch && branchId && !autonomousAllowed) {
+                console.log(`[OrdersAPI] Auto-assign gated (client-dispatch mode): ${platformId}/${orderId} (branch: ${branchId})`);
+                writeDispatchAudit({
+                    requestId, action: 'auto-assign-on-accept', platformId, orderId, branchId,
+                    success: false, errorReason: 'GATED_CLIENT_DISPATCH_MODE', source: 'orders-api'
+                });
+            } else if (autoAssign !== false && smartDispatch && branchId) {
                 try {
                     const order = await connector.getOrder(orderId);
                     if (order) {
@@ -735,6 +748,177 @@ function createOrdersApi(registry, smartDispatch, { sendPushNotification, notify
                 error: error.message,
                 code: 'SERVER_ERROR'
             });
+        }
+    });
+
+    /**
+     * POST /api/v2/orders/:platformId/:orderId/notify-couriers
+     * Telefon siparişi BROADCAST bildirimi — şubedeki nöbetteki TÜM kuryelere FCM push atar.
+     *
+     * assign-courier'dan farkı: kurye ATAMAZ, koordinat İSTEMEZ. Telefon siparişlerinde adres
+     * düz metin girildiği için koordinat yok → SmartDispatch eşleşemez → assign-courier hiç push
+     * atamaz. Bu endpoint o boşluğu kapatır: nöbetteki kuryelere "yeni sipariş var, üstlen" der.
+     * Üstlenme (claim) Express'te mevcut claim-courier akışıyla yapılır.
+     *
+     * Headers: x-api-key, x-branch-id
+     * Body: { customerName?, customerAddress? }
+     * Dönüş: { success, sent, failed, courierCount, tokenCount }
+     */
+    router.post('/:platformId/:orderId/notify-couriers', async (req, res) => {
+        const { platformId, orderId } = req.params;
+        const { customerName, customerAddress } = req.body || {};
+        const branchId = req.branchId;
+        const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+        const audit = (extra) => writeDispatchAudit({
+            requestId, action: 'notify-couriers', platformId, orderId, branchId,
+            source: 'orders-api', ...extra
+        });
+
+        try {
+            if (!branchId) {
+                audit({ success: false, errorReason: 'NO_BRANCH' });
+                return res.status(400).json({ success: false, error: 'branchId required', code: 'NO_BRANCH' });
+            }
+            if (!smartDispatch || typeof smartDispatch.getAvailableCouriers !== 'function') {
+                audit({ success: false, errorReason: 'NO_DISPATCH' });
+                return res.status(503).json({ success: false, error: 'Dispatch unavailable', code: 'NO_DISPATCH' });
+            }
+
+            // Nöbetteki kuryeler — mevcut sorgu (branchId + isOnDuty + isActive + isApproved)
+            const couriers = await smartDispatch.getAvailableCouriers(branchId);
+
+            // Tekilleştirilmiş fcmToken listesi (boş/paylaşılan token'ları ele)
+            const seen = new Set();
+            const tokens = [];
+            for (const c of couriers) {
+                if (c.fcmToken && !seen.has(c.fcmToken)) { seen.add(c.fcmToken); tokens.push(c.fcmToken); }
+            }
+
+            if (tokens.length === 0) {
+                console.log(`[OrdersAPI] notify-couriers | reqId=${requestId} | ${platformId}/${orderId} | branchId=${branchId} | couriers=${couriers.length} | tokens=0 — push skipped`);
+                audit({ success: true, sent: 0, courierCount: couriers.length, reason: 'NO_TOKENS' });
+                return res.json({ success: true, sent: 0, failed: 0, courierCount: couriers.length, tokenCount: 0 });
+            }
+
+            const safeAddress = (customerAddress || '').toString();
+            const shortAddress = safeAddress.length > 50 ? safeAddress.substring(0, 50) + '...' : safeAddress;
+            const title = 'Yeni Telefon Siparişi';
+            const body = [customerName, shortAddress].filter(Boolean).join(' - ') || 'Yeni bir telefon siparişi var';
+
+            const notification = { title, body };
+            const data = {
+                type: 'NEW_ORDER',
+                orderId: (orderId || '').toString(),
+                platform: (platformId || 'phone').toString(),
+                branchId: (branchId || '').toString(),
+                customerAddress: safeAddress,
+                // courierId BOŞ => Express shouldDeliverToThisCourier hedef-eşleşmesini atlar,
+                // bildirim nöbetteki TÜM kuryelere gösterilir (broadcast claim modeli).
+                courierId: '',
+                click_action: 'FLUTTER_NOTIFICATION_CLICK'
+            };
+
+            // Çoklu-alıcı gönderim — test'te inject edilir, prod'da admin SDK'ya düşer.
+            const multicast = sendCourierMulticast || ((tks, payload) => admin.messaging().sendEachForMulticast({
+                tokens: tks,
+                notification: payload.notification,
+                data: payload.data,
+                android: { priority: 'high', notification: { sound: 'default', channelId: 'orders' } }
+            }));
+
+            const response = await multicast(tokens, { notification, data });
+            const sent = response?.successCount ?? 0;
+            const failed = response?.failureCount ?? 0;
+
+            console.log(`[OrdersAPI] notify-couriers | reqId=${requestId} | ${platformId}/${orderId} | branchId=${branchId} | couriers=${couriers.length} | tokens=${tokens.length} | sent=${sent} | failed=${failed}`);
+            audit({ success: true, sent, failed, courierCount: couriers.length });
+
+            return res.json({ success: true, sent, failed, courierCount: couriers.length, tokenCount: tokens.length });
+        } catch (error) {
+            console.error('[OrdersAPI] notify-couriers error:', error.message);
+            audit({ success: false, errorReason: error.message });
+            return res.status(500).json({ success: false, error: error.message, code: 'SERVER_ERROR' });
+        }
+    });
+
+    /**
+     * POST /api/v2/orders/fcm-relay
+     * K1 Faz 5 (gömülü Admin SDK anahtarını WPF'ten kaldırma) — FCM gönderim relay'i.
+     *
+     * WPF eskiden binary'e gömülü SA ile FCM access token üretip mesajı doğrudan gönderiyordu
+     * (PushNotificationService.GetAccessTokenAsync). Bu uç o SON SA kullanımını sunucuya taşır:
+     * WPF eligibility/token-toplama/payload mantığını (gün sonu eodEnabled + sessiz-saat + owner
+     * fallback) client-auth ile YAPMAYA DEVAM eder, yalnızca hazır token listesini + payload'ı
+     * buraya gönderir; sunucu kendi firebase-admin kimliğiyle multicast eder.
+     *
+     * Headers: x-api-key, x-branch-id
+     * Body: { tokens: string[], notification?: {title,body}, data?: {}, channelId?: string }
+     * Dönüş: { success, sent, failed, tokenCount }
+     */
+    router.post('/fcm-relay', async (req, res) => {
+        const branchId = req.branchId;
+        const { tokens, notification, data, channelId } = req.body || {};
+        const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+        const audit = (extra) => writeDispatchAudit({
+            requestId, action: 'fcm-relay', branchId, source: 'orders-api', ...extra
+        });
+
+        try {
+            if (!Array.isArray(tokens) || tokens.length === 0) {
+                audit({ success: false, errorReason: 'NO_TOKENS' });
+                return res.status(400).json({ success: false, error: 'tokens[] required', code: 'NO_TOKENS' });
+            }
+            // Tekilleştir + boş/aşırı-uzun listeyi ele (kötüye kullanım sınırı)
+            const seen = new Set();
+            const cleanTokens = [];
+            for (const t of tokens) {
+                if (typeof t === 'string' && t.length > 0 && t.length < 4096 && !seen.has(t)) {
+                    seen.add(t); cleanTokens.push(t);
+                }
+                if (cleanTokens.length >= 500) break; // FCM multicast üst sınırı
+            }
+            if (cleanTokens.length === 0) {
+                audit({ success: false, errorReason: 'NO_VALID_TOKENS' });
+                return res.status(400).json({ success: false, error: 'no valid tokens', code: 'NO_VALID_TOKENS' });
+            }
+
+            // Payload — string data alanları (FCM data yalnız string kabul eder)
+            const safeData = {};
+            if (data && typeof data === 'object') {
+                for (const [k, v] of Object.entries(data)) {
+                    if (v !== undefined && v !== null) safeData[k] = String(v).slice(0, 1024);
+                }
+            }
+
+            const message = {
+                tokens: cleanTokens,
+                android: {
+                    priority: 'high',
+                    notification: { sound: 'default', channelId: String(channelId || 'general') }
+                }
+            };
+            if (notification && (notification.title || notification.body)) {
+                message.notification = {
+                    title: String(notification.title || ''),
+                    body: String(notification.body || '')
+                };
+            }
+            if (Object.keys(safeData).length > 0) message.data = safeData;
+
+            const response = await admin.messaging().sendEachForMulticast(message);
+            const sent = response?.successCount ?? 0;
+            const failed = response?.failureCount ?? 0;
+
+            console.log(`[OrdersAPI] fcm-relay | reqId=${requestId} | branchId=${branchId} | channel=${channelId || 'general'} | tokens=${cleanTokens.length} | sent=${sent} | failed=${failed}`);
+            audit({ success: true, sent, failed, tokenCount: cleanTokens.length });
+
+            return res.json({ success: true, sent, failed, tokenCount: cleanTokens.length });
+        } catch (error) {
+            console.error('[OrdersAPI] fcm-relay error:', error.message);
+            audit({ success: false, errorReason: error.message });
+            return res.status(500).json({ success: false, error: error.message, code: 'SERVER_ERROR' });
         }
     });
 
