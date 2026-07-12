@@ -101,7 +101,7 @@ function makeFakeProvider(overrides = {}) {
             pdfUrl: 'https://parasut.test/pdf/x',
             contactId: 'contact-1',
         }),
-        deleteInvoice: async () => ({ ok: true }),
+        cancelDocument: async () => ({ ok: true }),
     };
     return { ...defaults, ...overrides };
 }
@@ -395,11 +395,11 @@ describe('ApprovalProcessor — input validation', () => {
 });
 
 describe('ApprovalProcessor — Firestore txn failure → compensating delete', () => {
-    test('txn failure triggers Paraşüt deleteInvoice', async () => {
+    test('txn failure triggers Paraşüt cancelDocument', async () => {
         const db = makeFakeDb();
         const idem = new IdempotencyService({ db });
         const deleteSpy = jest.fn(async () => ({ ok: true }));
-        const provider = makeFakeProvider({ deleteInvoice: deleteSpy });
+        const provider = makeFakeProvider({ cancelDocument: deleteSpy });
 
         // Inject txn failure: swap runTransaction to throw
         const origTxn = db.runTransaction.bind(db);
@@ -414,7 +414,7 @@ describe('ApprovalProcessor — Firestore txn failure → compensating delete', 
         })).rejects.toMatchObject({ status: 500, code: 'firestore_txn_failed' });
 
         // Compensating delete called with provider invoice id
-        expect(deleteSpy).toHaveBeenCalledWith('mock-token', expect.stringMatching(/^parasut-inv-/));
+        expect(deleteSpy).toHaveBeenCalledWith('mock-token', expect.stringMatching(/^parasut-inv-/), 'firestore_txn_failed_compensation');
 
         // Doc back to pending_approval
         const finalDoc = await idem.getById(docId);
@@ -477,7 +477,7 @@ function makeYolAProvider(overrides = {}) {
             invoiceNumber: 'IM2026-AUTO-0001',
         })),
         checkVknInbox: jest.fn(async () => ({ registered: false })),
-        deleteInvoice: jest.fn(async () => ({ ok: true })),
+        cancelDocument: jest.fn(async () => ({ ok: true })),
     };
     return { ...defaults, ...overrides };
 }

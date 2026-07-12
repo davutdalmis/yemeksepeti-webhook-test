@@ -53,6 +53,41 @@ async function loadParasutSettings(tenantId) {
     return snap.data();
 }
 
+// Plan 27 5.1.1 — MASTER kill-switch: tenants/{id}.features.parasut_isEnabled.
+// Admin panel (/admin/parasut-tenants) yönetir. false/eksik/okunamadı → KAPALI (fail-safe).
+// Not: test-connection bilerek muaf — rollout Kapı 0'da önce bağlantı test edilir,
+// master flag sonra açılır (PARASUT_ROLLOUT_CHECKLIST.md).
+async function isParasutMasterFlagEnabled(tenantId) {
+    try {
+        if (!firebaseInitialized || !db) return false;
+        const snap = await db.collection('tenants').doc(tenantId).get();
+        return snap.exists && snap.data()?.features?.parasut_isEnabled === true;
+    } catch (e) {
+        console.warn(`[invoicing-engine] master flag read failed for ${tenantId}: ${e.message}`);
+        return false;
+    }
+}
+
+// Belge-id'li uçlar için guard: invoiceDocuments/{id} → tenantId → master flag.
+// Kapalıysa 409 yazar ve null döner; açıksa dokümanın tenantId'sini döner.
+async function requireMasterFlagForDoc(req, res) {
+    const docId = req.params.id;
+    const snap = await db.collection('invoiceDocuments').doc(docId).get();
+    if (!snap.exists) {
+        res.status(404).json({ error: 'not_found' });
+        return null;
+    }
+    const tenantId = snap.data().tenantId;
+    if (!(await isParasutMasterFlagEnabled(tenantId))) {
+        res.status(409).json({
+            error: 'master_flag_disabled',
+            message: `Parasut master flag kapalı (tenants/${tenantId}.features.parasut_isEnabled) — admin panelden açılmalı`,
+        });
+        return null;
+    }
+    return tenantId;
+}
+
 async function providerFactory(tenantId) {
     if (!vault) throw new Error('CredentialVault not initialized (INVOICING_AES_MASTER_KEY missing)');
     const settings = await loadParasutSettings(tenantId);
@@ -194,6 +229,21 @@ app.post('/invoicing/credentials', requireApiKey, async (req, res) => {
 
 // ---------------- Test connection (Plan 27 1.6) ----------------
 
+// Test sonucunu kalıcı yaz — panel "✓ Bağlı / son doğrulama" rozetini buradan okur.
+// Yalnız mevcut credentials dokümanına merge edilir (yoksa hayalet doküman açılmaz).
+// Sır içermez; hata olursa test yanıtını etkilemez.
+async function persistConnectionStatus(tenantId, patch) {
+    try {
+        if (!firebaseInitialized || !db) return;
+        const ref = db.collection('invoicingCredentials').doc(tenantId).collection('providers').doc('parasut');
+        const snap = await ref.get();
+        if (!snap.exists) return;
+        await ref.set({ ...patch, lastVerifiedAt: Date.now() }, { merge: true });
+    } catch (e) {
+        console.warn('[invoicing-engine] connection status persist failed:', e.message);
+    }
+}
+
 app.post('/invoicing/test-connection', requireApiKey, async (req, res) => {
     try {
         const { tenantId } = req.body || {};
@@ -204,11 +254,26 @@ app.post('/invoicing/test-connection', requireApiKey, async (req, res) => {
         const ping = await provider.ping(token);
 
         if (ping.ok) {
+            await persistConnectionStatus(tenantId, {
+                lastConnectionStatus: 'ok',
+                lastVerifiedCompany: ping.company?.name || null,
+                lastVerifyError: null,
+            });
             return res.json({ ok: true, provider: provider.providerName, parasutCompany: ping.company });
         }
+        await persistConnectionStatus(tenantId, {
+            lastConnectionStatus: 'failed',
+            lastVerifyError: ping.error || 'ping_failed',
+        });
         return res.status(502).json({ ok: false, error: ping.error || 'ping_failed', code: ping.code });
     } catch (e) {
         console.error('[invoicing-engine] test-connection error:', e.message);
+        if (req.body?.tenantId) {
+            await persistConnectionStatus(req.body.tenantId, {
+                lastConnectionStatus: 'failed',
+                lastVerifyError: e.message || String(e.code || 'internal_error'),
+            });
+        }
         const status = e.status || (e instanceof InvoiceProviderError && e.status) || 500;
         res.status(status).json({ ok: false, error: e.code || 'internal_error', message: e.message });
     }
@@ -225,7 +290,9 @@ app.get('/invoicing/tenants/:tenantId', requireApiKey, async (req, res) => {
             if (k.startsWith('encrypted')) safe[k] = '****';
             else safe[k] = v;
         }
-        res.json({ ok: true, tenantId: req.params.tenantId, settings: safe });
+        // Panel /settings/parasut master-flag uyarısı bunu bekler (data.featureEnabled).
+        const featureEnabled = await isParasutMasterFlagEnabled(req.params.tenantId);
+        res.json({ ok: true, tenantId: req.params.tenantId, featureEnabled, settings: safe });
     } catch (e) {
         res.status(e.status || 500).json({ error: e.code || 'internal_error', message: e.message });
     }
@@ -309,6 +376,8 @@ async function initRedisDependentLifecycle() {
             providerFactory: process.env.INVOICING_PARASUT_DRAFT_DISABLED === 'true' ? null : providerFactory,
             tokenManager: process.env.INVOICING_PARASUT_DRAFT_DISABLED === 'true' ? null : tokenManager,
             contextLoader: process.env.INVOICING_PARASUT_DRAFT_DISABLED === 'true' ? null : buildInvoiceContext,
+            // Plan 27 5.1.1: master kill-switch — kapalıysa yeni shipped transferler işlenmez.
+            masterFlagLoader: isParasutMasterFlagEnabled,
         });
         stockListener.start();
         const draftMode = process.env.INVOICING_PARASUT_DRAFT_DISABLED === 'true' ? 'firestore-only' : 'parasut-draft-enabled';
@@ -395,7 +464,15 @@ async function buildInvoiceContext(tenantId, doc) {
         productName: it.productName || it.name,
         productId: it.productId,
         sku: it.sku,
-        quantity: Number(it.quantity || 1),
+        // stockTransfers kalemleri miktarı shippedQuantity/approvedQuantity/requestedQuantity
+        // alanlarında taşır (StockTransferListener snapshot'ı ile aynı öncelik) — düz `quantity`
+        // çoğu transferde yok; eski `|| 1` fallback'i miktarı sessizce 1'e düşürüyordu.
+        quantity: Number(
+            it.shippedQuantity != null ? it.shippedQuantity :
+            it.approvedQuantity != null ? it.approvedQuantity :
+            it.requestedQuantity != null ? it.requestedQuantity :
+            it.quantity || 1
+        ),
         unitPrice: Number(it.unitPrice || 0),
         vatRate: typeof it.vatRate === 'number' ? it.vatRate : settings.defaultVatRate || 20,
         unit: it.unit || 'Adet',
@@ -539,6 +616,7 @@ app.post('/invoicing/draft/:id/approve', requireApiKey, async (req, res) => {
         return res.status(503).json({ error: 'approval_processor_unavailable', message: 'firebase or idempotency not initialized' });
     }
     try {
+        if (!(await requireMasterFlagForDoc(req, res))) return;
         const result = await approvalProcessor.approve(req.params.id, req.body || {});
         res.json(result);
     } catch (e) {
@@ -562,6 +640,7 @@ app.post('/invoicing/shipment/:id/create', requireApiKey, async (req, res) => {
         return res.status(503).json({ error: 'shipment_processor_unavailable' });
     }
     try {
+        if (!(await requireMasterFlagForDoc(req, res))) return;
         const result = await shipmentProcessor.create(req.params.id, req.body || {});
         res.json(result);
     } catch (e) {
@@ -604,6 +683,7 @@ app.post('/invoicing/shipment/:id/finalize', requireApiKey, async (req, res) => 
         return res.status(503).json({ error: 'shipment_processor_unavailable' });
     }
     try {
+        if (!(await requireMasterFlagForDoc(req, res))) return;
         const result = await shipmentProcessor.finalize(req.params.id, req.body || {});
         res.json(result);
     } catch (e) {
@@ -623,6 +703,7 @@ app.post('/invoicing/shipment/:id/finalize', requireApiKey, async (req, res) => 
 app.post('/invoicing/draft/:id/send', requireApiKey, async (req, res) => {
     if (!invoiceQueue || !idempotency) return res.status(503).json({ error: 'lifecycle_unavailable' });
     try {
+        if (!(await requireMasterFlagForDoc(req, res))) return;
         const doc = await idempotency.getById(req.params.id);
         if (!doc) return res.status(404).json({ error: 'not_found' });
         if (doc.status === 'sent') return res.status(409).json({ error: 'already_sent' });

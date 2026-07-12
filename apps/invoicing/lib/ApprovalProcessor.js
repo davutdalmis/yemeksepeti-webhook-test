@@ -11,7 +11,7 @@
 //        - inventoryMovements +N (shipment_out + shipment_in per item)
 //        - wasteRecords +M (fire reason'lar icin)
 //        - branchInventory aggregate update (in-place)
-//   5. Hata: Paraşüt deleteInvoice compensating action
+//   5. Hata: Paraşüt cancelDocument (DELETE /sales_invoices/{id}) compensating action
 // ==================================================================================
 
 const { validateTransition } = require('./StatusTransitionValidator');
@@ -475,7 +475,9 @@ class ApprovalProcessor {
             try {
                 const token = await this.tokenManager.getValidToken(tenantId);
                 if (parasutResult.providerInvoiceId) {
-                    await provider.deleteInvoice(token, parasutResult.providerInvoiceId);
+                    // NOT: provider kontratında silme metodu cancelDocument'tır (IInvoiceProvider).
+                    // deleteInvoice diye bir metot yok — eski isim TypeError ile telafiyi her seferinde bozuyordu.
+                    await provider.cancelDocument(token, parasutResult.providerInvoiceId, 'firestore_txn_failed_compensation');
                     console.warn(`[ApprovalProcessor] compensating: deleted Paraşüt invoice ${parasutResult.providerInvoiceId}`);
                 }
             } catch (compErr) {

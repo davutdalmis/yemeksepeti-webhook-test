@@ -55,7 +55,7 @@ class StockTransferListener {
      * @param {object} [deps.tokenManager]  Plan 28+: TokenManager
      * @param {(tenantId: string, doc: object) => Promise<object>} [deps.contextLoader]  Plan 28+: invoice context loader
      */
-    constructor({ db, idempotency, queue, settingsLoader, collection = 'stockTransfers', providerFactory, tokenManager, contextLoader }) {
+    constructor({ db, idempotency, queue, settingsLoader, collection = 'stockTransfers', providerFactory, tokenManager, contextLoader, masterFlagLoader }) {
         if (!db) throw new Error('StockTransferListener: db required');
         if (!idempotency) throw new Error('StockTransferListener: idempotency required');
         if (!settingsLoader) throw new Error('StockTransferListener: settingsLoader required');
@@ -67,6 +67,8 @@ class StockTransferListener {
         this.providerFactory = providerFactory || null;
         this.tokenManager = tokenManager || null;
         this.contextLoader = contextLoader || null;
+        // Plan 27 5.1.1: tenants/{id}.features.parasut_isEnabled — master kill-switch.
+        this.masterFlagLoader = masterFlagLoader || null;
         this._unsubscribe = null;
         this._unsubscribeCancel = null;
     }
@@ -153,6 +155,18 @@ class StockTransferListener {
 
         if (!settings || settings.isEnabled === false) {
             return;
+        }
+
+        // Master kill-switch: admin panelden kapatıldıysa (features.parasut_isEnabled !== true)
+        // hiçbir taslak/POST üretme. Loader hatasında fail-safe KAPALI davranır.
+        if (this.masterFlagLoader) {
+            let masterOn = false;
+            try {
+                masterOn = await this.masterFlagLoader(tenantId);
+            } catch (e) {
+                console.warn(`[StockTransferListener] master flag read failed for ${tenantId} — skipping (${e.message})`);
+            }
+            if (!masterOn) return;
         }
 
         // Plan 28: items snapshot — modal+approve endpoint icin items[]'i drafte yaz.
