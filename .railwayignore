@@ -1,0 +1,5 @@
+# Railway CLI yuklemesinde haric tut — kok Dockerfile Fly.io cold-standby icindir
+# (flyctl deploy --config apps/platforms/fly.toml). Railway servisleri Nixpacks +
+# ozel build/start komutlari kullanir; Dockerfile contexte girerse builder autodetect
+# DOCKERFILEa doner ve invoicing-engine buildi bozulur (2026-07-12 440b574e).
+Dockerfile

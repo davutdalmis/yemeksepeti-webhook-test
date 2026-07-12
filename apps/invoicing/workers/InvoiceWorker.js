@@ -52,7 +52,12 @@ class InvoiceWorker {
 
         try {
             const { Worker } = require('bullmq');
-            this.worker = new Worker(queueName, this._handler.bind(this), { connection, concurrency });
+            // BullMQ Worker blocking komut kullanır ve bağlantıda maxRetriesPerRequest=null
+            // ŞART koşar; paylaşılan @yemigo/shared redis client'ı bu ayarla gelmiyor.
+            // duplicate ile worker'a özel, override'lı bir bağlantı verilir — aksi halde
+            // init "maxRetriesPerRequest must be null" ile düşüyordu (prod 2026-07-12).
+            const workerConnection = connection.duplicate({ maxRetriesPerRequest: null });
+            this.worker = new Worker(queueName, this._handler.bind(this), { connection: workerConnection, concurrency });
             this._wireEvents();
             this.available = true;
         } catch (e) {
