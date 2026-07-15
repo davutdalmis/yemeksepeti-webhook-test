@@ -413,9 +413,14 @@ class ShipmentProcessor {
                     updatedAt: ts,
                 });
 
-                // stockTransfer.completed
-                if (doc.sourceType === 'stockTransfer' && doc.sourceId) {
-                    const tRef = this.db.collection('stockTransfers').doc(doc.sourceId);
+                // stockTransfer.completed — transfer-tetikli doc'ta sourceId, Plan 29
+                // sipariş-tetikli doc'ta ise (varsa) StockTransferListener'ın linklediği
+                // sourceTransferId üzerinden. Sipariş henüz sevkedilmediyse ikisi de yok — atla.
+                const transferIdToComplete = doc.sourceType === 'stockTransfer'
+                    ? doc.sourceId
+                    : doc.sourceTransferId;
+                if (transferIdToComplete) {
+                    const tRef = this.db.collection('stockTransfers').doc(transferIdToComplete);
                     txn.update(tRef, { status: 'completed', completedAt: ts, updatedAt: ts });
                 }
 

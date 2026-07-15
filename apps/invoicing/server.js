@@ -15,6 +15,7 @@ const RateLimiter = require('./lib/RateLimiter');
 const { InvoiceQueue } = require('./queue/InvoiceQueue');
 const InvoiceWorker = require('./workers/InvoiceWorker');
 const StockTransferListener = require('./listeners/StockTransferListener');
+const ProductionOrderListener = require('./listeners/ProductionOrderListener');
 const { ApprovalProcessor, ApprovalError } = require('./lib/ApprovalProcessor');
 const { ShipmentProcessor, ShipmentError } = require('./lib/ShipmentProcessor');
 
@@ -328,6 +329,7 @@ let rateLimiter = null;
 let invoiceQueue = null;
 let invoiceWorker = null;
 let stockListener = null;
+let productionOrderListener = null;
 let approvalProcessor = null;
 let shipmentProcessor = null;
 
@@ -414,6 +416,24 @@ async function initLifecycle() {
     });
     console.log('[invoicing-engine] ShipmentProcessor ready (Plan 28++)');
 
+    // Plan 29: sipariş-anı irsaliye taslağı — Redis/queue GEREKTIRMEZ, Firestore yeter.
+    // WPF imalat siparişi (productionOrders, status=PENDING) oluştuğu anda shipment DRAFT
+    // yaratır; kurye zimmeti beklenmez. StockTransferListener'ın shipped akışı aynı
+    // orderNumber için ikinci taslak üretmez (çift-taslak önleme).
+    if (process.env.INVOICING_LISTENER_ENABLED === 'true') {
+        productionOrderListener = new ProductionOrderListener({
+            db,
+            idempotency,
+            settingsLoader: loadParasutSettings,
+            providerFactory: process.env.INVOICING_PARASUT_DRAFT_DISABLED === 'true' ? null : providerFactory,
+            tokenManager: process.env.INVOICING_PARASUT_DRAFT_DISABLED === 'true' ? null : tokenManager,
+            contextLoader: process.env.INVOICING_PARASUT_DRAFT_DISABLED === 'true' ? null : buildInvoiceContext,
+            masterFlagLoader: isParasutMasterFlagEnabled,
+        });
+        productionOrderListener.start();
+        console.log('[invoicing-engine] Plan 29 ProductionOrderListener ready (order-time shipment drafts)');
+    }
+
     // Plan 27: BullMQ queue/worker/listener — gerçek Redis bekler
     if (redis instanceof MemoryFallback) {
         console.log('[invoicing-engine] Plan 27 lifecycle DISABLED (Redis fallback to memory; BullMQ requires real Redis)');
@@ -450,6 +470,13 @@ async function buildInvoiceContext(tenantId, doc) {
     if (doc.sourceType === 'stockTransfer' && doc.sourceId) {
         const snap = await db.collection('stockTransfers').doc(doc.sourceId).get();
         if (snap.exists) sourceData = snap.data();
+    } else if (doc.sourceType === 'productionOrder' && doc.sourceId) {
+        // Plan 29: sipariş-anı taslakları. Kalemler productionOrders.items'tan gelir
+        // ({productId, productName, quantity, unit, unitPrice}) — aşağıdaki miktar
+        // öncelik zinciri shipped/approved/requested alanlarını bulamayınca düz
+        // `quantity`ye düşer, sipariş kalemleri için doğru olan da bu.
+        const snap = await db.collection('productionOrders').doc(doc.sourceId).get();
+        if (snap.exists) sourceData = snap.data();
     }
 
     let branchData = null;
@@ -485,7 +512,7 @@ async function buildInvoiceContext(tenantId, doc) {
         issueDate: new Date().toISOString().slice(0, 10),
         shipmentIncluded: doc.shipmentIncluded != null ? doc.shipmentIncluded : !!settings.shipmentIncludedDefault,
         documentType: doc.documentType || settings.defaultDocumentType || 'sales_invoice',
-        description: sourceData ? `Sevkiyat: ${sourceData.transferNumber || sourceData.code || doc.sourceId}` : '',
+        description: sourceData ? `Sevkiyat: ${sourceData.transferNumber || sourceData.orderNumber || sourceData.code || doc.sourceId}` : '',
         invoiceSeriesPrefix: settings.invoiceSeriesPrefix || 'A',
         // Plan 28++++ Görev B: e-arşiv internet_sale ctx override (default null → ParasutProvider fallback).
         // Tenant ileride özelleştirebilsin diye settings'ten okur; UI henüz yok.
@@ -725,6 +752,7 @@ app.post('/invoicing/draft/:id/send', requireApiKey, async (req, res) => {
 async function shutdown() {
     console.log('[invoicing-engine] Graceful shutdown...');
     if (stockListener) stockListener.stop();
+    if (productionOrderListener) productionOrderListener.stop();
     if (invoiceWorker) await invoiceWorker.close().catch(() => {});
     if (invoiceQueue) await invoiceQueue.close().catch(() => {});
     process.exit(0);

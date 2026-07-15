@@ -235,14 +235,39 @@ class StockTransferListener {
 
         // Plan 28++ — shipment_document (e-irsaliye) DRAFT akisi
         if (shipmentMode !== 'disabled') {
-            shipmentResult = await this.idempotency.ensureDraft({
-                tenantId,
-                sourceType: 'stockTransfer',
-                sourceId: transferId,
-                documentKind: 'shipment',
-                data: baseDraftData,
-            });
-            shipmentDocId = shipmentResult.id;
+            // Plan 29 — ÇİFT TASLAK ÖNLEME: irsaliye taslağı artık sipariş anında
+            // (ProductionOrderListener) üretiliyor. Aynı orderNumber (== transferNumber)
+            // için sipariş-tetikli shipment doc VARSA yenisini üretme; yalnız linkle
+            // ve gerçek sevkiyat zamanını (shippedAt) doc'a işle.
+            const orderShipmentDoc = await this._findOrderShipmentDoc(tenantId, transfer.transferNumber || transfer.code);
+            if (orderShipmentDoc) {
+                shipmentDocId = orderShipmentDoc.id;
+                await this.idempotency.update(orderShipmentDoc.id, {
+                    // ShipmentProcessor.finalize bu alanla transferi 'completed' yapar.
+                    sourceTransferId: transferId,
+                    shipmentMeta: {
+                        shippedAt: tsToMs(transfer.shippedAt),
+                        shippedBy: transfer.preparedBy || transfer.shippedBy || null,
+                        sourceBranchId: transfer.sourceBranchId || null,
+                    },
+                }).catch((e) => {
+                    console.warn(`[StockTransferListener] could not link transfer ${transferId} to order doc ${orderShipmentDoc.id}:`, e.message);
+                });
+                await this.idempotency.appendAudit(orderShipmentDoc.id, 'transfer_linked', 'listener', {
+                    transferId,
+                    transferNumber: transfer.transferNumber || transfer.code || null,
+                }).catch(() => {});
+                console.log(`[StockTransferListener] transfer ${transferId} sipariş-tetikli doc ${orderShipmentDoc.id} ile eşleşti — yeni shipment draft üretilmedi`);
+            } else {
+                shipmentResult = await this.idempotency.ensureDraft({
+                    tenantId,
+                    sourceType: 'stockTransfer',
+                    sourceId: transferId,
+                    documentKind: 'shipment',
+                    data: baseDraftData,
+                });
+                shipmentDocId = shipmentResult.id;
+            }
         }
 
         // Mark transfer as queued (whether new or existing). parasutDocumentId
@@ -293,6 +318,31 @@ class StockTransferListener {
         // Plan 28: auto-enqueue intentionally removed.
         // Owner approval (panel "Onayla" -> POST /invoicing/draft/:id/approve)
         // is now the sole trigger for Parasut finalization (convert_to_invoice).
+    }
+
+    /**
+     * Plan 29 — sipariş-tetikli (sourceType='productionOrder') shipment doc araması.
+     * transferNumber, imalat-web buildTransferDoc'ta order.orderNumber'dan kopyalanır;
+     * sipariş-anı taslağı da sourceTransferNumber=orderNumber yazar — eşleşme bu alandan.
+     * Sorgu hatasında null döner (fail-open: eski transfer-tetikli davranış devam eder;
+     * en kötü durumda çift taslak oluşur, veri kaybı olmaz).
+     */
+    async _findOrderShipmentDoc(tenantId, transferNumber) {
+        if (!transferNumber) return null;
+        try {
+            const snap = await this.db.collection('invoiceDocuments')
+                .where('tenantId', '==', tenantId)
+                .where('documentKind', '==', 'shipment')
+                .where('sourceType', '==', 'productionOrder')
+                .where('sourceTransferNumber', '==', transferNumber)
+                .limit(1)
+                .get();
+            if (snap.empty) return null;
+            return { id: snap.docs[0].id, ...snap.docs[0].data() };
+        } catch (e) {
+            console.warn(`[StockTransferListener] order shipment doc lookup failed for ${transferNumber}: ${e.message}`);
+            return null;
+        }
     }
 
     /**

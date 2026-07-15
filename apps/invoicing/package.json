@@ -1,6 +1,6 @@
 {
   "name": "yemigo-invoicing-engine",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "YemiGO invoicing engine — Parasut & provider-agnostic e-Invoice/e-Despatch service (Plan 27)",
   "main": "server.js",
   "scripts": {
