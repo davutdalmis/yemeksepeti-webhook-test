@@ -301,6 +301,90 @@ describe('Plan 29 — ProductionOrderListener iptal güvenlik ağı', () => {
     });
 });
 
+describe('Plan 29 — saveEdits undefined temizliği (2026-07-15 canlı hata)', () => {
+    // Firestore undefined kabul etmez: "Value for argument 'data' is not a valid
+    // document. Cannot use 'undefined' (found in field approvalMeta.edits...)".
+    // Sebep/not seçilmeden kaydedilirse alan hiç yazılmamalı.
+    const { ShipmentProcessor } = require('../lib/ShipmentProcessor');
+
+    test('diffReason/note seçilmemişse edits entry\'lerinde alan HİÇ olmamalı', async () => {
+        const store = new Map([
+            ['D1', {
+                tenantId: 'T1',
+                documentKind: 'shipment',
+                status: 'draft',
+                items: [{ itemIndex: 0, productId: 'pizza', productName: 'Pizza Hamuru', originalQuantity: 1, unit: 'adet', unitPrice: 0, vatRate: 0 }],
+            }],
+        ]);
+        const idem = {
+            async getById(id) { const d = store.get(id); return d ? { id, ...d } : null; },
+            async update(id, patch) {
+                // Gerçek Firestore davranışı: undefined değer -> hata
+                const check = (obj, path) => {
+                    for (const [k, v] of Object.entries(obj)) {
+                        if (v === undefined) throw new Error(`Cannot use "undefined" as a Firestore value (found in field "${path}${k}")`);
+                        if (v && typeof v === 'object' && !Array.isArray(v)) check(v, `${path}${k}.`);
+                        if (Array.isArray(v)) v.forEach((el, i) => { if (el && typeof el === 'object') check(el, `${path}${k}.\`${i}\`.`); });
+                    }
+                };
+                check(patch, '');
+                store.set(id, { ...store.get(id), ...patch });
+            },
+            async appendAudit() {},
+        };
+        const proc = new ShipmentProcessor({
+            db: { runTransaction: async () => {}, collection: () => ({ doc: () => ({}) }) },
+            idempotency: idem,
+            tokenManager: { async getValidToken() { return 'AT'; } },
+            providerFactory: async () => ({}),
+            contextLoader: async () => ({ branch: { id: 'B1' }, items: [] }),
+        });
+
+        // Panel "Kaydet ve Onaya Bekle": sebep seçilmedi, not boş
+        const r = await proc.saveEdits('D1', {
+            tenantId: 'T1',
+            edits: [{ itemIndex: 0, finalQty: 1 }],
+            editedBy: 'panel',
+        });
+
+        expect(r.ok).toBe(true);
+        const saved = store.get('D1');
+        expect(saved.approvalMeta.edits).toHaveLength(1);
+        expect('diffReason' in saved.approvalMeta.edits[0]).toBe(false);
+        expect('note' in saved.approvalMeta.edits[0]).toBe(false);
+    });
+});
+
+describe('Plan 29 — IdempotencyService merkezi undefined temizliği', () => {
+    const { IdempotencyService } = require('../lib/IdempotencyService');
+
+    test('update() undefined alanları (iç içe/array dahil) yazmadan atar', async () => {
+        const writes = [];
+        const db = {
+            collection: () => ({
+                doc: () => ({
+                    async set(data) { writes.push(data); },
+                }),
+            }),
+        };
+        const svc = new IdempotencyService({ db });
+        await svc.update('X', {
+            a: 1,
+            b: undefined,
+            nested: { c: undefined, d: 2 },
+            arr: [{ e: undefined, f: 3 }],
+        });
+        expect(writes).toHaveLength(1);
+        const w = writes[0];
+        expect('b' in w).toBe(false);
+        expect('c' in w.nested).toBe(false);
+        expect(w.nested.d).toBe(2);
+        expect('e' in w.arr[0]).toBe(false);
+        expect(w.arr[0].f).toBe(3);
+        expect(JSON.stringify(w)).not.toContain('undefined');
+    });
+});
+
 describe('Plan 29 — StockTransferListener çift-taslak önleme', () => {
     function makeTransferSnap(id, data) {
         const refUpdates = [];

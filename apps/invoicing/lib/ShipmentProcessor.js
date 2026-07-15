@@ -238,14 +238,17 @@ class ShipmentProcessor {
                 });
             }
             const diffReason = ['fire', 'iade', 'duzeltme'].includes(e.diffReason) ? e.diffReason : undefined;
-            cleanEdits.push({
+            // Firestore undefined kabul etmez ("Cannot use undefined... approvalMeta.edits",
+            // 2026-07-15) — sebep/not seçilmediyse alanı hiç yazma.
+            const entry = {
                 itemIndex: idx,
                 productId: original.productId,
                 originalQty: original.originalQuantity,
                 finalQty,
-                diffReason,
-                note: typeof e.note === 'string' ? e.note.slice(0, 500) : undefined,
-            });
+            };
+            if (diffReason) entry.diffReason = diffReason;
+            if (typeof e.note === 'string' && e.note.length > 0) entry.note = e.note.slice(0, 500);
+            cleanEdits.push(entry);
             const diff = original.originalQuantity - finalQty;
             if (diff > 0 && diffReason === 'fire') fireTotal += diff;
         }
@@ -327,7 +330,7 @@ class ShipmentProcessor {
         await this.idempotency.appendAudit(documentId, 'shipment_edited', editedBy || 'panel', {
             editsCount: cleanEdits.length,
             fireTotal,
-            note: note ? String(note).slice(0, 500) : undefined,
+            ...(note ? { note: String(note).slice(0, 500) } : {}),
         });
 
         return { ok: true, edits: cleanEdits, fireQuantityTotal: fireTotal };
@@ -400,7 +403,14 @@ class ShipmentProcessor {
         try {
             await this.db.runTransaction(async (txn) => {
                 const docRef = this.db.collection('invoiceDocuments').doc(documentId);
-                const fresh = await txn.get(docRef);
+                // Firestore kuralı: transaction'da TÜM okumalar yazmalardan ÖNCE gelmeli.
+                // branchInventory okuması eskiden yazmalardan sonraydı — canlıda
+                // "reads before writes" hatasıyla finalize 500 veriyordu (2026-07-15).
+                const aggRef = this.db.collection('branchInventory').doc(tenantId);
+                const [fresh, aggSnap] = await Promise.all([
+                    txn.get(docRef),
+                    branchId ? txn.get(aggRef) : Promise.resolve(null),
+                ]);
                 if (!fresh.exists) throw new ShipmentError('document vanished', { status: 410, code: 'doc_vanished' });
                 const freshData = fresh.data();
                 if (freshData.status === 'sent') return; // race idempotent
@@ -477,12 +487,10 @@ class ShipmentProcessor {
                     });
                 }
 
-                // branchInventory aggregate
+                // branchInventory aggregate (okuma yukarıda, yazmalardan önce yapıldı)
                 if (branchId) {
-                    const aggRef = this.db.collection('branchInventory').doc(tenantId);
-                    const aggSnap = await txn.get(aggRef);
                     let agg;
-                    if (aggSnap.exists) {
+                    if (aggSnap && aggSnap.exists) {
                         agg = aggSnap.data();
                         if (!agg.branches) agg.branches = {};
                         if (!agg.production) agg.production = {};

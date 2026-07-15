@@ -600,14 +600,16 @@ app.post('/invoicing/draft/:id/save-edits', requireApiKey, async (req, res) => {
                 });
             }
             const diffReason = ['fire', 'iade', 'duzeltme'].includes(e.diffReason) ? e.diffReason : undefined;
-            cleanEdits.push({
+            // Firestore undefined kabul etmez — sebep/not seçilmediyse alanı hiç yazma (2026-07-15).
+            const entry = {
                 itemIndex: idx,
                 productId: original.productId,
                 originalQty: original.originalQuantity,
                 finalQty,
-                diffReason,
-                note: typeof e.note === 'string' ? e.note.slice(0, 500) : undefined,
-            });
+            };
+            if (diffReason) entry.diffReason = diffReason;
+            if (typeof e.note === 'string' && e.note.length > 0) entry.note = e.note.slice(0, 500);
+            cleanEdits.push(entry);
             const diff = original.originalQuantity - finalQty;
             if (diff > 0 && diffReason === 'fire') fireTotal += diff;
         }
@@ -624,7 +626,7 @@ app.post('/invoicing/draft/:id/save-edits', requireApiKey, async (req, res) => {
         await idempotency.appendAudit(req.params.id, 'edited', editedBy || 'panel', {
             editsCount: cleanEdits.length,
             fireTotal,
-            note: note ? String(note).slice(0, 500) : undefined,
+            ...(note ? { note: String(note).slice(0, 500) } : {}),
         });
 
         res.json({ ok: true, status: 'pending_approval', edits: cleanEdits, fireQuantityTotal: fireTotal });

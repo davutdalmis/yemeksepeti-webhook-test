@@ -335,9 +335,16 @@ class ApprovalProcessor {
 
         try {
             await this.db.runTransaction(async (txn) => {
-                // 5.1 invoiceDocuments → sent + parasutInvoiceId
+                // Firestore kuralı: transaction'da TÜM okumalar yazmalardan ÖNCE gelmeli
+                // (branchInventory okuması eskiden 5.5'te, yazmalardan sonraydı — canlıda
+                // "reads before writes" hatası verirdi; ShipmentProcessor'da 2026-07-15'te patladı).
                 const docRef = this.db.collection('invoiceDocuments').doc(documentId);
-                const fresh = await txn.get(docRef);
+                const aggRef = this.db.collection('branchInventory').doc(tenantId);
+                const [fresh, aggSnap] = await Promise.all([
+                    txn.get(docRef),
+                    branchId ? txn.get(aggRef) : Promise.resolve(null),
+                ]);
+                // 5.1 invoiceDocuments → sent + parasutInvoiceId
                 if (!fresh.exists) throw new ApprovalError('document vanished', { status: 410, code: 'doc_vanished' });
                 const freshData = fresh.data();
                 if (freshData.status === 'sent') {
@@ -428,12 +435,10 @@ class ApprovalProcessor {
                     // (production -finalQty zaten sevkiyatla düşüyor; fire ek hareket gerektirmiyor)
                 }
 
-                // 5.5 branchInventory aggregate (in-place merge — yarış riski sınırlı tek txn içinde)
+                // 5.5 branchInventory aggregate (okuma txn başında yapıldı — yarış riski sınırlı tek txn içinde)
                 if (branchId) {
-                    const aggRef = this.db.collection('branchInventory').doc(tenantId);
-                    const aggSnap = await txn.get(aggRef);
                     let agg;
-                    if (aggSnap.exists) {
+                    if (aggSnap && aggSnap.exists) {
                         agg = aggSnap.data();
                         if (!agg.branches) agg.branches = {};
                         if (!agg.production) agg.production = {};

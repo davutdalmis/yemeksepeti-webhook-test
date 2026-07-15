@@ -67,17 +67,21 @@ function makeFakeDb() {
             };
         },
         async runTransaction(fn) {
+            // Gerçek Firestore kuralı: tüm okumalar yazmalardan ÖNCE (2026-07-15 regresyon koruması).
+            let wrote = false;
             const txn = {
                 async get(ref) {
+                    if (wrote) throw new Error('Firestore transactions require all reads to be executed before all writes.');
                     const exists = store.has(ref._key);
                     return { exists, data: () => store.get(ref._key) };
                 },
-                set(ref, data) { store.set(ref._key, data); },
+                set(ref, data) { wrote = true; store.set(ref._key, data); },
                 update(ref, data) {
+                    wrote = true;
                     if (!store.has(ref._key)) throw new Error('txn update on missing: ' + ref._key);
                     store.set(ref._key, applyMerge(store.get(ref._key), data));
                 },
-                delete(ref) { store.delete(ref._key); },
+                delete(ref) { wrote = true; store.delete(ref._key); },
             };
             return fn(txn);
         },

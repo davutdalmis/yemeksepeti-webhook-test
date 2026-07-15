@@ -26,10 +26,17 @@ function makeMockDb() {
             };
         },
         async runTransaction(fn) {
+            // Gerçek Firestore kuralı: tüm okumalar yazmalardan ÖNCE gelmeli.
+            // 2026-07-15: finalize'daki get-after-write bu mock denetlemediği için
+            // canlıya kadar sızdı — artık mock da aynı kuralı uygular.
+            let wrote = false;
             const txn = {
-                async get(ref) { return ref.get(); },
-                set(ref, data) { ref.set(data); },
-                update(ref, patch) { ref.update(patch); },
+                async get(ref) {
+                    if (wrote) throw new Error('Firestore transactions require all reads to be executed before all writes.');
+                    return ref.get();
+                },
+                set(ref, data) { wrote = true; ref.set(data); },
+                update(ref, patch) { wrote = true; ref.update(patch); },
             };
             txnQueue.push(fn);
             return await fn(txn);

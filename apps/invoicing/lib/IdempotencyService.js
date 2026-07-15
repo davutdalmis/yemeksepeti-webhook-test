@@ -10,6 +10,25 @@
 const crypto = require('crypto');
 
 /**
+ * 2026-07-15: Firestore undefined kabul etmez ("Cannot use undefined as a Firestore
+ * value") — canlıda save-edits/audit yazımlarını 500'e düşürüyordu. Tüm yazım
+ * yollarında (ensureDraft/update/appendAudit) undefined alanlar sessizce atılır.
+ * FieldValue sentinel'leri (arrayUnion vb.) düz obje olmadığı için dokunulmaz.
+ */
+function stripUndefined(v) {
+    if (Array.isArray(v)) return v.map(stripUndefined);
+    if (v && typeof v === 'object' && v.constructor === Object) {
+        const out = {};
+        for (const [k, val] of Object.entries(v)) {
+            if (val === undefined) continue;
+            out[k] = stripUndefined(val);
+        }
+        return out;
+    }
+    return v;
+}
+
+/**
  * Plan 28++: documentKind opsiyonel. 'invoice' (default) eski hash'leri korur,
  * 'shipment' yeni e-irsaliye akisi icin ayri doc ID uretir; ayni stockTransfer
  * icin hem fatura hem irsaliye yan yana yasayabilsin.
@@ -45,7 +64,7 @@ class IdempotencyService {
         if (snap.exists) {
             return { existing: true, id: key, doc: snap.data() };
         }
-        const draft = {
+        const draft = stripUndefined({
             tenantId,
             sourceType,
             sourceId,
@@ -57,7 +76,7 @@ class IdempotencyService {
             createdAt: Date.now(),
             updatedAt: Date.now(),
             ...data,
-        };
+        });
         try {
             await ref.create(draft);
             return { existing: false, id: key, doc: draft };
@@ -78,7 +97,7 @@ class IdempotencyService {
 
     async update(id, patch) {
         await this.db.collection(this.collection).doc(id).set(
-            { ...patch, updatedAt: Date.now() },
+            stripUndefined({ ...patch, updatedAt: Date.now() }),
             { merge: true }
         );
     }
@@ -86,7 +105,7 @@ class IdempotencyService {
     async appendAudit(id, event, by, details) {
         const admin = require('firebase-admin');
         const entry = { ts: Date.now(), event, by };
-        if (details) entry.details = details;
+        if (details) entry.details = stripUndefined(details);
         await this.db.collection(this.collection).doc(id).update({
             audit: admin.firestore.FieldValue.arrayUnion(entry),
             updatedAt: Date.now(),
