@@ -165,6 +165,107 @@ function makeProcessor({ provider, db, idem, contextLoader }) {
 
 // ---------------- Tests ----------------
 
+// Plan 30 Faz 2.4: stok defteri yazımları INVOICING_STOCK_WRITES kill-switch'ine bağlandı
+// (default OFF). Mevcut testler stok yazım mantığının kendisini doğruladığı için flag
+// açık koşulur; flag-kapalı davranışı ayrı describe'da test edilir.
+beforeAll(() => {
+    process.env.INVOICING_STOCK_WRITES = 'true';
+});
+afterAll(() => {
+    delete process.env.INVOICING_STOCK_WRITES;
+});
+
+describe('ApprovalProcessor — Plan 30 KANONİK STOK (default: legacy off, canonical on)', () => {
+    test('onay anında branchStocks + stockMovements yazılır; görünmez defter YAZILMAZ', async () => {
+        process.env.INVOICING_STOCK_WRITES = 'false';
+        try {
+            const db = makeFakeDb();
+            const idem = new IdempotencyService({ db });
+            const provider = makeFakeProvider();
+            const docId = await seedDraftWithItems(db, idem);
+            // p1'in envanter eşlemesi var → stok anahtarı inv_p1 olmalı (TransferStockEngine paritesi)
+            await db.collection('productionProducts').doc('p1').set({ inventoryProductId: 'inv_p1' });
+            // imalat deposunda p1'den 200 var
+            await db.collection('branchStocks').doc('imalat_bafetto-001_inv_p1').set({ currentStock: 200, unit: 'paket' });
+            const proc = makeProcessor({ provider, db, idem });
+
+            const result = await proc.approve(docId, {
+                tenantId: 'bafetto-001',
+                approvedBy: 'owner',
+                edits: [{ itemIndex: 0, finalQty: 95, diffReason: 'fire' }],
+            });
+
+            expect(result.ok).toBe(true);
+            const finalDoc = await idem.getById(docId);
+            expect(finalDoc.status).toBe('sent');
+            const transferAfter = await db.collection('stockTransfers').doc('TR-2026-0042').get();
+            expect(transferAfter.data().status).toBe('completed');
+
+            // KANONİK: imalat deposu düştü, şube arttı (inv_p1 anahtarıyla)
+            const imalatP1 = (await db.collection('branchStocks').doc('imalat_bafetto-001_inv_p1').get()).data();
+            const branchP1 = (await db.collection('branchStocks').doc('b-kadikoy_inv_p1').get()).data();
+            expect(imalatP1.currentStock).toBe(105); // 200 - 95
+            expect(branchP1.currentStock).toBe(95);
+            // p2 eşlemesiz → kendi id'siyle; imalat stoğu yoktu → clamp 0
+            const imalatP2 = (await db.collection('branchStocks').doc('imalat_bafetto-001_p2').get()).data();
+            const branchP2 = (await db.collection('branchStocks').doc('b-kadikoy_p2').get()).data();
+            expect(imalatP2.currentStock).toBe(0);
+            expect(branchP2.currentStock).toBe(5);
+
+            // stockMovements: 2 kalem × (OUT+IN) = 4
+            const stockMoves = [...db._store.entries()].filter(([k]) => k.startsWith('stockMovements/'));
+            expect(stockMoves.length).toBe(4);
+            const outMove = stockMoves.map(([, v]) => v).find((m) => m.movementType === 'TRANSFER_OUT' && m.productId === 'inv_p1');
+            expect(outMove).toMatchObject({
+                tenantId: 'bafetto-001',
+                branchId: 'imalat_bafetto-001',
+                quantity: -95,
+                sourceType: 'invoice_approval',
+                sourceDocumentId: docId,
+                targetBranchId: 'b-kadikoy',
+                createdBy: 'owner',
+            });
+            const inMove = stockMoves.map(([, v]) => v).find((m) => m.movementType === 'TRANSFER_IN' && m.productId === 'inv_p1');
+            expect(inMove).toMatchObject({ branchId: 'b-kadikoy', quantity: 95 });
+
+            // fire kaydı kanonik akışta da yazılır
+            const wastes = [...db._store.entries()].filter(([k]) => k.startsWith('wasteRecords/'));
+            expect(wastes.length).toBe(1);
+
+            // Görünmez defter YAZILMADI
+            const invMovements = [...db._store.entries()].filter(([k]) => k.startsWith('inventoryMovements/'));
+            const aggSnap = await db.collection('branchInventory').doc('bafetto-001').get();
+            expect(invMovements.length).toBe(0);
+            expect(aggSnap.exists).toBe(false);
+        } finally {
+            process.env.INVOICING_STOCK_WRITES = 'true'; // dosya geneli legacy mod
+        }
+    });
+
+    test('INVOICING_CANONICAL_STOCK_DISABLED=true → kanonik stok yazılmaz', async () => {
+        process.env.INVOICING_STOCK_WRITES = 'false';
+        process.env.INVOICING_CANONICAL_STOCK_DISABLED = 'true';
+        try {
+            const db = makeFakeDb();
+            const idem = new IdempotencyService({ db });
+            const provider = makeFakeProvider();
+            const docId = await seedDraftWithItems(db, idem);
+            const proc = makeProcessor({ provider, db, idem });
+
+            const result = await proc.approve(docId, { tenantId: 'bafetto-001', approvedBy: 'owner', edits: [] });
+            expect(result.ok).toBe(true);
+
+            const stockMoves = [...db._store.entries()].filter(([k]) => k.startsWith('stockMovements/'));
+            const branchStocks = [...db._store.entries()].filter(([k]) => k.startsWith('branchStocks/'));
+            expect(stockMoves.length).toBe(0);
+            expect(branchStocks.length).toBe(0);
+        } finally {
+            delete process.env.INVOICING_CANONICAL_STOCK_DISABLED;
+            process.env.INVOICING_STOCK_WRITES = 'true';
+        }
+    });
+});
+
 describe('ApprovalProcessor — happy path', () => {
     test('100→95 with fire: Paraşüt POST + invoiceDoc=sent + transfer=completed + 4 movements + 1 waste + aggregate', async () => {
         const db = makeFakeDb();

@@ -16,6 +16,8 @@
 // ==================================================================================
 
 const { applyMovement, makeEmptyAggregate } = require('./InventoryAggregator');
+const { invoicingStockWritesEnabled } = require('./stockWritesFlag');
+const { canonicalStockEnabled, planCanonicalStock, readCanonicalStock, writeCanonicalStock } = require('./CanonicalStockWriter');
 
 /** Firestore Timestamp / ms / Date / null -> ms (Plan 28++ Date(Invalid) bugfix) */
 function tsToMs(v) {
@@ -399,6 +401,12 @@ class ShipmentProcessor {
         const ts = Date.now();
         const productionLocationId = ctx.productionLocationId || 'central';
         const branchId = doc.branchId || (ctx.branch && ctx.branch.id);
+        // Plan 30 (sahip kararı 2026-07-20): STOK TETİĞİ = İRSALİYE ONAYI.
+        // Kanonik yazım: branchStocks + stockMovements (CanonicalStockWriter, default AÇIK).
+        // Legacy görünmez defter (inventoryMovements/branchInventory): INVOICING_STOCK_WRITES
+        // kill-switch arkasında, default KAPALI.
+        const stockWrites = invoicingStockWritesEnabled();
+        const stockPlan = await planCanonicalStock(this.db, { tenantId, branchId, finalItems });
 
         try {
             await this.db.runTransaction(async (txn) => {
@@ -407,9 +415,10 @@ class ShipmentProcessor {
                 // branchInventory okuması eskiden yazmalardan sonraydı — canlıda
                 // "reads before writes" hatasıyla finalize 500 veriyordu (2026-07-15).
                 const aggRef = this.db.collection('branchInventory').doc(tenantId);
-                const [fresh, aggSnap] = await Promise.all([
+                const [fresh, aggSnap, stockSnaps] = await Promise.all([
                     txn.get(docRef),
-                    branchId ? txn.get(aggRef) : Promise.resolve(null),
+                    stockWrites && branchId ? txn.get(aggRef) : Promise.resolve(null),
+                    readCanonicalStock(txn, stockPlan),
                 ]);
                 if (!fresh.exists) throw new ShipmentError('document vanished', { status: 410, code: 'doc_vanished' });
                 const freshData = fresh.data();
@@ -434,8 +443,20 @@ class ShipmentProcessor {
                     txn.update(tRef, { status: 'completed', completedAt: ts, updatedAt: ts });
                 }
 
-                // inventoryMovements (production -> branch)
-                if (branchId) {
+                // Plan 30 KANONİK STOK: onay anında imalat deposu − / şube + (branchStocks
+                // + stockMovements — WPF/panel'in okuduğu defter). Tüm şubeler için geçerli
+                // tek stok yazım noktası budur.
+                writeCanonicalStock(this.db, txn, stockPlan, stockSnaps, {
+                    tenantId,
+                    branchId,
+                    sourceId: documentId,
+                    sourceLabel: doc.sourceTransferNumber || doc.parasutShipmentNumber || '',
+                    recordedBy: approvedBy,
+                    tsMillis: ts,
+                });
+
+                // inventoryMovements (production -> branch) — legacy görünmez defter, flag'li
+                if (stockWrites && branchId) {
                     for (const it of finalItems) {
                         if (it.finalQuantity > 0) {
                             const outRef = this.db.collection('inventoryMovements').doc();
@@ -469,8 +490,9 @@ class ShipmentProcessor {
                     }
                 }
 
-                // wasteRecords (fire)
-                for (const w of wasteEntries) {
+                // wasteRecords (fire) — onay düzenlemelerinden (100→95, sebep: fire) doğan
+                // fire kayıtları belge onayının parçasıdır; kanonik akışta da yazılır.
+                for (const w of (canonicalStockEnabled() || stockWrites) ? wasteEntries : []) {
                     const wRef = this.db.collection('wasteRecords').doc();
                     txn.set(wRef, {
                         tenantId,
@@ -488,7 +510,7 @@ class ShipmentProcessor {
                 }
 
                 // branchInventory aggregate (okuma yukarıda, yazmalardan önce yapıldı)
-                if (branchId) {
+                if (stockWrites && branchId) {
                     let agg;
                     if (aggSnap && aggSnap.exists) {
                         agg = aggSnap.data();

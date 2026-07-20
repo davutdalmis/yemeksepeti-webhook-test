@@ -25,6 +25,18 @@ const app = express();
 app.use(express.json({ limit: '2mb' }));
 
 const INVOICING_API_KEY = process.env.INVOICING_API_KEY || '';
+
+// Plan 30 (sahip kararı 2026-07-20) — stok tetiği İRSALİYE ONAYI; görünürlük logları.
+const { invoicingStockWritesEnabled } = require('./lib/stockWritesFlag');
+const { canonicalStockEnabled } = require('./lib/CanonicalStockWriter');
+console.log(
+    canonicalStockEnabled()
+        ? '[invoicing] KANONİK STOK AÇIK — irsaliye onayı branchStocks/stockMovements yazar (imalat − / şube +). UYARI: production-domain FEATURE_TRANSFER_STOCK_MOVE KAPALI olmalı (çifte sayım)!'
+        : '[invoicing] KANONİK STOK KAPALI (INVOICING_CANONICAL_STOCK_DISABLED=true) — irsaliye onayı stok YAZMAZ',
+);
+if (invoicingStockWritesEnabled()) {
+    console.log('[invoicing] UYARI: legacy INVOICING_STOCK_WRITES=ON — görünmez defter (branchInventory/inventoryMovements) de yazılıyor. Normalde kapalı olmalı.');
+}
 const ENCRYPTED_FIELDS = ['clientId', 'clientSecret', 'username', 'password'];
 
 // ---------------- Vault + TokenManager bootstrap ----------------

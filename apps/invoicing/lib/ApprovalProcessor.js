@@ -16,6 +16,8 @@
 
 const { validateTransition } = require('./StatusTransitionValidator');
 const { applyMovement, makeEmptyAggregate } = require('./InventoryAggregator');
+const { invoicingStockWritesEnabled } = require('./stockWritesFlag');
+const { canonicalStockEnabled, planCanonicalStock, readCanonicalStock, writeCanonicalStock } = require('./CanonicalStockWriter');
 
 class ApprovalError extends Error {
     constructor(message, { status = 500, code, payload } = {}) {
@@ -332,6 +334,11 @@ class ApprovalProcessor {
         if (!branchId) {
             console.warn(`[ApprovalProcessor] doc ${documentId} has no branchId — skipping inventory movements`);
         }
+        // Plan 30 (sahip kararı 2026-07-20): STOK TETİĞİ = İRSALİYE ONAYI.
+        // Kanonik yazım: branchStocks + stockMovements (default AÇIK).
+        // Legacy görünmez defter: INVOICING_STOCK_WRITES arkasında, default KAPALI.
+        const stockWrites = invoicingStockWritesEnabled();
+        const stockPlan = await planCanonicalStock(this.db, { tenantId, branchId, finalItems });
 
         try {
             await this.db.runTransaction(async (txn) => {
@@ -340,9 +347,10 @@ class ApprovalProcessor {
                 // "reads before writes" hatası verirdi; ShipmentProcessor'da 2026-07-15'te patladı).
                 const docRef = this.db.collection('invoiceDocuments').doc(documentId);
                 const aggRef = this.db.collection('branchInventory').doc(tenantId);
-                const [fresh, aggSnap] = await Promise.all([
+                const [fresh, aggSnap, stockSnaps] = await Promise.all([
                     txn.get(docRef),
-                    branchId ? txn.get(aggRef) : Promise.resolve(null),
+                    stockWrites && branchId ? txn.get(aggRef) : Promise.resolve(null),
+                    readCanonicalStock(txn, stockPlan),
                 ]);
                 // 5.1 invoiceDocuments → sent + parasutInvoiceId
                 if (!fresh.exists) throw new ApprovalError('document vanished', { status: 410, code: 'doc_vanished' });
@@ -378,8 +386,20 @@ class ApprovalProcessor {
                     txn.update(tRef, { status: 'completed', completedAt: ts, updatedAt: ts });
                 }
 
+                // 5.2b Plan 30 KANONİK STOK: onay anında imalat deposu − / şube +
+                // (branchStocks + stockMovements — WPF/panel'in okuduğu defter).
+                writeCanonicalStock(this.db, txn, stockPlan, stockSnaps, {
+                    tenantId,
+                    branchId,
+                    sourceId: documentId,
+                    sourceLabel: doc.sourceTransferNumber || doc.invoiceNumber || '',
+                    recordedBy: approvedBy,
+                    tsMillis: ts,
+                });
+
                 // 5.3 inventoryMovements: shipment_out (production) + shipment_in (branch)
-                if (branchId) {
+                // legacy görünmez defter — flag kapalıysa atla
+                if (stockWrites && branchId) {
                     for (const it of finalItems) {
                         if (it.finalQuantity > 0) {
                             // shipment_out from production
@@ -415,8 +435,9 @@ class ApprovalProcessor {
                     }
                 }
 
-                // 5.4 wasteRecords + waste inventoryMovement (production'dan eksilen fire)
-                for (const w of wasteEntries) {
+                // 5.4 wasteRecords (onay düzenlemelerinden doğan fire) — belge onayının
+                // parçası; kanonik akışta da yazılır.
+                for (const w of (canonicalStockEnabled() || stockWrites) ? wasteEntries : []) {
                     const wRef = this.db.collection('wasteRecords').doc();
                     txn.set(wRef, {
                         tenantId,
@@ -436,7 +457,7 @@ class ApprovalProcessor {
                 }
 
                 // 5.5 branchInventory aggregate (okuma txn başında yapıldı — yarış riski sınırlı tek txn içinde)
-                if (branchId) {
+                if (stockWrites && branchId) {
                     let agg;
                     if (aggSnap && aggSnap.exists) {
                         agg = aggSnap.data();
