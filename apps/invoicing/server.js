@@ -12,6 +12,7 @@ const CredentialVault = require('./secrets/CredentialVault');
 const { InvoiceProviderError } = require('./providers/IInvoiceProvider');
 const { IdempotencyService } = require('./lib/IdempotencyService');
 const RateLimiter = require('./lib/RateLimiter');
+const ProviderRefCache = require('./lib/ProviderRefCache');
 const { InvoiceQueue } = require('./queue/InvoiceQueue');
 const InvoiceWorker = require('./workers/InvoiceWorker');
 const StockTransferListener = require('./listeners/StockTransferListener');
@@ -101,6 +102,10 @@ async function requireMasterFlagForDoc(req, res) {
     return tenantId;
 }
 
+// 2026-07-29: Parasut isim->ID onbellegi. initLifecycle() icinde (db hazir olunca)
+// atanir; atanmazsa provider eski davranisiyla calisir.
+let providerRefCache = null;
+
 async function providerFactory(tenantId) {
     if (!vault) throw new Error('CredentialVault not initialized (INVOICING_AES_MASTER_KEY missing)');
     const settings = await loadParasutSettings(tenantId);
@@ -117,6 +122,12 @@ async function providerFactory(tenantId) {
         username: decrypted.username,
         password: decrypted.password,
         companyId: settings.companyId,
+        // 2026-07-29: isim->Parasut ID onbellegi. Firestore hazir degilse null kalir
+        // ve provider eski davranisina (her cagri arama) doner.
+        refCache: providerRefCache,
+        tenantId,
+        // Istek-basina hiz limiti (10/10 sn). Redis hazir degilse null kalir.
+        rateLimiter,
     });
 }
 
@@ -357,7 +368,18 @@ async function waitForRedisReady(redisClient, timeoutMs = 15000) {
 
 async function initRedisDependentLifecycle() {
     if (rateLimiter) return; // already inited
-    rateLimiter = new RateLimiter({ redis });
+    // Parasut'un belgelenmis limiti: 10 istek / 10 saniye (swagger "Genel Bilgiler").
+    // Eski sabit 60/60 sn hem yanlis hem de tehlikeliydi: kayan pencere t=0'da
+    // 60 istegin tamamina aninda izin veriyordu.
+    // Bu ayni limiter iki yerde kullanilir:
+    //   - InvoiceWorker: is basina kaba kabul kapisi (eskiden tek koruma buydu)
+    //   - ParasutProvider._get/_post/_put/_delete: HER istek icin jeton (asil koruma)
+    // Ikisi ust uste binerek biraz fazla sayar; bu bilincli ve guvenli yondedir.
+    rateLimiter = new RateLimiter({
+        redis,
+        limit: Number(process.env.PARASUT_RATE_LIMIT) || 10,
+        windowSec: Number(process.env.PARASUT_RATE_WINDOW_SEC) || 10,
+    });
     try {
         invoiceQueue = new InvoiceQueue({ connection: redis });
     } catch (e) {
@@ -407,6 +429,11 @@ async function initLifecycle() {
         return;
     }
     idempotency = new IdempotencyService({ db });
+
+    // 2026-07-29 (429 olayi): kimlik cozumleme isteklerini eleyen kalici onbellek.
+    // providerFactory bunu ParasutProvider'a enjekte eder.
+    providerRefCache = new ProviderRefCache({ db });
+    console.log('[invoicing-engine] ProviderRefCache ready (Parasut ref cache)');
 
     // Plan 28: ApprovalProcessor — Redis gerektirmez
     approvalProcessor = new ApprovalProcessor({

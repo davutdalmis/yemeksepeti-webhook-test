@@ -22,6 +22,9 @@ class ParasutProvider {
      * @param {string} opts.companyId
      * @param {string} [opts.baseUrl]
      * @param {number} [opts.timeoutMs]
+     * @param {object} [opts.refCache]   ProviderRefCache — isim->Parasut ID kalici onbellegi.
+     *                                   Verilmezse davranis eskisiyle birebir ayni (her cagri arama yapar).
+     * @param {string} [opts.tenantId]   refCache scope'u icin zorunlu; refCache yoksa gereksiz.
      */
     constructor(opts) {
         const required = ['clientId', 'clientSecret', 'username', 'password', 'companyId'];
@@ -36,6 +39,45 @@ class ParasutProvider {
         this.baseUrl = opts.baseUrl || DEFAULT_BASE_URL;
         this.timeoutMs = opts.timeoutMs || DEFAULT_TIMEOUT_MS;
         this.providerName = 'parasut';
+        // 2026-07-29: 429 olayi sonrasi eklendi. Onbellek YALNIZ kimlik cozumleme
+        // (arama) isteklerini eler; olusturma/fatura akisi degismez.
+        this.refCache = opts.refCache || null;
+        this.tenantId = opts.tenantId || null;
+        // Istek-basina hiz limiti. Parasut tavani: 10 istek / 10 sn (swagger "Genel
+        // Bilgiler"). InvoiceWorker'daki kapi IS basina sayiyordu; tek bir siparis
+        // 17 istek uretebildigi icin tavan asiliyordu. Burasi HER istegi sayar.
+        // Enjekte edilmezse davranis eskisiyle birebir ayni (limitleme yok).
+        this.rateLimiter = opts.rateLimiter || null;
+        this.rateLimitMaxWaitMs = opts.rateLimitMaxWaitMs || 30000;
+    }
+
+    /**
+     * Hiz limiti jetonu alinana kadar bekler. Jeton yoksa THROW ETMEZ, bekler —
+     * cunku bir siparisin ortasinda patlamak yerine yavaslamak dogru davranis.
+     * Ust sinir asilirsa retryable 429 firlatir, BullMQ backoff'a devreder.
+     */
+    async _acquireSlot() {
+        if (!this.rateLimiter || !this.tenantId) return;
+        const deadline = Date.now() + this.rateLimitMaxWaitMs;
+        for (;;) {
+            let res;
+            try {
+                res = await this.rateLimiter.tryAcquire(this.tenantId);
+            } catch (e) {
+                return; // limitleyici bozuksa akisi durdurma
+            }
+            if (res && res.allowed) return;
+
+            const waitMs = Math.min(Math.max(Number(res && res.retryAfterMs) || 250, 100), 2000);
+            if (Date.now() + waitMs > deadline) {
+                throw new InvoiceProviderError('Local rate limit wait exceeded', {
+                    code: 'RATE_LIMIT_WAIT_TIMEOUT',
+                    status: 429,
+                    retryable: true,
+                });
+            }
+            await new Promise((r) => setTimeout(r, waitMs));
+        }
     }
 
     // -------------------- AUTH --------------------
@@ -120,10 +162,19 @@ class ParasutProvider {
 
     async upsertContact(token, branch) {
         const taxNo = branch.taxNumber || branch.vatNumber || branch.vergiNo;
+        // Onbellek anahtari: vergi no varsa o, yoksa sube adi.
+        // NOT: vergi no YOKKEN eski kod arama bile yapmadan HER SEFERINDE yeni cari
+        // yaratiyordu (Parasut'ta mukerrer sube carileri). Onbellek bunu da kapatir.
+        const refLabel = taxNo || branch.name || branch.branchName;
+        const cachedId = await this._lookupRef('contacts', refLabel);
+        if (cachedId) return { contactId: cachedId, created: false, fromCache: true };
+
         if (taxNo) {
             const found = await this._get(token, `/contacts?filter[tax_number]=${encodeURIComponent(taxNo)}&page[size]=1`);
             if (found && Array.isArray(found.data) && found.data.length > 0) {
-                return { contactId: String(found.data[0].id), created: false };
+                const foundId = String(found.data[0].id);
+                await this._rememberRef('contacts', refLabel, foundId);
+                return { contactId: foundId, created: false };
             }
         }
         const payload = {
@@ -149,7 +200,9 @@ class ParasutProvider {
         if (!created || !created.data || !created.data.id) {
             throw new InvoiceProviderError('Contact create returned no id', { code: 'CONTACT_CREATE_NO_ID' });
         }
-        return { contactId: String(created.data.id), created: true };
+        const newId = String(created.data.id);
+        await this._rememberRef('contacts', refLabel, newId);
+        return { contactId: newId, created: true };
     }
 
     // -------------------- PRODUCT --------------------
@@ -158,9 +211,16 @@ class ParasutProvider {
         const name = product.name || product.productName;
         if (!name) throw new InvoiceProviderError('Product name required', { code: 'PRODUCT_NO_NAME' });
 
+        // Onbellek: daha once cozulmus urun icin Parasut'a HIC gitme.
+        // Bu satir olmadan her siparis her kalem icin 1 arama istegi atiyordu (429 kok nedeni).
+        const cachedId = await this._lookupRef('products', name);
+        if (cachedId) return { productId: cachedId, created: false, fromCache: true };
+
         const found = await this._get(token, `/products?filter[name]=${encodeURIComponent(name)}&page[size]=1`);
         if (found && Array.isArray(found.data) && found.data.length > 0) {
-            return { productId: String(found.data[0].id), created: false };
+            const foundId = String(found.data[0].id);
+            await this._rememberRef('products', name, foundId);
+            return { productId: foundId, created: false };
         }
         const payload = {
             data: {
@@ -180,7 +240,31 @@ class ParasutProvider {
         if (!created || !created.data || !created.data.id) {
             throw new InvoiceProviderError('Product create returned no id', { code: 'PRODUCT_CREATE_NO_ID' });
         }
-        return { productId: String(created.data.id), created: true };
+        const newId = String(created.data.id);
+        await this._rememberRef('products', name, newId);
+        return { productId: newId, created: true };
+    }
+
+    // -------------------- REF CACHE (isim -> Parasut ID) --------------------
+
+    /** Onbellekte varsa ID doner, yoksa null. refCache enjekte edilmemisse daima null. */
+    async _lookupRef(kind, label) {
+        if (!this.refCache || !this.tenantId || !label) return null;
+        try {
+            return await this.refCache.get(this.tenantId, kind, label);
+        } catch (e) {
+            return null; // onbellek asla akisi bozmaz
+        }
+    }
+
+    /** Cozulen eslesmeyi kaydet. Hata yutulur. */
+    async _rememberRef(kind, label, parasutId) {
+        if (!this.refCache || !this.tenantId || !label || !parasutId) return;
+        try {
+            await this.refCache.set(this.tenantId, kind, label, parasutId);
+        } catch (e) {
+            // yoksay
+        }
     }
 
     // -------------------- INVOICE --------------------
@@ -271,12 +355,88 @@ class ParasutProvider {
                     },
                 },
             });
-            if (earchive && earchive.data && earchive.data.id) {
-                result.eArchiveId = String(earchive.data.id);
+            // 2026-07-29 DUZELTME — resmi doku (swagger.yaml:377): e-Fatura/e-Arsiv/e-Smm
+            // olusturma SENKRON DEGILDIR. POST /e_archives yaniti 201 "Trackable Job"
+            // olup donen id bir ISLEM TAKIP numarasidir, e-arsiv belgesinin id'si DEGIL.
+            // Eski kod bu id'yi eArchiveId sanip Firestore'a yaziyordu:
+            //   - id 15 dakika sonra olu; belgeye erisim icin kullanilamaz
+            //   - is "error" ile bitse bile biz "sent" yaziyorduk (sessiz basarisizlik)
+            // Dogru akis: isi bekle -> sonra sales_invoice'i ?include=active_e_document
+            // ile cekip GERCEK e-belge id'sini al (resmi doku 3. adim).
+            const respType = earchive && earchive.data && earchive.data.type;
+            const respId = earchive && earchive.data && earchive.data.id;
+
+            if (respId && respType === 'trackable_jobs') {
+                result.eArchiveJobId = String(respId);
+                await this.waitForTrackableJob(token, respId);
+                const resolved = await this._resolveActiveEDocument(token, created.data.id);
+                if (resolved) {
+                    result.eArchiveId = resolved.id;
+                    result.eDocType = resolved.type;
+                    if (resolved.pdfUrl) result.pdfUrl = resolved.pdfUrl;
+                }
+            } else if (respId) {
+                // Savunma dali: bazi ortamlar/mock'lar dogrudan e_archives kaynagi donuyor.
+                // Gercek Parasut API'sinde bu dal beklenmiyor.
+                result.eArchiveId = String(respId);
             }
         }
 
         return result;
+    }
+
+    /**
+     * Trackable job'i sonuclanana kadar sorgular (resmi doku: swagger.yaml:377).
+     * Statuler: pending | running | error | done
+     * NOT: swagger'in TrackableJobAttributes enum'unda 'pending' EKSIK, ama duz metin
+     * aciklamasinda var — ikisi de bekleme durumu sayilir.
+     * Job id'sinin omru 15 dk; varsayilan timeout bunun cok altinda tutuldu.
+     */
+    async waitForTrackableJob(token, jobId, { timeoutMs = 60000, intervalMs = 2000 } = {}) {
+        if (!jobId) throw new InvoiceProviderError('jobId required', { code: 'TRACKABLE_JOB_NO_ID' });
+        const deadline = Date.now() + timeoutMs;
+
+        for (;;) {
+            const res = await this._get(token, `/trackable_jobs/${jobId}`);
+            const attrs = (res && res.data && res.data.attributes) || {};
+            const status = String(attrs.status || '').toLowerCase();
+
+            if (status === 'done') {
+                return { status, errors: [] };
+            }
+            if (status === 'error') {
+                const errors = Array.isArray(attrs.errors) ? attrs.errors : [];
+                throw new InvoiceProviderError(
+                    `Parasut e-document job failed: ${errors.join('; ') || 'unknown error'}`,
+                    { code: 'EDOC_JOB_FAILED', retryable: false, providerPayload: res }
+                );
+            }
+            // pending | running | bilinmeyen -> beklemeye devam
+            if (Date.now() + intervalMs > deadline) {
+                throw new InvoiceProviderError(`Parasut e-document job still "${status || 'unknown'}" after ${timeoutMs}ms`, {
+                    code: 'EDOC_JOB_TIMEOUT',
+                    retryable: true,
+                    providerPayload: res,
+                });
+            }
+            await new Promise((r) => setTimeout(r, intervalMs));
+        }
+    }
+
+    /**
+     * Resmi doku 3. adim: e-belge olustuktan sonra gercek id'yi almak icin
+     * sales_invoice'i ?include=active_e_document ile cek.
+     */
+    async _resolveActiveEDocument(token, salesInvoiceId) {
+        const fresh = await this._get(token, `/sales_invoices/${salesInvoiceId}?include=active_e_document`);
+        if (!fresh || !Array.isArray(fresh.included)) return null;
+        const eDoc = fresh.included.find((x) => x.type === 'e_archives' || x.type === 'e_invoices');
+        if (!eDoc) return null;
+        return {
+            id: String(eDoc.id),
+            type: eDoc.type === 'e_invoices' ? 'e_invoice' : 'e_archive',
+            pdfUrl: this._extractPdfUrl(fresh),
+        };
     }
 
     /**
@@ -755,6 +915,7 @@ class ParasutProvider {
     }
 
     async _get(token, suffix) {
+        await this._acquireSlot();
         const url = `${this.baseUrl}${this._basePath(suffix)}`;
         try {
             const { data } = await axios.get(url, {
@@ -768,6 +929,7 @@ class ParasutProvider {
     }
 
     async _post(token, suffix, body) {
+        await this._acquireSlot();
         const url = `${this.baseUrl}${this._basePath(suffix)}`;
         try {
             const { data } = await axios.post(url, body, {
@@ -785,6 +947,7 @@ class ParasutProvider {
     }
 
     async _put(token, suffix, body) {
+        await this._acquireSlot();
         const url = `${this.baseUrl}${this._basePath(suffix)}`;
         try {
             const { data } = await axios.put(url, body, {
@@ -802,6 +965,7 @@ class ParasutProvider {
     }
 
     async _delete(token, suffix) {
+        await this._acquireSlot();
         const url = `${this.baseUrl}${this._basePath(suffix)}`;
         try {
             const { data } = await axios.delete(url, {
