@@ -41,6 +41,9 @@ const DispatchMetrics = require('./services/dispatch/dispatch-metrics');
 const DispatchQueue = require('./services/dispatch/dispatch-queue');
 // Plan 29 Faz 2.3 — Pre-dispatch buffer (kurye dönüş bekleme penceresi, default 0 = kapalı)
 const PreDispatchBuffer = require('./services/dispatch/pre-dispatch-buffer');
+// Otonom atama gate'i — şube dispatch moduna (useServerDispatch) göre Railway'in
+// sunucu-başlatımlı atamasını kapatır. Default-safe (autonomousGateEnabled=false → no-op).
+const DispatchModeResolver = require('./services/dispatch/dispatch-mode-resolver');
 // Plan 29 Faz 2.4 — Audit log (assignmentDecisions koleksiyonu)
 const DispatchAudit = require('./services/dispatch/dispatch-audit');
 const DispatchAlerts = require('./services/dispatch/dispatch-alerts');
@@ -154,7 +157,7 @@ const MAX_REQUEST_LOG = 200;
 app.use((req, res, next) => {
     // Log all non-polling requests (polling is too noisy)
     const isPolling = req.path.includes('pending-orders') || req.path.includes('/poll/');
-    const isHealth = req.path === '/health' || req.path === '/';
+    const isHealth = req.path === '/health' || req.path === '/health/firestore' || req.path === '/';
 
     if (!isPolling && !isHealth) {
         const entry = {
@@ -221,6 +224,23 @@ const API_KEYS = {
 // Webhook secret for incoming platform webhooks
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || null;
 const SOCKET_AUTH_TOKEN = process.env.SOCKET_AUTH_TOKEN || null;
+
+// Inbound platform webhook token (YS/GetirYemek/TrendyolGo/Fuudy sahte sipariş enjeksiyonuna karşı).
+// Platformlar per-sipariş secret göndermiyor; branchId gizli değil (herkese açık okunuyor).
+// Çözüm: callback URL'sine paylaşımlı token koy (?whk=<TOKEN> veya x-webhook-token header).
+// parseKeySet ile virgüllü çoklu değer = anahtar rotasyonu (eski+yeni geçiş penceresi).
+const PLATFORM_WEBHOOK_TOKEN = parseKeySet(process.env.PLATFORM_WEBHOOK_TOKEN);
+// Hangi platformlar REDDEDECEK: virgüllü liste (yemeksepeti,getiryemek,trendyolgo,fuudy) veya 'all'.
+// Boş → hiçbir platform reddetmez (yalnız audit log). Kademeli açılış için audit-then-enforce.
+const PLATFORM_WEBHOOK_ENFORCE = new Set(
+    parseKeySet(process.env.PLATFORM_WEBHOOK_ENFORCE).map(s => s.toLowerCase())
+);
+// YemekSepeti (Delivery Hero) inbound webhook'ları Authorization JWT ile gelir (HS512,
+// DH'nin verdiği doğrulama secret'ı, `service: middleware` claim'i — pluginApi.yaml).
+// Uydurma token yerine bu resmi imza doğrulanır. Boşsa generic token'a düşülür.
+const YEMEKSEPETI_DH_JWT_SECRET = parseKeySet(process.env.YEMEKSEPETI_DH_JWT_SECRET);
+// Token/JWT kararı saf/test edilebilir modülde (services/platform-webhook-auth.js).
+const { evaluateWebhookToken, platformFromPath, verifyDeliveryHeroJwt } = require('./services/platform-webhook-auth');
 
 // Webhook authentication middleware (internal API'ler için)
 function authenticateWebhook(req, res, next) {
@@ -298,6 +318,42 @@ function authenticatePlatformWebhook(req, res, next) {
     } catch (err) {
         // Audit pipeline asla webhook'u bloklamaz
         console.warn('[Pentest 2.2.a IpAudit] handler exception:', err.message);
+    }
+
+    // ===== INBOUND WEBHOOK KİMLİK DOĞRULAMASI (sahte sipariş enjeksiyonu koruması) =====
+    // İki mekanizma, aynı audit-then-enforce kararına bağlı:
+    //   • YemekSepeti (Delivery Hero) → Authorization JWT (HS512, DH secret, service:middleware) — resmi.
+    //   • Diğerleri → paylaşımlı token (header x-webhook-token veya ?whk= query).
+    // İlgili secret env boşsa o mekanizma pasif → hiçbir değişiklik (tam geriye uyumlu).
+    {
+        const p2 = req.path || '';
+        const platform = platformFromPath(p2);
+        const enforcing = PLATFORM_WEBHOOK_ENFORCE.has(platform) || PLATFORM_WEBHOOK_ENFORCE.has('all');
+
+        let active = false;      // doğrulama devrede mi (ilgili secret yapılandırılmış mı)
+        let matched = null;      // kimlik doğrulandı mı
+        let method = 'none';
+        let reason = '';
+
+        if (platform === 'yemeksepeti' && YEMEKSEPETI_DH_JWT_SECRET.length > 0) {
+            const j = verifyDeliveryHeroJwt(req.headers['authorization'], YEMEKSEPETI_DH_JWT_SECRET, { requiredService: 'middleware' });
+            active = true; matched = j.valid; method = 'dh-jwt'; reason = j.reason;
+        } else if (PLATFORM_WEBHOOK_TOKEN.length > 0) {
+            const provided = req.headers['x-webhook-token'] || req.query.whk || null;
+            const d = evaluateWebhookToken({ providedToken: provided, tokenSet: PLATFORM_WEBHOOK_TOKEN, platform, enforceSet: PLATFORM_WEBHOOK_ENFORCE });
+            active = d.active; matched = d.matched; method = 'shared-token'; reason = matched ? 'ok' : 'token_mismatch';
+        }
+
+        if (active && !matched) {
+            if (enforcing) {
+                console.warn(`[Security] Platform webhook REDDEDİLDİ — platform=${platform} method=${method} reason=${reason} path=${p2} ip=${req.ip || 'unknown'}`);
+                return res.status(401).json({ error: 'Unauthorized webhook' });
+            }
+            // Audit modu: reddetme, sadece görünürlük — secret panelde/env'de ayarlanana kadar akış bozulmaz.
+            console.warn(`[Security][audit] Platform webhook doğrulanmadı (audit modu, izin verildi) — platform=${platform} method=${method} reason=${reason} path=${p2} ip=${req.ip || 'unknown'}`);
+        } else if (active && matched && enforcing) {
+            console.log(`[Security] Platform webhook OK — platform=${platform} method=${method}`);
+        }
     }
 
     next();
@@ -519,6 +575,7 @@ let dispatchAlerts = null;
 let dispatchQueue = null;
 let preDispatchBuffer = null; // Plan 29 Faz 2.3
 let dispatchAudit = null;     // Plan 29 Faz 2.4
+let dispatchMode = null;      // Otonom atama gate'i (per-branch dispatch modu)
 let delayedCallQueue = null;
 let orphanOrderWatchdog = null; // OUTAGE_RESILIENCE_PLAN Faz 1
 
@@ -598,12 +655,15 @@ async function initializePlatformHub() {
     smartDispatchService.setCourierState(courierState);
     smartDispatchService.setRedis(getRedisClient(), isRedisAvailable);
 
+    // Otonom atama gate resolver'ı (per-branch dispatch modu, 5dk cache, default-safe)
+    dispatchMode = new DispatchModeResolver(db);
+
     // Initialize Dispatch Queue (retry for failed assignments)
-    dispatchQueue = new DispatchQueue(db, smartDispatchService, platformRegistry, dispatchMetrics);
+    dispatchQueue = new DispatchQueue(db, smartDispatchService, platformRegistry, dispatchMetrics, dispatchMode);
     dispatchQueue.start();
 
     // Plan 29 Faz 2.3 — Pre-dispatch buffer (geriye uyumlu: bufferSeconds=0 default → buffer atlanır)
-    preDispatchBuffer = new PreDispatchBuffer(db, smartDispatchService, platformRegistry, dispatchQueue);
+    preDispatchBuffer = new PreDispatchBuffer(db, smartDispatchService, platformRegistry, dispatchQueue, dispatchMode);
     preDispatchBuffer.start();
 
     // Plan 29 Faz 2.4 — Audit log (her atama için "neden bu kurye" karar dokümanı)
@@ -1591,41 +1651,51 @@ async function processPlatformOrderWebhook(platformId, rawOrder, branchId, optio
         // Plan 29 Faz 2.3 — preDispatchBuffer wrapper (bufferSeconds=0 → eski akış, buffer atlanır)
         // Geriye uyumlu: preDispatchBuffer yoksa direkt assignBestCourier
         const estimatedReadyAt = transformedOrder?.EstimatedReadyAt || transformedOrder?.estimatedReadyAt || null;
-        let courier = null;
-        let buffered = false;
 
-        if (preDispatchBuffer) {
-            const result = await preDispatchBuffer.enqueueOrAssign({
-                orderId: firebaseResult.orderId,
-                platformId,
-                branchId,
-                deliveryLocation,
-                estimatedReadyAt
-            });
-            courier = result.courier || null;
-            buffered = result.buffered;
+        // Dispatch mode gate — intake-anı OTONOM atama yalnızca otonom atamaya izinli
+        // şubede çalışır (gate kapalı VEYA useServerDispatch=true). Gate'liyse (client-mode)
+        // WPF EARLY DISPATCH atamayı üstlenir → çift/yarışan atama önlenir.
+        const autonomousAllowed = !dispatchMode || (await dispatchMode.isAutonomousAssignmentAllowed(branchId));
+        if (!autonomousAllowed) {
+            metrics.increment('dispatch_assignments_total', { status: 'gated' });
+            console.log(`[PlatformHub] Auto-dispatch gated (client-dispatch mode): ${platformId}/${firebaseResult.orderId} (branch: ${branchId})`);
         } else {
-            courier = await smartDispatchService.assignBestCourier(branchId, deliveryLocation, {
-                orderId: firebaseResult.orderId, estimatedReadyAt
-            });
-        }
+            let courier = null;
+            let buffered = false;
 
-        metrics.increment('dispatch_assignments_total', {
-            status: courier ? 'success' : (buffered ? 'buffered' : 'queued')
-        });
-
-        if (courier) {
-            if (connector && connector.assignCourier) {
-                await connector.assignCourier(firebaseResult.orderId, courier.id, courier.name);
+            if (preDispatchBuffer) {
+                const result = await preDispatchBuffer.enqueueOrAssign({
+                    orderId: firebaseResult.orderId,
+                    platformId,
+                    branchId,
+                    deliveryLocation,
+                    estimatedReadyAt
+                });
+                courier = result.courier || null;
+                buffered = result.buffered;
+            } else {
+                courier = await smartDispatchService.assignBestCourier(branchId, deliveryLocation, {
+                    orderId: firebaseResult.orderId, estimatedReadyAt
+                });
             }
-            await notifyCourierNewOrder(courier, transformedOrder, platformDisplayName || platformId);
-        } else if (!buffered && dispatchQueue) {
-            await dispatchQueue.enqueue({
-                orderId: firebaseResult.orderId,
-                platformId,
-                branchId,
-                deliveryLocation
+
+            metrics.increment('dispatch_assignments_total', {
+                status: courier ? 'success' : (buffered ? 'buffered' : 'queued')
             });
+
+            if (courier) {
+                if (connector && connector.assignCourier) {
+                    await connector.assignCourier(firebaseResult.orderId, courier.id, courier.name);
+                }
+                await notifyCourierNewOrder(courier, transformedOrder, platformDisplayName || platformId);
+            } else if (!buffered && dispatchQueue) {
+                await dispatchQueue.enqueue({
+                    orderId: firebaseResult.orderId,
+                    platformId,
+                    branchId,
+                    deliveryLocation
+                });
+            }
         }
     }
 
@@ -1791,7 +1861,8 @@ app.use('/api/v2/orders', (req, res, next) => {
     db,
     dispatchMetrics,
     dispatchQueue,
-    io
+    io,
+    dispatchMode
 }));
 
 app.use('/api/v2/platforms', createPlatformsApi(platformRegistry, db));
@@ -1845,7 +1916,8 @@ app.use('/api/v2/delayed-call', (req, res, next) => {
 app.use('/api/v2/otp', createOtpApi(otpService));
 
 // OTP → Firebase Custom Token sign-in (SMS_BRANDING_MIGRATION_PLAN.md F3)
-app.use('/api/v2/auth', createAuthApi(otpService, firebaseAuth));
+// db → sevkiyatçı (couriers) token'ına tenantId+courierId claim eklenir (Sevkiyat el terminali).
+app.use('/api/v2/auth', createAuthApi(otpService, firebaseAuth, db));
 
 // ==================== YEMEKSEPETI WEBHOOKS (LEGACY COMPATIBILITY) ====================
 
@@ -1935,25 +2007,40 @@ app.post('/order/:remoteId', webhookLimiter, authenticatePlatformWebhook, async 
         // Firebase direct write
         const firebaseResult = await writeOrderToFirebaseUnified(transformedOrder, 'yemeksepeti', branchId);
         if (firebaseResult.success) {
-            // Auto-assign courier
-            if (smartDispatchService && branchId) {
+            // YS kuryeli (Own Delivery: delivery.riderPickupTime dolu) ve Gel Al siparişlerinde
+            // kendi kurye ataması YAPILMAZ — teslimatı platform/müşteri üstlenir
+            // (MigrosYemek webhook'undaki deliveryProvider shouldDispatch gate paterni).
+            const ysPlatformCourier = !!order.delivery?.riderPickupTime;
+            const ysPickupOrder = order.expeditionType === 'pickup';
+            if (ysPlatformCourier || ysPickupOrder) {
+                metrics.increment('dispatch_assignments_total', { status: 'skipped' });
+                console.log(`[YemekSepeti] Auto-dispatch atlandı (${ysPlatformCourier ? 'YS kuryesi — Own Delivery' : 'Gel Al'}): ${firebaseResult.orderId} (branch: ${branchId})`);
+            }
+            // Auto-assign courier — dispatch mode gate (otonom atama, client-mode'da WPF üstlenir)
+            else if (smartDispatchService && branchId) {
                 const deliveryLocation = {
                     latitude: transformedOrder.Customer?.Address?.Latitude || 0,
                     longitude: transformedOrder.Customer?.Address?.Longitude || 0
                 };
-                const courier = await smartDispatchService.assignBestCourier(branchId, deliveryLocation);
-                metrics.increment('dispatch_assignments_total', { status: courier ? 'success' : 'queued' });
-                if (courier) {
-                    await connector?.assignCourier(firebaseResult.orderId, courier.id, courier.name);
-                    await notifyCourierNewOrder(courier, transformedOrder, 'YemekSepeti');
-                } else if (dispatchQueue) {
-                    // No courier available — enqueue for retry
-                    await dispatchQueue.enqueue({
-                        orderId: firebaseResult.orderId,
-                        platformId: 'yemeksepeti',
-                        branchId,
-                        deliveryLocation
-                    });
+                const ysAutonomousAllowed = !dispatchMode || (await dispatchMode.isAutonomousAssignmentAllowed(branchId));
+                if (!ysAutonomousAllowed) {
+                    metrics.increment('dispatch_assignments_total', { status: 'gated' });
+                    console.log(`[YemekSepeti] Auto-dispatch gated (client-dispatch mode): ${firebaseResult.orderId} (branch: ${branchId})`);
+                } else {
+                    const courier = await smartDispatchService.assignBestCourier(branchId, deliveryLocation);
+                    metrics.increment('dispatch_assignments_total', { status: courier ? 'success' : 'queued' });
+                    if (courier) {
+                        await connector?.assignCourier(firebaseResult.orderId, courier.id, courier.name);
+                        await notifyCourierNewOrder(courier, transformedOrder, 'YemekSepeti');
+                    } else if (dispatchQueue) {
+                        // No courier available — enqueue for retry
+                        await dispatchQueue.enqueue({
+                            orderId: firebaseResult.orderId,
+                            platformId: 'yemeksepeti',
+                            branchId,
+                            deliveryLocation
+                        });
+                    }
                 }
             }
 
@@ -2077,29 +2164,52 @@ app.post('/webhook/newOrder', webhookLimiter, authenticatePlatformWebhook, async
     captureGetirWebhook(req, secretResolved, urlBranchId, branchId);
 
     if (!branchId) {
-        // Permissive mode: 200 dön ki Getir retry yapmasın, ama Firestore'a unresolved olarak yaz
-        if (process.env.GETIR_WEBHOOK_PERMISSIVE === 'true') {
-            console.error('[GetirYemek] ⚠ branchId çözülemedi — PERMISSIVE mode, unresolved kaydediliyor');
-            try {
-                await db.collection('getirYemekOrders_unresolved').add({
-                    receivedAt: new Date(),
-                    headers: {
-                        'x-restaurant-secret-key': restaurantSecretKey || null,
-                        'x-branch-id': req.headers['x-branch-id'] || null,
-                        'user-agent': req.headers['user-agent'] || null,
-                    },
-                    query: req.query || {},
-                    body: rawBody,
-                    bodyRestaurantId: bodyRestaurantId || null,
-                    _unresolved: true,
-                });
-            } catch (e) {
-                console.error('[GetirYemek] unresolved write failed:', e.message);
-            }
-            return res.status(200).send('OK');
+        // KÖK FIX (R1, 2026-06-17): branchId çözülemese bile siparişi ASLA izsiz düşürme.
+        // Her durumda kalıcı iz (getirYemekOrders_unresolved) + DLQ kaydı (failedWebhooks) + alarm
+        // bırak, sonra 200 dön (Getir retry storm'unu durdur). Faz 3 retry worker / manuel kurtarma
+        // branchId'yi sonradan çözüp yeniden yazar — böylece sipariş görünür ve kurtarılabilir kalır.
+        // Eski strict-400 davranışı yalnızca GETIR_WEBHOOK_STRICT_REJECT=true ile (artık iz bırakılır).
+        console.error('[GetirYemek] ⚠ branchId çözülemedi — unresolved + DLQ kaydı (izsiz kayıp önlendi)');
+        try {
+            await db.collection('getirYemekOrders_unresolved').add({
+                receivedAt: new Date(),
+                headers: {
+                    'x-restaurant-secret-key': restaurantSecretKey || null,
+                    'x-branch-id': req.headers['x-branch-id'] || null,
+                    'user-agent': req.headers['user-agent'] || null,
+                },
+                query: req.query || {},
+                body: rawBody,
+                // Faz 3 retry için unwrapped (foodOrder açılmış) parsed payload — transform'a hazır.
+                orderPayload: order || null,
+                bodyRestaurantId: bodyRestaurantId || null,
+                remoteOrderId: (order && order.id) || null,
+                confirmationId: (order && (order.confirmationId || order.shortCode)) || null,
+                _unresolved: true,
+                retryCount: 0,
+                status: 'pending_resolve',
+            });
+        } catch (e) {
+            console.error('[GetirYemek] unresolved write failed:', e.message);
         }
-        console.error('[GetirYemek] ❌ branchId belirlenemedi — sipariş reddedildi (multi-tenant güvenlik)');
-        return res.status(400).json({ error: 'branchId could not be resolved (url/secret/restaurantId all failed)' });
+        // DLQ kaydı — kurtarma kuyruğu + Sentry görünürlüğü (collector Sentry alarmı da yazar).
+        try {
+            const collector = require('./services/failed-webhook-collector');
+            collector.record({
+                platform: 'getiryemek',
+                remoteOrderId: (order && order.id) || null,
+                branchId: null,
+                rawPayload: rawBody,
+                transformedOrder: null,
+                error: new Error('branchId_unresolved (url/secret/restaurantId all failed)'),
+            }).catch(() => { /* fail-soft */ });
+        } catch (_) { /* collector yüklenemezse sessiz geç */ }
+
+        if (process.env.GETIR_WEBHOOK_STRICT_REJECT === 'true') {
+            console.error('[GetirYemek] STRICT_REJECT — 400 dönülüyor (iz bırakıldı, kayıp değil)');
+            return res.status(400).json({ error: 'branchId could not be resolved (captured to unresolved + DLQ)' });
+        }
+        return res.status(200).send('OK');
     }
     console.log(`[GetirYemek] ✓ branchId resolved via ${resolveSource}: ${branchId}`);
     const branchCheckGY = await validateBranchId(branchId, 'getiryemek', db);
@@ -2794,6 +2904,56 @@ app.get('/', async (req, res) => {
     });
 });
 
+// ==================== DR: yemigo-prod CANLI erişilebilirlik probu ====================
+// Harici uptime izleyici (UptimeRobot vb.) buraya ping atar; yemigo-prod (Firebase)
+// askıya alınır/erişilemez olursa 503 döner → izleyici mail atar.
+// NOT: /health yetmez — sadece firebaseInitialized bayrağına bakar; proje askıya alınsa
+// bile lazy-init nedeniyle 'true' kalır. Burada GERÇEK bir Firestore okuması yapılır.
+// 30 sn in-memory cache: sık ping Firestore kotasını yormasın.
+let _fsHealthCache = { at: 0, ok: false, ms: 0, error: null };
+const FS_HEALTH_TTL_MS = 30 * 1000;
+
+app.get('/health/firestore', async (req, res) => {
+    const now = Date.now();
+    if (now - _fsHealthCache.at < FS_HEALTH_TTL_MS) {
+        return res
+            .status(_fsHealthCache.ok ? 200 : 503)
+            .json({
+                ok: _fsHealthCache.ok,
+                project: 'yemigo-prod',
+                ms: _fsHealthCache.ms,
+                cached: true,
+                error: _fsHealthCache.error,
+                timestamp: new Date(now).toISOString(),
+            });
+    }
+
+    const started = Date.now();
+    try {
+        if (!db) throw new Error('firestore-not-initialized');
+        // Hafif okuma: önce DR sentinel doc, yoksa branches'tan tek kayıt.
+        let snap = await db.doc('globalConfig/activeProject').get();
+        if (!snap.exists) {
+            await db.collection('branches').limit(1).get();
+        }
+        const ms = Date.now() - started;
+        _fsHealthCache = { at: now, ok: true, ms, error: null };
+        return res.status(200).json({
+            ok: true, project: 'yemigo-prod', ms, cached: false,
+            timestamp: new Date().toISOString(),
+        });
+    } catch (err) {
+        const ms = Date.now() - started;
+        const error = (err && err.message) ? String(err.message).slice(0, 200) : 'unknown';
+        _fsHealthCache = { at: now, ok: false, ms, error };
+        console.error('[health/firestore] yemigo-prod erişilemez:', error);
+        return res.status(503).json({
+            ok: false, project: 'yemigo-prod', ms, cached: false, error,
+            timestamp: new Date().toISOString(),
+        });
+    }
+});
+
 app.get('/socket/status', async (req, res) => {
     const allConnected = await courierState.getAllConnected();
     const couriers = [];
@@ -2848,6 +3008,72 @@ app.get('/debug/last-getir-webhooks', async (req, res) => {
         webhooks: firestoreWebhooks, // Firestore is authoritative (cross-instance)
         instanceMemoryWebhooks: lastGetirWebhooks.slice().reverse(),
     });
+});
+
+// ==================== ADMIN: GETIRYEMEK UNRESOLVED RECOVERY (Kök Fix Faz 3) ====================
+// branchId çözülemediği için unresolved'a düşmüş siparişleri görüntüle / manuel kurtar.
+app.get('/admin/getiryemek/unresolved', async (req, res) => {
+    const apiKey = req.headers['x-api-key'];
+    if (apiKey !== API_KEYS.ADMIN_API_KEY) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+    if (!db) return res.status(503).json({ error: 'firestore_unavailable' });
+    try {
+        const statusFilter = req.query.status || null; // pending_resolve | exhausted | resolved
+        let q = db.collection('getirYemekOrders_unresolved');
+        if (statusFilter) q = q.where('status', '==', statusFilter);
+        const snap = await q.limit(100).get();
+        const items = snap.docs.map(doc => {
+            const x = doc.data();
+            return {
+                id: doc.id,
+                status: x.status || null,
+                retryCount: x.retryCount || 0,
+                remoteOrderId: x.remoteOrderId || null,
+                confirmationId: x.confirmationId || null,
+                bodyRestaurantId: x.bodyRestaurantId || null,
+                receivedAt: x.receivedAt || null,
+                lastError: x.lastError || null,
+                resolvedBranchId: x.resolvedBranchId || null,
+            };
+        });
+        res.json({ total: items.length, statusFilter, items });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/admin/getiryemek/unresolved/:docId', async (req, res) => {
+    const apiKey = req.headers['x-api-key'];
+    if (apiKey !== API_KEYS.ADMIN_API_KEY) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+    if (!db) return res.status(503).json({ error: 'firestore_unavailable' });
+    const branchId = req.body && req.body.branchId;
+    if (!branchId) return res.status(400).json({ error: 'branchId required' });
+    try {
+        const ref = db.collection('getirYemekOrders_unresolved').doc(req.params.docId);
+        const doc = await ref.get();
+        if (!doc.exists) return res.status(404).json({ error: 'unresolved doc not found' });
+
+        const branchCheck = await validateBranchId(branchId, 'getiryemek', db);
+        if (!branchCheck.valid) return res.status(400).json({ error: `invalid branchId: ${branchCheck.reason}` });
+
+        const result = await getirUnresolvedRetry.reprocessUnresolvedDoc(getirRetryDeps, doc.data(), branchId);
+        if (getirUnresolvedRetry.isWriteSuccess(result)) {
+            await ref.update({
+                status: 'resolved',
+                resolvedBranchId: branchId,
+                resolveSource: 'admin_manual',
+                resolvedOrderId: result.orderId || null,
+                resolvedAt: new Date(),
+            });
+            return res.json({ success: true, branchId, orderId: result.orderId || null, duplicate: result.reason === 'duplicate_skipped' });
+        }
+        return res.status(500).json({ error: (result && result.reason) || 'write_failed' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 app.get('/debug/requests', async (req, res) => {
@@ -2952,6 +3178,30 @@ async function syncCourierLocationsToFirestore() {
 
 setInterval(syncCourierLocationsToFirestore, 10000); // 10 saniyede bir
 setTimeout(syncCourierLocationsToFirestore, 15000); // İlk sync 15s sonra
+
+// ==================== GETIRYEMEK UNRESOLVED RETRY (Kök Fix Faz 3) ====================
+// branchId çözülemediği için `getirYemekOrders_unresolved`'a düşmüş siparişleri periyodik
+// yeniden çözmeye çalışır. Çekirdek mantık test edilebilir service modülünde; burada
+// sadece bağımlılıkları enjekte edip cron'u bağlıyoruz (default OFF, env ile canary).
+const getirUnresolvedRetry = require('./services/getiryemek-unresolved-retry');
+
+const getirRetryDeps = {
+    db,
+    platformRegistry,
+    writeOrderToFirebaseUnified,
+    validateBranchId,
+    resolveBranchByGetirSecret,
+    resolveBranchByGetirRestaurantId,
+};
+
+setInterval(() => {
+    getirUnresolvedRetry.retryUnresolvedGetirOrders(getirRetryDeps).catch(err =>
+        console.error('[GetirRetry] cron error:', err.message));
+}, 2 * 60 * 1000); // 2 dakikada bir
+setTimeout(() => {
+    getirUnresolvedRetry.retryUnresolvedGetirOrders(getirRetryDeps).catch(err =>
+        console.error('[GetirRetry] ilk deneme error:', err.message));
+}, 45000); // İlk deneme 45s sonra
 
 // ==================== SERVER START ====================
 
