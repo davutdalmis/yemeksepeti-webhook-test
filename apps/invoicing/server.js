@@ -7,6 +7,9 @@ const { getRedisClient, isRedisAvailable, getRedisStatus, MemoryFallback } = req
 const { initSentry } = require('@yemigo/shared/sentry-init');
 
 const ParasutProvider = require('./providers/ParasutProvider');
+const UyumsoftProvider = require('./providers/UyumsoftProvider');
+const ParasutInboxProvider = require('./providers/ParasutInboxProvider');
+const { InboxInvoiceService } = require('./lib/InboxInvoiceService');
 const TokenManager = require('./auth/TokenManager');
 const CredentialVault = require('./secrets/CredentialVault');
 const { InvoiceProviderError } = require('./providers/IInvoiceProvider');
@@ -337,6 +340,284 @@ app.get('/invoicing/parasut/:tenantId/contacts/persons', requireApiKey, async (r
         console.error('[invoicing-engine] persons contacts error:', e.message);
         const status = e.status || (e instanceof InvoiceProviderError && e.status) || 500;
         res.status(status).json({ ok: false, error: e.code || 'internal_error', message: e.message });
+    }
+});
+
+// ---------------- GELEN e-fatura (inbox) uclari (2026-08-03; Parasut 2026-08-31) ----------------
+// Akis: sync -> incomingInvoices -> panel onay -> INVOICE_ENTRY stok girisi.
+// Panel bu uclara admin CF invoicingProxy uzerinden erisir (statik export, API route yok).
+//
+// Saglayici artik TENANT BASINA secilir (2026-08-31). Onceden Uyumsoft sabit kodluydu;
+// Parasut kullanan tenant'ta gelen kutusu akisi hic calisamiyordu.
+
+const UYUMSOFT_ENCRYPTED_FIELDS = ['username', 'password'];
+const PARASUT_ENCRYPTED_FIELDS = ['clientId', 'clientSecret', 'username', 'password'];
+// Secim sirasi: tenant'in acikca yazdigi inboxProvider > uyumsoft > parasut.
+// Uyumsoft'un onde olmasi BILINCLIDIR: daha once Uyumsoft ile kurulmus bir tenant'ta
+// davranis degismesin — o tenant'lar icin akis birebir eskisi gibi kalir.
+const INBOX_PROVIDER_ORDER = ['uyumsoft', 'parasut'];
+
+/**
+ * Tenant icin kullanilacak gelen-kutusu saglayicisini ve ayarlarini bulur.
+ * @returns {Promise<{provider:string, settings:object, ref:object}>}
+ */
+async function loadInboxProviderSettings(tenantId) {
+    if (!firebaseInitialized || !db) {
+        throw new Error('Firestore not initialized — cannot load tenant settings');
+    }
+    const root = db.collection('invoicingCredentials').doc(tenantId);
+
+    let preferred = '';
+    try {
+        const rootSnap = await root.get();
+        preferred = rootSnap.exists ? String((rootSnap.data() || {}).inboxProvider || '') : '';
+    } catch (e) {
+        preferred = '';
+    }
+    const order = preferred && INBOX_PROVIDER_ORDER.includes(preferred)
+        ? [preferred, ...INBOX_PROVIDER_ORDER.filter((p) => p !== preferred)]
+        : INBOX_PROVIDER_ORDER;
+
+    const disabled = [];
+    for (const name of order) {
+        const snap = await root.collection('providers').doc(name).get();
+        if (!snap.exists) continue;
+        const settings = snap.data() || {};
+        if (settings.isEnabled === false) { disabled.push(name); continue; }
+        return { provider: name, settings, ref: snap.ref };
+    }
+    if (disabled.length > 0) {
+        const err = new Error(`Inbox integration disabled for tenant "${tenantId}" (${disabled.join(', ')})`);
+        err.code = 'TENANT_DISABLED';
+        err.status = 409;
+        throw err;
+    }
+    const err = new Error(`No inbox provider settings for tenant "${tenantId}"`);
+    err.code = 'TENANT_SETTINGS_MISSING';
+    err.status = 404;
+    throw err;
+}
+
+async function inboxProviderFactory(tenantId) {
+    if (!vault) throw new Error('CredentialVault not initialized (INVOICING_AES_MASTER_KEY missing)');
+    const { provider, settings } = await loadInboxProviderSettings(tenantId);
+
+    if (provider === 'parasut') {
+        if (!settings.companyId) {
+            const err = new Error(`Parasut companyId missing for tenant "${tenantId}"`);
+            err.code = 'TENANT_SETTINGS_MISSING';
+            err.status = 404;
+            throw err;
+        }
+        const d = vault.decryptFields(settings, PARASUT_ENCRYPTED_FIELDS, tenantId);
+        return new ParasutInboxProvider({
+            clientId: d.clientId,
+            clientSecret: d.clientSecret,
+            username: d.username,
+            password: d.password,
+            companyId: settings.companyId,
+            baseUrl: settings.baseUrl || undefined,
+        });
+    }
+
+    const d = vault.decryptFields(settings, UYUMSOFT_ENCRYPTED_FIELDS, tenantId);
+    return new UyumsoftProvider({
+        username: d.username,
+        password: d.password,
+        baseUrl: settings.baseUrl || undefined,
+    });
+}
+
+const inboxService = (firebaseInitialized && db)
+    ? new InboxInvoiceService({
+        db,
+        Timestamp: admin.firestore.Timestamp,
+        providerFactory: inboxProviderFactory,
+    })
+    : null;
+
+function requireInbox(res) {
+    if (!inboxService) {
+        res.status(500).json({ error: 'firestore_not_initialized' });
+        return false;
+    }
+    return true;
+}
+
+function inboxErrorStatus(e) {
+    return e.status || (e instanceof InvoiceProviderError && e.status) || 500;
+}
+
+/** Uyumsoft kimlik kaydi — Parasut credentials ile ayni vault deseni. */
+app.post('/invoicing/inbox/credentials', requireApiKey, async (req, res) => {
+    try {
+        if (!vault) return res.status(500).json({ error: 'vault_not_initialized' });
+        if (!firebaseInitialized || !db) return res.status(500).json({ error: 'firestore_not_initialized' });
+        const { tenantId, username, password, isEnabled = true, updatedBy = 'panel' } = req.body || {};
+        if (!tenantId || !username || !password) {
+            return res.status(400).json({ error: 'missing_fields', required: ['tenantId', 'username', 'password'] });
+        }
+        const encrypted = vault.encryptFields({ username, password }, UYUMSOFT_ENCRYPTED_FIELDS, tenantId);
+        const ref = db.collection('invoicingCredentials').doc(tenantId).collection('providers').doc('uyumsoft');
+        await ref.set({
+            ...encrypted,
+            provider: 'uyumsoft',
+            isEnabled: !!isEnabled,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            updatedBy: String(updatedBy),
+        }, { merge: true });
+        res.json({ ok: true, tenantId, provider: 'uyumsoft', isEnabled: !!isEnabled });
+    } catch (e) {
+        console.error('[invoicing-engine] uyumsoft credentials write error:', e);
+        res.status(e.status || 500).json({ error: e.code || 'internal_error', message: e.message });
+    }
+});
+
+/** Uyumsoft baglanti testi (1 kayitlik liste sorgusu). Sonuc rozet icin kalici yazilir. */
+app.post('/invoicing/inbox/test-connection', requireApiKey, async (req, res) => {
+    try {
+        const { tenantId } = req.body || {};
+        if (!tenantId) return res.status(400).json({ error: 'missing_tenantId' });
+        const { provider: providerName, ref: providerRef } = await loadInboxProviderSettings(tenantId);
+        const provider = await inboxProviderFactory(tenantId);
+        const ping = await provider.ping();
+        try {
+            const ref = providerRef;
+            await ref.set({
+                lastConnectionStatus: ping.ok ? 'ok' : 'failed',
+                lastVerifyError: ping.ok ? null : (ping.error || 'ping_failed'),
+                lastVerifiedAt: Date.now(),
+            }, { merge: true });
+        } catch (persistErr) {
+            console.warn('[invoicing-engine] uyumsoft status persist failed:', persistErr.message);
+        }
+        if (ping.ok) return res.json({ ok: true, provider: providerName, totalInboxCount: ping.totalCount });
+        return res.status(502).json({ ok: false, error: ping.error || 'ping_failed' });
+    } catch (e) {
+        console.error('[invoicing-engine] uyumsoft test-connection error:', e.message);
+        res.status(inboxErrorStatus(e)).json({ ok: false, error: e.code || 'internal_error', message: e.message });
+    }
+});
+
+/** Maskeli Uyumsoft ayarlari (panel form doldurma + rozet). */
+app.get('/invoicing/inbox/:tenantId/settings', requireApiKey, async (req, res) => {
+    try {
+        const { provider, settings } = await loadInboxProviderSettings(req.params.tenantId);
+        const safe = {};
+        for (const [k, v] of Object.entries(settings)) {
+            safe[k] = k.startsWith('encrypted') ? '****' : v;
+        }
+        res.json({ ok: true, tenantId: req.params.tenantId, provider, settings: safe });
+    } catch (e) {
+        res.status(e.status || 500).json({ error: e.code || 'internal_error', message: e.message });
+    }
+});
+
+/** Gelen kutusu senkronu -> incomingInvoices (yalniz yeni dokumanlar yazilir). */
+app.post('/invoicing/inbox/:tenantId/sync', requireApiKey, async (req, res) => {
+    try {
+        if (!requireInbox(res)) return;
+        const { createStartDate, createEndDate, days } = req.body || {};
+        // Tarih verilmezse son 30 gun taranir. Penceresiz senkron tum gecmisi
+        // (bu tenant'ta 6000+ belge) gelen kutusuna dokerdi ve maxPages tavani
+        // sessizce devreye girerdi. Gerekirse body.days ile genisletilir.
+        const lookbackDays = Number(days) > 0 ? Math.min(Number(days), 365) : 30;
+        const startDate = createStartDate
+            || new Date(Date.now() - (lookbackDays * 24 * 60 * 60 * 1000)).toISOString().slice(0, 10);
+        const r = await inboxService.syncInbox({
+            tenantId: req.params.tenantId,
+            createStartDate: startDate,
+            createEndDate,
+        });
+        res.json(r);
+    } catch (e) {
+        console.error('[invoicing-engine] inbox sync error:', e.message);
+        res.status(inboxErrorStatus(e)).json({ ok: false, error: e.code || 'internal_error', message: e.message });
+    }
+});
+
+/** incomingInvoices listesi (panel tablo). Bellekte siralanir — composite index gerekmez. */
+app.get('/invoicing/inbox/:tenantId/list', requireApiKey, async (req, res) => {
+    try {
+        if (!requireInbox(res)) return;
+        let q = db.collection('incomingInvoices').where('tenantId', '==', req.params.tenantId);
+        if (req.query.status) q = q.where('status', '==', String(req.query.status));
+        const snap = await q.limit(500).get();
+        const items = snap.docs
+            .map((d) => {
+                const { parsed, ...rest } = d.data();
+                return { ...rest, hasLines: !!parsed };
+            })
+            .sort((a, b) => String(b.invoiceCreateDateUtc).localeCompare(String(a.invoiceCreateDateUtc)));
+        res.json({ ok: true, count: items.length, items });
+    } catch (e) {
+        console.error('[invoicing-engine] inbox list error:', e.message);
+        res.status(inboxErrorStatus(e)).json({ ok: false, error: e.code || 'internal_error', message: e.message });
+    }
+});
+
+/** UBL cek + parse + eslesme onerileri (detay ekrani). */
+app.post('/invoicing/inbox/:tenantId/:invoiceId/lines', requireApiKey, async (req, res) => {
+    try {
+        if (!requireInbox(res)) return;
+        const r = await inboxService.loadInvoiceLines({
+            tenantId: req.params.tenantId,
+            invoiceId: req.params.invoiceId,
+            force: req.body && req.body.force === true,
+        });
+        res.json({ ok: true, invoice: r });
+    } catch (e) {
+        console.error('[invoicing-engine] inbox lines error:', e.message);
+        res.status(inboxErrorStatus(e)).json({ ok: false, error: e.code || 'internal_error', message: e.message });
+    }
+});
+
+/** Fatura PDF onizleme (base64). */
+app.get('/invoicing/inbox/:tenantId/:invoiceId/pdf', requireApiKey, async (req, res) => {
+    try {
+        const provider = await inboxProviderFactory(req.params.tenantId);
+        const r = await provider.getInboxInvoicePdf(req.params.invoiceId);
+        res.json({ ok: true, invoiceId: r.invoiceId, pdfBase64: r.pdfBase64 });
+    } catch (e) {
+        console.error('[invoicing-engine] inbox pdf error:', e.message);
+        res.status(inboxErrorStatus(e)).json({ ok: false, error: e.code || 'internal_error', message: e.message });
+    }
+});
+
+/** Sube onayi -> INVOICE_ENTRY stok girisi + (ticari faturada) Uyumsoft Approve. */
+app.post('/invoicing/inbox/:tenantId/:invoiceId/approve', requireApiKey, async (req, res) => {
+    try {
+        if (!requireInbox(res)) return;
+        const { branchId, items, approvedBy } = req.body || {};
+        const r = await inboxService.approveInvoice({
+            tenantId: req.params.tenantId,
+            invoiceId: req.params.invoiceId,
+            branchId,
+            items,
+            approvedBy,
+        });
+        res.json(r);
+    } catch (e) {
+        console.error('[invoicing-engine] inbox approve error:', e.message);
+        res.status(inboxErrorStatus(e)).json({ ok: false, error: e.code || 'internal_error', message: e.message });
+    }
+});
+
+/** Red — stok yazilmaz; (ticari faturada) Uyumsoft Decline. */
+app.post('/invoicing/inbox/:tenantId/:invoiceId/decline', requireApiKey, async (req, res) => {
+    try {
+        if (!requireInbox(res)) return;
+        const { reason, declinedBy } = req.body || {};
+        const r = await inboxService.declineInvoice({
+            tenantId: req.params.tenantId,
+            invoiceId: req.params.invoiceId,
+            reason,
+            declinedBy,
+        });
+        res.json(r);
+    } catch (e) {
+        console.error('[invoicing-engine] inbox decline error:', e.message);
+        res.status(inboxErrorStatus(e)).json({ ok: false, error: e.code || 'internal_error', message: e.message });
     }
 });
 
@@ -789,9 +1070,78 @@ app.post('/invoicing/draft/:id/send', requireApiKey, async (req, res) => {
     }
 });
 
+// ---------------- Gelen kutusu zamanlanmis senkronu (2026-08-31) ----------------
+// Railway servisi surekli ayakta oldugu icin zamanlayici motorun icinde; Cloud Scheduler
+// gerekmiyor. syncInbox idempotenttir (var olan dokumani ASLA ezmez), bu yuzden birden
+// fazla replika kosarsa bile zarar vermez — yalniz bosa istek olur.
+//
+// Acma/kapama ortam degiskeniyle (mevcut INVOICING_LISTENER_ENABLED deseni):
+//   INVOICING_INBOX_SYNC_ENABLED=true      zorunlu, varsayilan KAPALI
+//   INVOICING_INBOX_SYNC_INTERVAL_MIN=30   tur araligi (dakika)
+//   INVOICING_INBOX_SYNC_DAYS=30           geriye bakis penceresi (gun)
+//
+// Parasut'te suzme alani issue_date'tir (faturanin KESIM tarihi); gec ulasan bir fatura
+// dar pencerede kacabilir. 30 gunluk pencere bunu tolere eder, tekrarli tur maliyetsizdir
+// cunku var olan dokumanlar 'skipped' sayilir.
+
+let inboxSyncTimer = null;
+let inboxSyncRunning = false;
+
+async function runInboxSyncCycle() {
+    if (!inboxService || !db) return;
+    if (inboxSyncRunning) {
+        console.warn('[inbox-sync] onceki tur hala suruyor, bu tur atlandi');
+        return;
+    }
+    inboxSyncRunning = true;
+    const days = Number(process.env.INVOICING_INBOX_SYNC_DAYS) > 0
+        ? Math.min(Number(process.env.INVOICING_INBOX_SYNC_DAYS), 365)
+        : 30;
+    const createStartDate = new Date(Date.now() - (days * 24 * 60 * 60 * 1000)).toISOString().slice(0, 10);
+    try {
+        // listDocuments(): ust dokuman bos olsa bile alt koleksiyonu olan tenant'lari verir.
+        const tenants = await db.collection('invoicingCredentials').listDocuments();
+        for (const t of tenants) {
+            try {
+                const r = await inboxService.syncInbox({ tenantId: t.id, createStartDate });
+                if (r.created > 0 || r.truncated) {
+                    console.log(`[inbox-sync] ${t.id}: ${r.created} yeni fatura, ${r.scanned} belge tarandi${r.truncated ? ' — SAYFA TAVANINA CARPTI' : ''}`);
+                }
+            } catch (e) {
+                // Saglayicisi olmayan/kapali tenant beklenen durum; gurultu yapma.
+                if (e.code === 'TENANT_SETTINGS_MISSING' || e.code === 'TENANT_DISABLED') continue;
+                console.warn(`[inbox-sync] ${t.id} basarisiz: ${e.code || ''} ${e.message}`);
+            }
+        }
+    } catch (e) {
+        console.error('[inbox-sync] tur hatasi:', e.message);
+    } finally {
+        inboxSyncRunning = false;
+    }
+}
+
+function startInboxSyncScheduler() {
+    if (process.env.INVOICING_INBOX_SYNC_ENABLED !== 'true') {
+        console.log('[inbox-sync] KAPALI (INVOICING_INBOX_SYNC_ENABLED != true) — senkron yalniz elle');
+        return;
+    }
+    if (!inboxService) {
+        console.warn('[inbox-sync] inboxService yok (Firestore hazir degil) — zamanlayici baslatilmadi');
+        return;
+    }
+    const minutes = Number(process.env.INVOICING_INBOX_SYNC_INTERVAL_MIN) > 0
+        ? Number(process.env.INVOICING_INBOX_SYNC_INTERVAL_MIN)
+        : 30;
+    console.log(`[inbox-sync] ACIK — her ${minutes} dakikada bir gelen kutusu taranacak`);
+    // Ilk tur 60 sn gecikmeli: acilista Firestore/Redis baglantilari otursun.
+    setTimeout(() => { void runInboxSyncCycle(); }, 60000).unref();
+    inboxSyncTimer = setInterval(() => { void runInboxSyncCycle(); }, minutes * 60 * 1000);
+}
+
 // Graceful shutdown
 async function shutdown() {
     console.log('[invoicing-engine] Graceful shutdown...');
+    if (inboxSyncTimer) clearInterval(inboxSyncTimer);
     if (stockListener) stockListener.stop();
     if (productionOrderListener) productionOrderListener.stop();
     if (invoiceWorker) await invoiceWorker.close().catch(() => {});
@@ -818,4 +1168,6 @@ app.listen(PORT, () => {
     console.log(`  Redis:    ${isRedisAvailable() ? 'connected' : 'memory fallback'}`);
     console.log(`  ApiKey:   ${INVOICING_API_KEY ? 'set' : 'NOT SET — protected endpoints will 500'}`);
     console.log('================================================================================');
+
+    startInboxSyncScheduler();
 });
