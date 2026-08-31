@@ -10,6 +10,7 @@ const ParasutProvider = require('./providers/ParasutProvider');
 const UyumsoftProvider = require('./providers/UyumsoftProvider');
 const ParasutInboxProvider = require('./providers/ParasutInboxProvider');
 const { InboxInvoiceService } = require('./lib/InboxInvoiceService');
+const { runCloseCycle, MIN_AGE_HOURS } = require('./lib/ProductionOrderCloser');
 const TokenManager = require('./auth/TokenManager');
 const CredentialVault = require('./secrets/CredentialVault');
 const { InvoiceProviderError } = require('./providers/IInvoiceProvider');
@@ -1138,10 +1139,63 @@ function startInboxSyncScheduler() {
     inboxSyncTimer = setInterval(() => { void runInboxSyncCycle(); }, minutes * 60 * 1000);
 }
 
+// ---------------- Irsaliyesi kesilen imalat siparisini kapatma (2026-08-31) ----------------
+// Yetkili panelde irsaliyeyi onaylayinca stok hareket ediyordu ama siparis PENDING
+// kaliyor, imalat-web "Bugun" sayfasinda birikiyordu (31.08 olcumu: 70 siparis,
+// 21 ayri gun, hepsinin irsaliyesi kesilmis).
+//
+// Neden zamanlayici, neden finalize'in icinde DEGIL: gercek yetkili siparisi ERTESI
+// SABAH ~11:00'de onayliyor, uretim daha yapilmadan. Onay aninda kapatmak isi imalatin
+// ekranindan gun ortasinda silerdi. Ayrinti + canli saat tablosu: lib/ProductionOrderCloser.js
+//
+// Acil kapatma: INVOICING_ORDER_CLOSE_DISABLED=true (varsayilan ACIK).
+// Tur araligi:  INVOICING_ORDER_CLOSE_INTERVAL_MIN (varsayilan 60 dk)
+
+let orderCloseTimer = null;
+let orderCloseRunning = false;
+
+async function runOrderCloseCycle() {
+    if (!db) return;
+    if (orderCloseRunning) {
+        console.warn('[order-close] onceki tur hala suruyor, bu tur atlandi');
+        return;
+    }
+    orderCloseRunning = true;
+    try {
+        const r = await runCloseCycle(db, { now: Date.now() });
+        if (r.closed > 0 || r.errors > 0) {
+            console.log(`[order-close] tur bitti: ${r.closed} kapandi, ${r.skipped} atlandi, ${r.errors} hata (${r.scanned} aktif siparis tarandi)`);
+        }
+    } catch (e) {
+        console.error('[order-close] tur hatasi:', e.message);
+    } finally {
+        orderCloseRunning = false;
+    }
+}
+
+function startOrderCloseScheduler() {
+    if (process.env.INVOICING_ORDER_CLOSE_DISABLED === 'true') {
+        console.log('[order-close] KAPALI (INVOICING_ORDER_CLOSE_DISABLED=true)');
+        return;
+    }
+    if (!firebaseInitialized) {
+        console.warn('[order-close] Firestore hazir degil — zamanlayici baslatilmadi');
+        return;
+    }
+    const minutes = Number(process.env.INVOICING_ORDER_CLOSE_INTERVAL_MIN) > 0
+        ? Number(process.env.INVOICING_ORDER_CLOSE_INTERVAL_MIN)
+        : 60;
+    console.log(`[order-close] ACIK — her ${minutes} dakikada bir, onayindan ${MIN_AGE_HOURS} saat gecmis irsaliyelerin siparisleri kapatilacak`);
+    // Ilk tur 90 sn gecikmeli: acilista Firestore baglantisi otursun.
+    setTimeout(() => { void runOrderCloseCycle(); }, 90000).unref();
+    orderCloseTimer = setInterval(() => { void runOrderCloseCycle(); }, minutes * 60 * 1000);
+}
+
 // Graceful shutdown
 async function shutdown() {
     console.log('[invoicing-engine] Graceful shutdown...');
     if (inboxSyncTimer) clearInterval(inboxSyncTimer);
+    if (orderCloseTimer) clearInterval(orderCloseTimer);
     if (stockListener) stockListener.stop();
     if (productionOrderListener) productionOrderListener.stop();
     if (invoiceWorker) await invoiceWorker.close().catch(() => {});
@@ -1170,4 +1224,5 @@ app.listen(PORT, () => {
     console.log('================================================================================');
 
     startInboxSyncScheduler();
+    startOrderCloseScheduler();
 });
