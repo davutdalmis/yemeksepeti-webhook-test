@@ -186,6 +186,7 @@ class InboxInvoiceService {
                 invoiceId: invoiceId || null,
                 actorUid: (actor && actor.uid) || 'unknown',
                 actorRole: (actor && actor.role) || 'unknown',
+                actorFirmOwner: actor && typeof actor.firmOwner === 'boolean' ? actor.firmOwner : null,
                 meta: meta || null,
                 at: ts,
             });

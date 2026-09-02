@@ -448,17 +448,24 @@ function requireInbox(res) {
 // 02.09.2026 (Davut karari): gelen tedarikci faturalari YALNIZ firma sahibinin (owner) isidir.
 // Sahibin ekledigi hicbir yetkili (manager) goremez. Proxy X-Actor-Role gonderirse burada da
 // kesilir (savunma derinligi); baslik yoksa eski proxy'dir, gecirilir ama iz 'unknown' duser.
-const INBOX_ALLOWED_ROLES = new Set(['owner', 'admin', 'super_admin']);
+// 02.09.2026 gece (Davut, tekrar): "firma yetkilisi = admin web'de eklenen kisi; onun panelden
+// yetkilendirdigi kisi DEGIL." Rol 'owner' YETMEZ; proxy X-Actor-Firm-Owner: '1' gondermeli
+// (claims.firmOwner <- tenantUsers.firmOwner, yalniz admin web yazar). Yemigo admin/super_admin gecer.
+const INBOX_PRIVILEGED_ROLES = new Set(['admin', 'super_admin']);
 function inboxActor(req) {
+    const fo = String(req.get('x-actor-firm-owner') || '');
     return {
         uid: String(req.get('x-actor-uid') || req.body?.actorUid || '') || 'unknown',
         role: String(req.get('x-actor-role') || req.body?.actorRole || '') || 'unknown',
+        firmOwner: fo === '1' ? true : (fo === '0' ? false : null), // null = baslik yok (eski proxy)
     };
 }
 function requireInboxOwner(req, res) {
     const a = inboxActor(req);
-    if (a.role !== 'unknown' && !INBOX_ALLOWED_ROLES.has(a.role)) {
-        res.status(403).json({ ok: false, error: 'forbidden', message: 'Gelen faturalar yalniz firma sahibine aciktir.' });
+    if (a.role === 'unknown') return true; // eski proxy: baslik yok, iz 'unknown' duser
+    if (INBOX_PRIVILEGED_ROLES.has(a.role)) return true;
+    if (a.firmOwner !== true) {
+        res.status(403).json({ ok: false, error: 'forbidden', message: 'Gelen faturalar yalniz firma yetkilisine aciktir.' });
         return false;
     }
     return true;
