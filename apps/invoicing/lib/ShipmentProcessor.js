@@ -406,7 +406,12 @@ class ShipmentProcessor {
         // Legacy görünmez defter (inventoryMovements/branchInventory): INVOICING_STOCK_WRITES
         // kill-switch arkasında, default KAPALI.
         const stockWrites = invoicingStockWritesEnabled();
-        const stockPlan = await planCanonicalStock(this.db, { tenantId, branchId, finalItems });
+        const stockPlan = await planCanonicalStock(this.db, {
+            tenantId, branchId, finalItems,
+            // Üretilen ürünlerin reçete düşümü işareti (productionStockLog/{orderId}_consume) için kaynak sipariş
+            orderId: doc.sourceType === 'productionOrder' ? doc.sourceId : (doc.sourceOrderId || null),
+            orderNumber: doc.sourceTransferNumber || null,
+        });
 
         try {
             await this.db.runTransaction(async (txn) => {

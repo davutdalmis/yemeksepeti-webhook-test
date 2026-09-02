@@ -1,4 +1,5 @@
 // CanonicalStockWriter — birim dönüşümü + satır birimini ezmeme (02.09.2026)
+// + üretilen ürün (supplyType=produced): imalattan stok değil reçete düşer (02.09.2026, Davut kararı)
 // Canlı vaka: Maltepe Zeytin 8.469 g + "1 kg" sipariş → eski yazım 8.470 "kg" yazdı.
 
 jest.mock('firebase-admin/firestore', () => ({
@@ -19,10 +20,21 @@ function makeDb(seed = {}) {
             docs.set(`${name}/${id}`, opts && opts.merge && cur ? { ...cur, ...data } : data);
         },
     });
+    const query = (name, filters) => ({
+        where(f, _op, v) { return query(name, [...filters, [f, v]]); },
+        async get() {
+            const out = [];
+            for (const [k, d] of docs) {
+                if (!k.startsWith(name + '/')) continue;
+                if (filters.every(([f, v]) => d[f] === v)) out.push({ id: k.split('/')[1], data: () => d });
+            }
+            return { docs: out };
+        },
+    });
     return {
         _docs: docs,
         collection(name) {
-            return { doc(id) { return ref(name, id || `auto${++autoId}`); } };
+            return { doc(id) { return ref(name, id || `auto${++autoId}`); }, where(f, op, v) { return query(name, []).where(f, op, v); } };
         },
         txn() {
             return {
@@ -35,13 +47,13 @@ function makeDb(seed = {}) {
 
 const CTX = { tenantId: 'T', branchId: 'B', sourceId: 'doc1', sourceLabel: 'IM-2026-1', recordedBy: 'u', tsMillis: 1000 };
 
-async function run(db, finalItems) {
-    const plan = await planCanonicalStock(db, { tenantId: 'T', branchId: 'B', finalItems });
+async function run(db, finalItems, extra = {}) {
+    const plan = await planCanonicalStock(db, { tenantId: 'T', branchId: 'B', finalItems, ...extra });
     const txn = db.txn();
     const snaps = await readCanonicalStock(txn, plan);
     const n = writeCanonicalStock(db, txn, plan, snaps, CTX);
     const moves = [...db._docs.entries()].filter(([k]) => k.startsWith('stockMovements/')).map(([, v]) => v);
-    return { plan, n, moves, stok: (id) => db._docs.get(`branchStocks/${id}`) };
+    return { plan, n, moves, stok: (id) => db._docs.get(`branchStocks/${id}`), doc: (k) => db._docs.get(k) };
 }
 
 describe('UnitConversion', () => {
@@ -88,7 +100,6 @@ describe('CanonicalStockWriter birim davranışı', () => {
         });
         const r = await run(db, [{ productId: 'p1', productName: 'X', unit: 'g', finalQuantity: 500 }]);
         expect(r.stok('B_p1')).toMatchObject({ currentStock: 2.5, unit: 'kg' });
-        // imalat satırı yok → kart birimi (g) ile açılır
         expect(r.stok('imalat_T_p1')).toMatchObject({ currentStock: 0, unit: 'g' });
     });
 
@@ -126,8 +137,7 @@ describe('CanonicalStockWriter birim davranışı', () => {
         ]);
         expect(r.plan.entries).toHaveLength(1);
         expect(r.stok('B_inv')).toMatchObject({ currentStock: 750, unit: 'g' });
-        const inn = r.moves.find((m) => m.movementType === 'TRANSFER_IN');
-        expect(inn.sourceQuantity).toBeNull(); // karışık kaynak birim — iz tutulmaz, tahmin yok
+        expect(r.moves.find((m) => m.movementType === 'TRANSFER_IN').sourceQuantity).toBeNull();
     });
 
     it('imalat 0 altına inmez (clamp korunur) ve sıfır/negatif adetler atlanır', async () => {
@@ -152,5 +162,84 @@ describe('CanonicalStockWriter birim davranışı', () => {
         } finally {
             delete process.env.INVOICING_CANONICAL_STOCK_DISABLED;
         }
+    });
+});
+
+describe('Üretilen ürün (supplyType=produced): imalattan stok değil reçete düşer', () => {
+    // Pizza Hamuru: 25 kg Pizza Unu + 0.33 lt Zeytinyağı → 150 top (Davut 02.09.2026)
+    const seed = () => ({
+        'productionProducts/pHamur': { supplyType: 'produced', inventoryProductId: 'invHamur' },
+        'productionProducts/pSucuk': { supplyType: 'trade', inventoryProductId: 'invSucuk' },
+        'inventoryProducts/invHamur': { unit: 'adet' },
+        'inventoryProducts/invUn': { unit: 'kg' },
+        'inventoryProducts/invZy': { unit: 'lt' },
+        'productionRecipes/r1': {
+            tenantId: 'T', productionProductId: 'pHamur', isActive: true, version: 2, outputQuantity: 150, outputUnit: 'adet',
+            ingredients: [
+                { inventoryProductId: 'invUn', inventoryProductName: 'Pizza Unu', quantity: 25, unit: 'kg' },
+                { inventoryProductId: 'invZy', inventoryProductName: 'Zeytinyağı', quantity: 0.33, unit: 'lt' },
+            ],
+        },
+        'productionRecipes/r0': { tenantId: 'T', productionProductId: 'pHamur', isActive: false, version: 1, outputQuantity: 50, ingredients: [{ inventoryProductId: 'invMaya', quantity: 0.5, unit: 'kg' }] },
+        'branchStocks/imalat_T_invUn': { currentStock: 100, unit: 'kg' },
+        'branchStocks/imalat_T_invZy': { currentStock: 10, unit: 'lt' },
+        'branchStocks/imalat_T_invSucuk': { currentStock: 50, unit: 'kg' },
+    });
+
+    it('300 top hamur: imalatta hamur satırı AÇILMAZ, TRANSFER_OUT yok; un −50 kg, zeytinyağı −0.66 lt; şubeye +300', async () => {
+        const db = makeDb(seed());
+        const r = await run(db, [
+            { productId: 'pHamur', productName: 'Pizza Hamuru', unit: 'adet', finalQuantity: 300 },
+            { productId: 'pSucuk', productName: 'Sucuk', unit: 'kg', finalQuantity: 4 },
+        ], { orderId: 'ord1', orderNumber: 'IM-2026-1' });
+        expect(r.n).toBe(2);
+        expect(r.stok('imalat_T_invHamur')).toBeUndefined();
+        expect(r.stok('B_invHamur')).toMatchObject({ currentStock: 300, unit: 'adet' });
+        expect(r.stok('imalat_T_invUn')).toMatchObject({ currentStock: 50, unit: 'kg' });
+        expect(r.stok('imalat_T_invZy')).toMatchObject({ currentStock: 9.34, unit: 'lt' });
+        expect(r.stok('imalat_T_invSucuk')).toMatchObject({ currentStock: 46, unit: 'kg' }); // ticari aynen
+        const outs = r.moves.filter((m) => m.movementType === 'TRANSFER_OUT');
+        expect(outs).toHaveLength(1); expect(outs[0].productId).toBe('invSucuk');
+        const cons = r.moves.filter((m) => m.movementType === 'PRODUCTION_CONSUME');
+        expect(cons).toHaveLength(2);
+        expect(cons.find((m) => m.productId === 'invUn')).toMatchObject({ quantity: -50, unit: 'kg', sourceOrderId: 'ord1' });
+        expect(cons[0].notes).toContain('Üretim siparişi: IM-2026-1');
+        // pasif eski reçete (maya) KULLANILMAZ
+        expect(r.moves.find((m) => m.productId === 'invMaya')).toBeUndefined();
+        // marker RecipeStockEngine ile aynı anahtarda
+        expect(r.doc('productionStockLog/ord1_consume')).toMatchObject({ orderId: 'ord1', phase: 'consume', count: 2, source: 'invoice_approval' });
+    });
+
+    it('imalat-web "Üretime Al" zaten düşmüşse (marker var) reçete İKİNCİ KEZ düşmez, şube girişi yine yapılır', async () => {
+        const db = makeDb({ ...seed(), 'productionStockLog/ord1_consume': { orderId: 'ord1', phase: 'consume' } });
+        const r = await run(db, [{ productId: 'pHamur', productName: 'Pizza Hamuru', unit: 'adet', finalQuantity: 300 }], { orderId: 'ord1', orderNumber: 'IM-2026-1' });
+        expect(r.stok('imalat_T_invUn')).toMatchObject({ currentStock: 100 });
+        expect(r.moves.filter((m) => m.movementType === 'PRODUCTION_CONSUME')).toHaveLength(0);
+        expect(r.stok('B_invHamur')).toMatchObject({ currentStock: 300 });
+    });
+
+    it('hammadde satırı gram tutuyorsa reçete kg miktarı grama çevrilir', async () => {
+        const s = seed(); s['branchStocks/imalat_T_invUn'] = { currentStock: 100000, unit: 'g' };
+        const r = await run(makeDb(s), [{ productId: 'pHamur', productName: 'Pizza Hamuru', unit: 'adet', finalQuantity: 150 }], { orderId: 'o2', orderNumber: 'IM-2' });
+        expect(r.stok('imalat_T_invUn')).toMatchObject({ currentStock: 75000, unit: 'g' });
+        expect(r.moves.find((m) => m.movementType === 'PRODUCTION_CONSUME' && m.productId === 'invUn')).toMatchObject({ quantity: -25000, unit: 'g', sourceQuantity: 25, sourceUnit: 'kg' });
+    });
+
+    it('reçetesi olmayan üretilen ürün (Browni gibi): imalatta hiçbir şey düşmez, şubeye girer', async () => {
+        const db = makeDb({ 'productionProducts/pBr': { supplyType: 'produced', inventoryProductId: 'invBr' } });
+        const r = await run(db, [{ productId: 'pBr', productName: 'Browni', unit: 'adet', finalQuantity: 3 }], { orderId: 'o3' });
+        expect(r.stok('imalat_T_invBr')).toBeUndefined();
+        expect(r.stok('B_invBr')).toMatchObject({ currentStock: 3 });
+        expect(r.moves).toHaveLength(1);
+        expect(r.plan.entries[0].noRecipe).toBe(true);
+    });
+
+    it('hammadde imalatta 0 altına inmez (clamp), sipariş kimliği yoksa marker yazılmaz ama düşüm yapılır', async () => {
+        const s = seed(); s['branchStocks/imalat_T_invUn'] = { currentStock: 10, unit: 'kg' };
+        const r = await run(makeDb(s), [{ productId: 'pHamur', productName: 'Pizza Hamuru', unit: 'adet', finalQuantity: 300 }]);
+        expect(r.stok('imalat_T_invUn')).toMatchObject({ currentStock: 0 });
+        expect(r.moves.filter((m) => m.movementType === 'PRODUCTION_CONSUME')).toHaveLength(2);
+        expect(r.plan.consumeEntries).toHaveLength(2);
+        expect(r.plan.markerRef).toBeNull();
     });
 });
