@@ -166,6 +166,41 @@ class InboxInvoiceService {
         return { ok: true, count: items.length, items, counts };
     }
 
+    // -------------------- 0b) ERISIM IZI --------------------
+
+    /**
+     * 02.09.2026 (Davut): gelen fatura ekranina KIM ne zaman bakti — her list/lines/pdf/approve/
+     * decline cagrisi inboxAccessLog'a yazilir; lines/pdf ayrica faturaya lastViewedAt/By yazar.
+     * Aktor bilgisi Cloud Function proxy'den X-Actor-Uid / X-Actor-Role basliklariyla gelir;
+     * eski proxy basliksiz cagirir -> actor 'unknown' olarak kaydedilir (iz yine dusur).
+     * Hata yutulur: iz yazilamadi diye is akisi durmaz.
+     */
+    async logAccess({ tenantId, action, invoiceId, actor, meta }) {
+        try {
+            const ts = this.Timestamp.fromMillis(this.now());
+            const ref = this.db.collection('inboxAccessLog').doc();
+            await ref.set({
+                id: ref.id,
+                tenantId: tenantId || '',
+                action: action || 'unknown',
+                invoiceId: invoiceId || null,
+                actorUid: (actor && actor.uid) || 'unknown',
+                actorRole: (actor && actor.role) || 'unknown',
+                meta: meta || null,
+                at: ts,
+            });
+            if (invoiceId && (action === 'lines' || action === 'pdf')) {
+                await this.db.collection('incomingInvoices').doc(this._docId(tenantId, invoiceId)).set({
+                    lastViewedAt: ts,
+                    lastViewedBy: (actor && actor.uid) || 'unknown',
+                    lastViewedRole: (actor && actor.role) || 'unknown',
+                }, { merge: true });
+            }
+        } catch (e) {
+            this.logger.warn('[inbox] erisim izi yazilamadi:', e.message);
+        }
+    }
+
     // -------------------- 1) SYNC --------------------
 
     /**

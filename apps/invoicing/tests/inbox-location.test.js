@@ -166,3 +166,22 @@ describe('approveInvoice — satir bazinda konum + birim', () => {
         expect(r.supplierKind).toBe('stock');
     });
 });
+
+describe('logAccess — kim ne zaman bakti (02.09.2026)', () => {
+    it('inboxAccessLog yazar; lines/pdf faturaya lastViewedAt/By yazar; hata yutulur', async () => {
+        const db = makeDb({ 'incomingInvoices/tenantA__inv9': { tenantId: T, invoiceId: 'inv9', status: 'new' } });
+        const s = svc(db);
+        await s.logAccess({ tenantId: T, action: 'list', actor: { uid: 'u1', role: 'owner' }, meta: { status: 'new' } });
+        await s.logAccess({ tenantId: T, action: 'lines', invoiceId: 'inv9', actor: { uid: 'u2', role: 'manager' } });
+        const logs = [...db._docs.entries()].filter(([k]) => k.startsWith('inboxAccessLog/')).map(([, v]) => v);
+        expect(logs).toHaveLength(2);
+        expect(logs[0]).toMatchObject({ tenantId: T, action: 'list', actorUid: 'u1', actorRole: 'owner', invoiceId: null });
+        expect(logs[1]).toMatchObject({ action: 'lines', invoiceId: 'inv9', actorUid: 'u2', actorRole: 'manager' });
+        expect(db._docs.get('incomingInvoices/tenantA__inv9')).toMatchObject({ lastViewedBy: 'u2', lastViewedRole: 'manager', status: 'new' });
+        // aktor yoksa 'unknown'; db patlasa bile fırlatmaz
+        await s.logAccess({ tenantId: T, action: 'pdf', invoiceId: 'inv9' });
+        expect([...db._docs.entries()].filter(([k]) => k.startsWith('inboxAccessLog/')).pop()[1]).toMatchObject({ actorUid: 'unknown', actorRole: 'unknown' });
+        const broken = svc({ collection() { throw new Error('down'); } });
+        await expect(broken.logAccess({ tenantId: T, action: 'list' })).resolves.toBeUndefined();
+    });
+});

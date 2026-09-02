@@ -445,6 +445,25 @@ function requireInbox(res) {
     return true;
 }
 
+// 02.09.2026 (Davut karari): gelen tedarikci faturalari YALNIZ firma sahibinin (owner) isidir.
+// Sahibin ekledigi hicbir yetkili (manager) goremez. Proxy X-Actor-Role gonderirse burada da
+// kesilir (savunma derinligi); baslik yoksa eski proxy'dir, gecirilir ama iz 'unknown' duser.
+const INBOX_ALLOWED_ROLES = new Set(['owner', 'admin', 'super_admin']);
+function inboxActor(req) {
+    return {
+        uid: String(req.get('x-actor-uid') || req.body?.actorUid || '') || 'unknown',
+        role: String(req.get('x-actor-role') || req.body?.actorRole || '') || 'unknown',
+    };
+}
+function requireInboxOwner(req, res) {
+    const a = inboxActor(req);
+    if (a.role !== 'unknown' && !INBOX_ALLOWED_ROLES.has(a.role)) {
+        res.status(403).json({ ok: false, error: 'forbidden', message: 'Gelen faturalar yalniz firma sahibine aciktir.' });
+        return false;
+    }
+    return true;
+}
+
 function inboxErrorStatus(e) {
     return e.status || (e instanceof InvoiceProviderError && e.status) || 500;
 }
@@ -503,6 +522,7 @@ app.post('/invoicing/inbox/test-connection', requireApiKey, async (req, res) => 
 /** Maskeli Uyumsoft ayarlari (panel form doldurma + rozet). */
 app.get('/invoicing/inbox/:tenantId/settings', requireApiKey, async (req, res) => {
     try {
+        if (!requireInboxOwner(req, res)) return;
         const { provider, settings } = await loadInboxProviderSettings(req.params.tenantId);
         const safe = {};
         for (const [k, v] of Object.entries(settings)) {
@@ -517,6 +537,7 @@ app.get('/invoicing/inbox/:tenantId/settings', requireApiKey, async (req, res) =
 /** Gelen kutusu senkronu -> incomingInvoices (yalniz yeni dokumanlar yazilir). */
 app.post('/invoicing/inbox/:tenantId/sync', requireApiKey, async (req, res) => {
     try {
+        if (!requireInboxOwner(req, res)) return;
         if (!requireInbox(res)) return;
         const { createStartDate, createEndDate, days } = req.body || {};
         // Tarih verilmezse son 30 gun taranir. Penceresiz senkron tum gecmisi
@@ -541,6 +562,8 @@ app.post('/invoicing/inbox/:tenantId/sync', requireApiKey, async (req, res) => {
 app.get('/invoicing/inbox/:tenantId/list', requireApiKey, async (req, res) => {
     try {
         if (!requireInbox(res)) return;
+        if (!requireInboxOwner(req, res)) return;
+        void inboxService.logAccess({ tenantId: req.params.tenantId, action: 'list', actor: inboxActor(req), meta: { status: req.query.status || null } });
         const r = await inboxService.listInvoices({
             tenantId: req.params.tenantId,
             status: req.query.status ? String(req.query.status) : '',
@@ -556,6 +579,8 @@ app.get('/invoicing/inbox/:tenantId/list', requireApiKey, async (req, res) => {
 app.post('/invoicing/inbox/:tenantId/:invoiceId/lines', requireApiKey, async (req, res) => {
     try {
         if (!requireInbox(res)) return;
+        if (!requireInboxOwner(req, res)) return;
+        void inboxService.logAccess({ tenantId: req.params.tenantId, action: 'lines', invoiceId: req.params.invoiceId, actor: inboxActor(req) });
         const r = await inboxService.loadInvoiceLines({
             tenantId: req.params.tenantId,
             invoiceId: req.params.invoiceId,
@@ -571,6 +596,8 @@ app.post('/invoicing/inbox/:tenantId/:invoiceId/lines', requireApiKey, async (re
 /** Fatura PDF onizleme (base64). */
 app.get('/invoicing/inbox/:tenantId/:invoiceId/pdf', requireApiKey, async (req, res) => {
     try {
+        if (!requireInboxOwner(req, res)) return;
+        if (inboxService) void inboxService.logAccess({ tenantId: req.params.tenantId, action: 'pdf', invoiceId: req.params.invoiceId, actor: inboxActor(req) });
         const provider = await inboxProviderFactory(req.params.tenantId);
         const r = await provider.getInboxInvoicePdf(req.params.invoiceId);
         res.json({ ok: true, invoiceId: r.invoiceId, pdfBase64: r.pdfBase64 });
@@ -584,6 +611,8 @@ app.get('/invoicing/inbox/:tenantId/:invoiceId/pdf', requireApiKey, async (req, 
 app.post('/invoicing/inbox/:tenantId/:invoiceId/approve', requireApiKey, async (req, res) => {
     try {
         if (!requireInbox(res)) return;
+        if (!requireInboxOwner(req, res)) return;
+        void inboxService.logAccess({ tenantId: req.params.tenantId, action: 'approve', invoiceId: req.params.invoiceId, actor: inboxActor(req), meta: { items: Array.isArray(req.body?.items) ? req.body.items.length : 0 } });
         const { branchId, items, approvedBy } = req.body || {};
         const r = await inboxService.approveInvoice({
             tenantId: req.params.tenantId,
@@ -603,6 +632,8 @@ app.post('/invoicing/inbox/:tenantId/:invoiceId/approve', requireApiKey, async (
 app.post('/invoicing/inbox/:tenantId/:invoiceId/decline', requireApiKey, async (req, res) => {
     try {
         if (!requireInbox(res)) return;
+        if (!requireInboxOwner(req, res)) return;
+        void inboxService.logAccess({ tenantId: req.params.tenantId, action: 'decline', invoiceId: req.params.invoiceId, actor: inboxActor(req), meta: { reason: req.body?.reason || '' } });
         const { reason, declinedBy } = req.body || {};
         const r = await inboxService.declineInvoice({
             tenantId: req.params.tenantId,
