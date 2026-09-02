@@ -20,9 +20,39 @@
 // ==================================================================================
 
 const { parseUblInvoice } = require('./UblInvoiceParser');
+const { normalizeUnit, convertQuantity, roundQty } = require('./UnitConversion');
 
 function round2(n) {
     return Math.round(n * 100) / 100;
+}
+
+// ----------------------------------------------------------------------------------
+// 02.09.2026 (Davut karari) — TEDARIKCI = FILTRE, URUN = KONUM, ISTISNA = ONAYDA ELLE
+//   * supplierKind  : 'stock' | 'service' | 'unclassified'. Kaynak sirasi:
+//       tenants/{tenantId}/supplierProfiles/{vkn}.kind  (panel yazar; Firestore kurali izinli)
+//       > tedarikcinin supplierProductMappings kaydi varsa 'stock'
+//       > 'unclassified'
+//     Ayni Parasut sirketi imalat + sube (Barbeku Turizm: imalat + Saskinbakkal) oldugu icin
+//     gelen kutusunda komisyon/elektrik/kurye faturalari da var; bunlar stok ekranini bogar.
+//   * targetLocation: satir bazinda 'imalat' | <branchId>. Kaynak sirasi:
+//       supplierProductMappings.targetLocation > supplierProfiles.defaultLocation > null (onayci secer)
+//     Ayni fatura hem imalat hem sube mali tasiyabilir; her satir kendi konumuna yazilir.
+//   * Onayda birim: kalem miktari stok biriminde gelir; mevcut branchStocks satirinin birimi
+//     farkliysa (kg satiri / g satiri) UnitConversion ile cevrilir, satir birimi EZILMEZ
+//     (CanonicalStockWriter ile ayni kural).
+// ----------------------------------------------------------------------------------
+const SUPPLIER_PROFILES = 'supplierProfiles';
+
+/** 'imalat' | 'imalat_<tenant>' -> 'imalat'; sube id'si aynen. Bos -> null. */
+function normalizeLocation(loc, tenantId) {
+    if (!loc) return null;
+    const v = String(loc).trim();
+    if (!v) return null;
+    if (v === 'imalat' || v === `imalat_${tenantId}` || v.startsWith('imalat_')) return 'imalat';
+    return v;
+}
+function locationBranchId(loc, tenantId) {
+    return loc === 'imalat' ? `imalat_${tenantId}` : loc;
 }
 
 // Eslesme anahtari: tr kucuk harf + tek bosluk; dokuman id'sinde yasak karakterler temizlenir.
@@ -71,6 +101,69 @@ class InboxInvoiceService {
     _mappingDocId(tenantId, supplierVkn, line) {
         const key = mappingKeyPart(line.sellerCode) || mappingKeyPart(line.name);
         return `${tenantId}__${supplierVkn || 'vkn'}__${key || 'bilinmeyen'}`;
+    }
+
+    // -------------------- 0) TEDARIKCI SINIFI / KONUM --------------------
+
+    /** tenants/{tenantId}/supplierProfiles -> Map(vkn -> profile). Yoksa bos Map. */
+    async _loadSupplierProfiles(tenantId) {
+        const out = new Map();
+        try {
+            const snap = await this.db.collection('tenants').doc(tenantId).collection(SUPPLIER_PROFILES).get();
+            for (const d of snap.docs || []) {
+                const x = d.data() || {};
+                out.set(String(x.vkn || d.id), { ...x, vkn: String(x.vkn || d.id) });
+            }
+        } catch (e) {
+            this.logger.warn('[inbox] supplierProfiles okunamadi:', e.message);
+        }
+        return out;
+    }
+
+    /** Eslesme kaydi olan tedarikci VKN kumesi (stok tedarikcisi kaniti). */
+    async _loadMappingVkns(tenantId) {
+        const out = new Set();
+        try {
+            const snap = await this.db.collection('supplierProductMappings').where('tenantId', '==', tenantId).get();
+            for (const d of snap.docs || []) { const v = (d.data() || {}).supplierVkn; if (v) out.add(String(v)); }
+        } catch (e) {
+            this.logger.warn('[inbox] supplierProductMappings okunamadi:', e.message);
+        }
+        return out;
+    }
+
+    /** Tedarikci sinifi: profil > eslesme kaydi > unclassified. */
+    static classifySupplier(vkn, profiles, mappingVkns) {
+        const p = vkn ? profiles.get(String(vkn)) : null;
+        if (p && (p.kind === 'stock' || p.kind === 'service')) return { kind: p.kind, defaultLocation: p.defaultLocation || null, source: 'profile' };
+        if (vkn && mappingVkns.has(String(vkn))) return { kind: 'stock', defaultLocation: null, source: 'mapping' };
+        return { kind: 'unclassified', defaultLocation: null, source: 'none' };
+    }
+
+    /**
+     * incomingInvoices listesi (panel tablo). Her satira supplierKind + supplierKindSource +
+     * supplierDefaultLocation eklenir (anlik hesap, dokumana yazilmaz — profil degisince
+     * eski faturalar da dogru sinifa duser).
+     */
+    async listInvoices({ tenantId, status, limit = 500 }) {
+        if (!tenantId) throw new InboxInvoiceError('tenantId required', { code: 'BAD_REQUEST', status: 400 });
+        let q = this.db.collection('incomingInvoices').where('tenantId', '==', tenantId);
+        if (status) q = q.where('status', '==', String(status));
+        const [snap, profiles, mappingVkns] = await Promise.all([
+            q.limit(limit).get(),
+            this._loadSupplierProfiles(tenantId),
+            this._loadMappingVkns(tenantId),
+        ]);
+        const items = (snap.docs || [])
+            .map((d) => {
+                const { parsed, ...rest } = d.data();
+                const c = InboxInvoiceService.classifySupplier(rest.supplierVkn, profiles, mappingVkns);
+                return { ...rest, hasLines: !!parsed, supplierKind: c.kind, supplierKindSource: c.source, supplierDefaultLocation: c.defaultLocation };
+            })
+            .sort((a, b) => String(b.invoiceCreateDateUtc).localeCompare(String(a.invoiceCreateDateUtc)));
+        const counts = { stock: 0, service: 0, unclassified: 0 };
+        for (const it of items) counts[it.supplierKind] = (counts[it.supplierKind] || 0) + 1;
+        return { ok: true, count: items.length, items, counts };
     }
 
     // -------------------- 1) SYNC --------------------
@@ -175,20 +268,26 @@ class InboxInvoiceService {
 
         // Ogrenilmis eslesme onerileri (salt okuma — otomatik stok yazilmaz)
         const supplierVkn = parsed.supplier.vkn || doc.supplierVkn || '';
+        const profiles = await this._loadSupplierProfiles(tenantId);
+        const profile = profiles.get(String(supplierVkn)) || null;
+        const profileLoc = profile ? normalizeLocation(profile.defaultLocation, tenantId) : null;
         const lines = [];
         for (const line of parsed.lines) {
             const mapRef = this.db.collection('supplierProductMappings')
                 .doc(this._mappingDocId(tenantId, supplierVkn, line));
             const mapSnap = await mapRef.get();
             const m = mapSnap.exists ? mapSnap.data() : null;
+            // Konum onerisi: eslesme kaydi > tedarikci profili > null (onayci secer)
+            const suggestedTargetLocation = (m && normalizeLocation(m.targetLocation, tenantId)) || profileLoc || null;
             lines.push({
                 ...line,
                 suggestedInventoryProductId: m ? m.inventoryProductId : null,
                 suggestedInventoryProductName: m ? (m.inventoryProductName || null) : null,
                 suggestedUnitMultiplier: m ? (m.unitMultiplier || 1) : null,
+                suggestedTargetLocation,
             });
         }
-        return { ...parsed, lines, status: doc.status };
+        return { ...parsed, lines, status: doc.status, supplierKind: profile ? (profile.kind || null) : null, supplierDefaultLocation: profileLoc };
     }
 
     // -------------------- 3) APPROVE --------------------
@@ -207,10 +306,15 @@ class InboxInvoiceService {
      */
     async approveInvoice({ tenantId, invoiceId, branchId, items, approvedBy, sendProviderResponse = true }) {
         if (!tenantId || !invoiceId) throw new InboxInvoiceError('tenantId+invoiceId required', { code: 'BAD_REQUEST', status: 400 });
-        if (!branchId) throw new InboxInvoiceError('branchId required', { code: 'BAD_REQUEST', status: 400 });
+        const defaultLoc = normalizeLocation(branchId, tenantId);
         const list = Array.isArray(items) ? items : [];
-        const valid = list.filter((it) => it && it.inventoryProductId && Number(it.quantity) > 0);
+        // Her kalemin konumu: item.targetLocation > govde branchId. 'imalat' -> imalat_<tenant>.
+        const valid = list
+            .filter((it) => it && it.inventoryProductId && Number(it.quantity) > 0)
+            .map((it) => ({ ...it, _loc: normalizeLocation(it.targetLocation, tenantId) || defaultLoc }));
         if (valid.length === 0) throw new InboxInvoiceError('en az bir eslesmis kalem gerekli', { code: 'NO_ITEMS', status: 400 });
+        const konumsuz = valid.filter((it) => !it._loc);
+        if (konumsuz.length) throw new InboxInvoiceError(`konum secilmemis kalem: ${konumsuz.map((it) => it.productName || it.inventoryProductId).join(', ')}`, { code: 'NO_LOCATION', status: 400 });
 
         const ref = this.db.collection('incomingInvoices').doc(this._docId(tenantId, invoiceId));
         const ts = this.Timestamp.fromMillis(this.now());
@@ -224,26 +328,31 @@ class InboxInvoiceService {
             if (doc.status === 'declined') throw new InboxInvoiceError('fatura reddedilmis; onaylanamaz', { code: 'ALREADY_DECLINED', status: 409 });
 
             // Okumalar (hepsi yazmalardan once — Firestore kurali)
-            const stockRefs = valid.map((it) => this.db.collection('branchStocks').doc(`${branchId}_${it.inventoryProductId}`));
+            const stockRefs = valid.map((it) => this.db.collection('branchStocks').doc(`${locationBranchId(it._loc, tenantId)}_${it.inventoryProductId}`));
             const stockSnaps = [];
             for (const sr of stockRefs) stockSnaps.push(await txn.get(sr));
 
             const invoiceNo = doc.documentId || (doc.parsed && doc.parsed.invoiceNumber) || '';
             const supplierName = doc.supplierTitle || (doc.parsed && doc.parsed.supplier && doc.parsed.supplier.title) || '';
 
-            // Yazimlar
+            // Yazimlar — kalem kendi konumuna; satir birimi varsa ona cevrilir, ezilmez
             for (let i = 0; i < valid.length; i++) {
                 const it = valid[i];
-                const qty = round2(Number(it.quantity));
-                const current = stockSnaps[i].exists ? Number((stockSnaps[i].data() || {}).currentStock || 0) : 0;
+                const rowBranchId = locationBranchId(it._loc, tenantId);
+                const rowData = stockSnaps[i].exists ? (stockSnaps[i].data() || {}) : {};
+                const current = Number(rowData.currentStock || 0);
+                const itemUnit = normalizeUnit(it.unit, 'adet');
+                const rowUnit = rowData.unit ? normalizeUnit(rowData.unit, itemUnit) : itemUnit;
+                const c = convertQuantity(Number(it.quantity), itemUnit, rowUnit);
+                const qty = roundQty(c.qty);
                 txn.set(stockRefs[i], {
-                    id: `${branchId}_${it.inventoryProductId}`,
+                    id: `${rowBranchId}_${it.inventoryProductId}`,
                     tenantId,
-                    branchId,
+                    branchId: rowBranchId,
                     productId: it.inventoryProductId,
                     productName: it.productName || it.inventoryProductId,
-                    currentStock: round2(current + qty),
-                    unit: it.unit || 'adet',
+                    currentStock: roundQty(current + qty),
+                    unit: rowUnit,
                     lastUpdated: ts,
                 }, { merge: true });
 
@@ -251,15 +360,19 @@ class InboxInvoiceService {
                 txn.set(moveRef, {
                     id: moveRef.id,
                     tenantId,
-                    branchId,
+                    branchId: rowBranchId,
                     movementType: 'INVOICE_ENTRY',
                     productId: it.inventoryProductId,
                     productName: it.productName || it.inventoryProductId,
                     quantity: qty,
-                    unit: it.unit || 'adet',
+                    unit: rowUnit,
+                    sourceQuantity: roundQty(Number(it.quantity)),
+                    sourceUnit: itemUnit,
+                    ...(c.mismatch ? { unitMismatch: true } : {}),
+                    targetLocation: it._loc,
                     movementDate: ts,
                     createdAt: ts,
-                    notes: `Gelen e-fatura onayi ${invoiceNo}`.trim(),
+                    notes: `Gelen e-fatura onayi ${invoiceNo}`.trim() + (c.mismatch ? ` (birim uyusmazligi: ${itemUnit} -> ${rowUnit}, cevrilmedi)` : ''),
                     sourceType: 'incoming_invoice',
                     sourceDocumentId: this._docId(tenantId, invoiceId),
                     createdBy: approvedBy || 'invoicing-engine',
@@ -271,10 +384,13 @@ class InboxInvoiceService {
                 });
             }
 
+            const locations = [...new Set(valid.map((it) => it._loc))];
             txn.set(ref, {
                 status: 'approved',
                 approval: {
-                    branchId,
+                    // Geriye uyum: branchId = ilk konumun deposu; tum konumlar `locations`ta
+                    branchId: locationBranchId(locations[0], tenantId),
+                    locations,
                     approvedBy: approvedBy || '',
                     approvedAt: ts,
                     items: valid.map((it) => ({
@@ -283,6 +399,7 @@ class InboxInvoiceService {
                         quantity: round2(Number(it.quantity)),
                         unit: it.unit || 'adet',
                         lineNumber: it.lineNumber || '',
+                        targetLocation: it._loc,
                     })),
                 },
             }, { merge: true });
@@ -310,6 +427,7 @@ class InboxInvoiceService {
                     inventoryProductId: it.inventoryProductId,
                     inventoryProductName: it.productName || '',
                     unitMultiplier: Number(it.unitMultiplier) > 0 ? Number(it.unitMultiplier) : 1,
+                    targetLocation: it._loc,
                     updatedAt: ts,
                     updatedBy: approvedBy || '',
                 }, { merge: true });
@@ -375,4 +493,4 @@ class InboxInvoiceService {
     }
 }
 
-module.exports = { InboxInvoiceService, InboxInvoiceError };
+module.exports = { InboxInvoiceService, InboxInvoiceError, normalizeLocation, locationBranchId };

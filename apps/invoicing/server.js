@@ -537,20 +537,15 @@ app.post('/invoicing/inbox/:tenantId/sync', requireApiKey, async (req, res) => {
     }
 });
 
-/** incomingInvoices listesi (panel tablo). Bellekte siralanir — composite index gerekmez. */
+/** incomingInvoices listesi (panel tablo) + tedarikci sinifi (stock/service/unclassified). */
 app.get('/invoicing/inbox/:tenantId/list', requireApiKey, async (req, res) => {
     try {
         if (!requireInbox(res)) return;
-        let q = db.collection('incomingInvoices').where('tenantId', '==', req.params.tenantId);
-        if (req.query.status) q = q.where('status', '==', String(req.query.status));
-        const snap = await q.limit(500).get();
-        const items = snap.docs
-            .map((d) => {
-                const { parsed, ...rest } = d.data();
-                return { ...rest, hasLines: !!parsed };
-            })
-            .sort((a, b) => String(b.invoiceCreateDateUtc).localeCompare(String(a.invoiceCreateDateUtc)));
-        res.json({ ok: true, count: items.length, items });
+        const r = await inboxService.listInvoices({
+            tenantId: req.params.tenantId,
+            status: req.query.status ? String(req.query.status) : '',
+        });
+        res.json(r);
     } catch (e) {
         console.error('[invoicing-engine] inbox list error:', e.message);
         res.status(inboxErrorStatus(e)).json({ ok: false, error: e.code || 'internal_error', message: e.message });
