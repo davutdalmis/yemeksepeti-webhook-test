@@ -852,6 +852,94 @@ class ParasutProvider {
         };
     }
 
+    /**
+     * 04.09.2026 — Paraşüt'teki GERÇEK durum: taslak mı, e-İrsaliye olarak resmileşmiş mi, silinmiş mi.
+     * Canlı probe kanıtı (scripts/_parasut_irsaliye_pdf_probe3.js): resmileşen belgede
+     * `legalized_at`, `despatch_no` (BR0…), `uuid` (ETTN), `status='legalized'` dolu; taslakta hepsi null;
+     * Paraşüt panelinden silinen belgede 404. Yemigo bugüne kadar bunların hiçbirini okumuyordu —
+     * panel 8 silinmiş belgeyi "Hazır" gösteriyordu.
+     * @returns {Promise<{found:boolean, deleted:boolean, legalized:boolean, despatchNo:string|null, uuid:string|null, legalizedAt:string|null, eStatus:string|null, eStatusMessage:string|null, issueDate:string|null, shipmentDate:string|null, vehiclePlate:string|null, driverName:string|null, driverTckn:string|null, printedAt:string|null, archived:boolean}>}
+     */
+    async getShipmentDocumentStatus(token, providerShipmentId) {
+        if (!providerShipmentId) throw new InvoiceProviderError('providerShipmentId required', { code: 'SHIPMENT_NO_ID' });
+        let data;
+        try {
+            data = await this._get(token, `/shipment_documents/${providerShipmentId}`);
+        } catch (err) {
+            if (err && err.status === 404) {
+                return { found: false, deleted: true, legalized: false, despatchNo: null, uuid: null, legalizedAt: null, eStatus: null, eStatusMessage: null, issueDate: null, shipmentDate: null, vehiclePlate: null, driverName: null, driverTckn: null, printedAt: null, archived: false };
+            }
+            throw err;
+        }
+        const a = (data && data.data && data.data.attributes) || {};
+        const drivers = Array.isArray(a.drivers_info) ? a.drivers_info : [];
+        return {
+            found: true,
+            deleted: false,
+            legalized: !!a.legalized_at,
+            despatchNo: a.despatch_no || null,
+            uuid: a.uuid || null,
+            legalizedAt: a.legalized_at || null,
+            eStatus: a.status || null,
+            eStatusMessage: a.status_message || null,
+            issueDate: a.issue_date || null,
+            shipmentDate: a.shipment_date || null,
+            vehiclePlate: a.carrier_license_plate || null,
+            driverName: (drivers[0] && drivers[0].full_name) || null,
+            driverTckn: (drivers[0] && drivers[0].tckn) || null,
+            printedAt: a.printed_at || null,
+            archived: a.archived === true,
+        };
+    }
+
+    /**
+     * 04.09.2026 — Resmi e-İrsaliye PDF'i (GİB logolu, QR'lı, ETTN'li; Paraşüt panelinin indirdiğiyle birebir).
+     * GET /shipment_documents/{id}/pdf → `e_document_pdfs` kaynağı, `attributes.url` ~4 saat geçerli imzalı S3
+     * linki (kimliksiz indirilir). Belge henüz resmileşmemişse Paraşüt 204 (gövde yok) döner → SHIPMENT_NOT_LEGALIZED.
+     * `pdfUrl` alanındaki panel adresi (uygulama.parasut.com) yerine bu kullanılır; kullanıcı Paraşüt girişi görmez.
+     * @returns {Promise<{providerShipmentId:string, pdfBase64:string, expiresAt:string|null}>}
+     */
+    async getShipmentDocumentPdf(token, providerShipmentId) {
+        if (!providerShipmentId) throw new InvoiceProviderError('providerShipmentId required', { code: 'SHIPMENT_NO_ID' });
+        await this._acquireSlot();
+        const url = `${this.baseUrl}${this._basePath(`/shipment_documents/${providerShipmentId}/pdf`)}`;
+        let res;
+        try {
+            res = await axios.get(url, {
+                headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+                timeout: this.timeoutMs,
+                validateStatus: (s) => s < 500,
+            });
+        } catch (err) {
+            throw this._wrap(err, 'GET_FAILED');
+        }
+        if (res.status === 404) {
+            throw new InvoiceProviderError(`Paraşüt irsaliyesi bulunamadı (${providerShipmentId})`, { code: 'SHIPMENT_NOT_FOUND', status: 404, retryable: false });
+        }
+        if (res.status === 401 || res.status === 403) {
+            throw new InvoiceProviderError(`Paraşüt PDF yetkisi reddedildi HTTP ${res.status}`, { code: 'GET_FAILED', status: res.status, retryable: false });
+        }
+        const attrs = res.status === 200 && res.data && res.data.data && res.data.data.attributes;
+        const fileUrl = attrs && attrs.url;
+        if (!fileUrl) {
+            throw new InvoiceProviderError('İrsaliye Paraşüt\'te henüz resmileşmedi; e-İrsaliye PDF\'i yok', { code: 'SHIPMENT_NOT_LEGALIZED', status: 409, retryable: false });
+        }
+        let file;
+        try {
+            file = await axios.get(fileUrl, { responseType: 'arraybuffer', timeout: this.timeoutMs, validateStatus: () => true });
+        } catch (err) {
+            throw this._wrap(err, 'GET_FAILED');
+        }
+        if (file.status !== 200) {
+            throw new InvoiceProviderError(`e-İrsaliye PDF indirilemedi HTTP ${file.status}`, { code: 'BAD_RESPONSE', status: 502, retryable: file.status >= 500 });
+        }
+        return {
+            providerShipmentId: String(providerShipmentId),
+            pdfBase64: Buffer.from(file.data || []).toString('base64'),
+            expiresAt: attrs.expires_at || null,
+        };
+    }
+
     async deleteShipmentDocument(token, providerShipmentId) {
         try {
             await this._delete(token, `/shipment_documents/${providerShipmentId}`);

@@ -11,6 +11,7 @@ const UyumsoftProvider = require('./providers/UyumsoftProvider');
 const ParasutInboxProvider = require('./providers/ParasutInboxProvider');
 const { InboxInvoiceService } = require('./lib/InboxInvoiceService');
 const { runCloseCycle, MIN_AGE_HOURS } = require('./lib/ProductionOrderCloser');
+const { ShipmentStatusSync } = require('./lib/ShipmentStatusSync');
 const TokenManager = require('./auth/TokenManager');
 const CredentialVault = require('./secrets/CredentialVault');
 const { InvoiceProviderError } = require('./providers/IInvoiceProvider');
@@ -1018,6 +1019,59 @@ app.post('/invoicing/draft/:id/approve', requireApiKey, async (req, res) => {
 // ---------------- Plan 28++ Shipment (e-irsaliye) endpoint'leri ----------------
 
 // Manual modda yetkili "İrsaliye Oluştur" basinca: Parasut'a shipment_document POST
+// ---------------- Paraşüt gerçek durum + resmi e-İrsaliye PDF (04.09.2026) ----------------
+// Panelin "PDF" düğmesi bugüne kadar `pdfUrl` = uygulama.parasut.com panel adresini açıyordu;
+// Paraşüt hesabı olmayan kullanıcı login sayfasına düşüyordu. Bu uçlar PDF'i sunucuda Paraşüt
+// API'sinden çeker (base64), kullanıcı Paraşüt'ü hiç görmez. Belge resmileşmemişse 409,
+// Paraşüt'te silinmişse 410 döner; her iki durumda da doc.parasutSync güncellenir.
+let shipmentStatusSync = null;
+function getShipmentStatusSync() {
+    if (!shipmentStatusSync && db) {
+        shipmentStatusSync = new ShipmentStatusSync({ db, tokenManager, providerFactory });
+    }
+    return shipmentStatusSync;
+}
+
+/** GET /invoicing/shipment/:id/pdf?tenantId=… → { ok, pdfBase64, despatchNo, fileName, parasutSync } */
+app.get('/invoicing/shipment/:id/pdf', requireApiKey, async (req, res) => {
+    const sync = getShipmentStatusSync();
+    if (!sync) return res.status(503).json({ error: 'firestore_unavailable' });
+    const tenantId = typeof req.query.tenantId === 'string' ? req.query.tenantId : '';
+    if (!tenantId) return res.status(400).json({ error: 'tenant_required', message: 'tenantId zorunlu.' });
+    try {
+        const r = await sync.syncDocument(req.params.id, { tenantId });
+        if (r.skipped === 'not_shipment') return res.status(400).json({ error: 'not_shipment', message: 'Bu belge bir irsaliye değil.' });
+        if (r.skipped === 'no_parasut_document') return res.status(409).json({ error: 'no_parasut_document', message: 'Bu irsaliye henüz Paraşüt\'te oluşturulmadı.' });
+        if (r.sync.deleted) return res.status(410).json({ error: 'deleted_in_parasut', message: 'Bu irsaliye Paraşüt\'te silinmiş; PDF yok.', parasutSync: r.sync });
+        if (!r.sync.legalized) return res.status(409).json({ error: 'not_legalized', message: 'İrsaliye Paraşüt\'te henüz resmileşmedi (e-İrsaliye kesilmedi); PDF yok.', parasutSync: r.sync });
+        const provider = await providerFactory(tenantId);
+        const token = await tokenManager.getValidToken(tenantId);
+        const pdf = await provider.getShipmentDocumentPdf(token, r.parasutShipmentId);
+        const fileName = `e-irsaliye-${(r.sync.despatchNo || r.parasutShipmentId).replace(/[^A-Za-z0-9_-]/g, '')}.pdf`;
+        res.json({ ok: true, documentId: req.params.id, despatchNo: r.sync.despatchNo, fileName, pdfBase64: pdf.pdfBase64, parasutSync: r.sync });
+    } catch (e) {
+        const status = e && (e.status === 404 || e.status === 409 || e.status === 410) ? e.status : (e && e.status >= 500 ? 502 : 500);
+        console.error('[invoicing-engine] shipment pdf error:', req.params.id, e && e.message);
+        res.status(status).json({ ok: false, error: (e && e.code) || 'internal_error', message: e && e.message });
+    }
+});
+
+/** POST /invoicing/shipment/sync { tenantId } → firmanın aktif irsaliyelerinin Paraşüt durumunu parasutSync'e yazar. */
+app.post('/invoicing/shipment/sync', requireApiKey, async (req, res) => {
+    const sync = getShipmentStatusSync();
+    if (!sync) return res.status(503).json({ error: 'firestore_unavailable' });
+    const tenantId = req.body && typeof req.body.tenantId === 'string' ? req.body.tenantId : '';
+    if (!tenantId) return res.status(400).json({ error: 'tenant_required', message: 'tenantId zorunlu.' });
+    try {
+        const r = await sync.syncTenant(tenantId);
+        console.log(`[shipment-sync] ${tenantId}: ${r.scanned} tarandi, ${r.synced} guncellendi (resmi ${r.legalized}, taslak ${r.draft}, silinmis ${r.deleted}), ${r.errors} hata`);
+        res.json({ ok: true, ...r });
+    } catch (e) {
+        console.error('[invoicing-engine] shipment sync error:', e && e.message);
+        res.status(e && e.status === 409 ? 409 : 500).json({ ok: false, error: (e && e.code) || 'internal_error', message: e && e.message });
+    }
+});
+
 app.post('/invoicing/shipment/:id/create', requireApiKey, async (req, res) => {
     if (!shipmentProcessor) {
         return res.status(503).json({ error: 'shipment_processor_unavailable' });
