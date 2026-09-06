@@ -1,6 +1,6 @@
 {
   "name": "yemigo-invoicing-engine",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "YemiGO invoicing engine — Parasut & provider-agnostic e-Invoice/e-Despatch service (Plan 27) + Uyumsoft gelen e-fatura inbox",
   "main": "server.js",
   "scripts": {
