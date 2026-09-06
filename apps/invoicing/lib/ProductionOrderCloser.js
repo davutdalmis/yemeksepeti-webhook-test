@@ -40,8 +40,12 @@ const ORDERS_COLLECTION = 'productionOrders';
 const EVENTS_COLLECTION = 'productionOrderEvents';
 const DOCS_COLLECTION = 'invoiceDocuments';
 
-/** production-domain ile ayni aktif kume. */
-const ACTIVE = ['PENDING', 'APPROVED', 'IN_PROGRESS', 'READY'];
+/**
+ * Kapatilabilir aktif kume. 2026-09-06: SHIPPED eklendi — imalat-web "Sevkiyata cikar"
+ * siparisi SHIPPED yapar; irsaliye onaylandiktan sonra siparis bu durumda kaldigi icin
+ * kapatici onu hic tarayamiyor, siparis ekranda sonsuza dek kaliyordu.
+ */
+const ACTIVE = ['PENDING', 'APPROVED', 'IN_PROGRESS', 'READY', 'SHIPPED'];
 /** Kapanmis siparise dokunulmaz. */
 const TERMINAL = new Set(['DELIVERED', 'CANCELLED']);
 /** Onaydan sonra siparisin ekranda kalacagi asgari sure. Gerekce yukarida. */
@@ -55,6 +59,26 @@ function toMs(v) {
     if (typeof v._seconds === 'number') return v._seconds * 1000;
     const t = Date.parse(v);
     return Number.isFinite(t) ? t : null;
+}
+
+/**
+ * Siparisin irsaliyesini kaynak bagiyla bulur. Birden fazla varsa 'sent' olan tercih edilir
+ * (iptal edilip yeniden acilmis irsaliye durumu).
+ * @returns {{id:string, data:object}|null}
+ */
+async function findShipmentDocByOrder(db, { tenantId, orderId }) {
+    const snap = await db.collection(DOCS_COLLECTION)
+        .where('sourceType', '==', 'productionOrder')
+        .where('sourceId', '==', orderId)
+        .where('documentKind', '==', 'shipment')
+        .limit(5)
+        .get();
+    if (!snap || snap.size === 0) return null;
+    const adaylar = snap.docs
+        .map((x) => ({ id: x.id, data: x.data() || {} }))
+        .filter((x) => x.data.tenantId === tenantId);
+    if (adaylar.length === 0) return null;
+    return adaylar.find((x) => x.data.status === 'sent') || adaylar[0];
 }
 
 /**
@@ -83,6 +107,9 @@ async function closeOrder(db, { orderId, tenantId, documentId, sourceLabel, appr
             closedByShipmentDocumentId: documentId,
             closedByShipmentAt: ts,
         };
+        // Bag production-domain PATCH'inde silinmis olabilir (2026-09-06 oncesi butun
+        // durum gecisleri siliyordu); irsaliye baska yoldan bulunduysa geri yazilir.
+        if (!cur.parasutShipmentDocumentId) patch.parasutShipmentDocumentId = documentId;
         // production-domain stampLifecycle ile ayni: DELIVERED yalniz actualDeliveryDate
         // damgalar ve varsa uzerine YAZMAZ.
         if (!cur.actualDeliveryDate) patch.actualDeliveryDate = ts;
@@ -132,12 +159,23 @@ async function runCloseCycle(db, { now = Date.now(), limit = 300, log = console 
 
     for (const d of snap.docs) {
         const order = d.data() || {};
-        const docId = order.parasutShipmentDocumentId;
-        if (!docId || !order.tenantId) { sonuc.skipped++; continue; }
+        if (!order.tenantId) { sonuc.skipped++; continue; }
         try {
-            const inv = await db.collection(DOCS_COLLECTION).doc(docId).get();
-            if (!inv.exists) { sonuc.skipped++; continue; }
-            const doc = inv.data() || {};
+            let docId = order.parasutShipmentDocumentId;
+            let doc = null;
+            if (docId) {
+                const inv = await db.collection(DOCS_COLLECTION).doc(docId).get();
+                if (inv.exists) doc = inv.data() || {};
+            }
+            if (!doc) {
+                // Siparisteki bag yoksa (production-domain 2026-09-06 oncesi her PATCH'te
+                // siliyordu) irsaliye kaynak bagindan bulunur: sourceType/sourceId/documentKind
+                // uclu esitlik — bilesik index gerektirmez (Firestore esitlikleri birlestirir).
+                const found = await findShipmentDocByOrder(db, { tenantId: order.tenantId, orderId: d.id });
+                if (!found) { sonuc.skipped++; continue; }
+                docId = found.id;
+                doc = found.data;
+            }
             if (doc.tenantId !== order.tenantId) { sonuc.skipped++; continue; }
             if (doc.documentKind !== 'shipment' || doc.status !== 'sent') { sonuc.skipped++; continue; }
 
@@ -166,4 +204,4 @@ async function runCloseCycle(db, { now = Date.now(), limit = 300, log = console 
     return sonuc;
 }
 
-module.exports = { closeOrder, runCloseCycle, MIN_AGE_HOURS, ACTIVE };
+module.exports = { closeOrder, runCloseCycle, findShipmentDocByOrder, MIN_AGE_HOURS, ACTIVE };

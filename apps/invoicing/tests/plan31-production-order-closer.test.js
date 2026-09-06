@@ -27,14 +27,17 @@ function makeDb({ orders = {}, docs = {} } = {}) {
             return {
                 doc(id) { return ref(name, id); },
                 where(field, op, val) {
-                    return {
+                    // Zincirli where destegi (2026-09-06: findShipmentDocByOrder uclu esitlik kullanir)
+                    const filtreler = [[field, op, val]];
+                    const sorgu = {
+                        where(f, o, v) { filtreler.push([f, o, v]); return sorgu; },
                         limit() {
                             return {
                                 async get() {
                                     const docs = [];
                                     for (const [k, v] of store.entries()) {
                                         if (!k.startsWith(name + '/')) continue;
-                                        const ok = op === 'in' ? val.includes(v[field]) : v[field] === val;
+                                        const ok = filtreler.every(([f, o, val2]) => (o === 'in' ? val2.includes(v[f]) : v[f] === val2));
                                         if (ok) docs.push({ id: k.split('/')[1], data: () => v });
                                     }
                                     return { size: docs.length, docs };
@@ -42,6 +45,7 @@ function makeDb({ orders = {}, docs = {} } = {}) {
                             };
                         },
                     };
+                    return sorgu;
                 },
             };
         },
@@ -150,6 +154,58 @@ describe('closeOrder', () => {
 
 describe('runCloseCycle — hangi siparis kapanir', () => {
     const calistir = (db) => runCloseCycle(db, { now: SIMDI, log: sessiz });
+
+    test('SHIPPED (sevkiyata cikarilmis) siparis de KAPANIR (2026-09-06)', async () => {
+        const db = makeDb({ orders: { ORD1: siparis({ status: 'SHIPPED', version: 3 }) }, docs: { D1: irsaliye() } });
+        const r = await calistir(db);
+        expect(r).toMatchObject({ scanned: 1, closed: 1 });
+        const o = db._store.get('productionOrders/ORD1');
+        expect(o.status).toBe('DELIVERED');
+        expect(o.version).toBe(4);
+    });
+
+    test('siparisteki parasutShipmentDocumentId SILINMISSE irsaliye kaynak bagindan bulunur ve geri yazilir', async () => {
+        const db = makeDb({
+            orders: { ORD1: siparis({ status: 'IN_PROGRESS', parasutShipmentDocumentId: undefined }) },
+            docs: { D1: irsaliye({ sourceId: 'ORD1' }) },
+        });
+        delete db._store.get('productionOrders/ORD1').parasutShipmentDocumentId;
+        const r = await calistir(db);
+        expect(r).toMatchObject({ scanned: 1, closed: 1, skipped: 0 });
+        const o = db._store.get('productionOrders/ORD1');
+        expect(o.status).toBe('DELIVERED');
+        expect(o.parasutShipmentDocumentId).toBe('D1');
+        expect(o.closedByShipmentDocumentId).toBe('D1');
+    });
+
+    test('bag yok ve irsaliye de yoksa ATLANIR', async () => {
+        const db = makeDb({ orders: { ORD1: siparis({ status: 'READY' }) } });
+        delete db._store.get('productionOrders/ORD1').parasutShipmentDocumentId;
+        const r = await calistir(db);
+        expect(r).toMatchObject({ scanned: 1, closed: 0, skipped: 1 });
+        expect(db._store.get('productionOrders/ORD1').status).toBe('READY');
+    });
+
+    test('bag yok, irsaliye BASKA firmanin ise ATLANIR', async () => {
+        const db = makeDb({
+            orders: { ORD1: siparis({ status: 'READY' }) },
+            docs: { D1: irsaliye({ tenantId: 'BASKA' }) },
+        });
+        delete db._store.get('productionOrders/ORD1').parasutShipmentDocumentId;
+        const r = await calistir(db);
+        expect(r.closed).toBe(0);
+    });
+
+    test('bag yok, biri iptal biri sent iki irsaliye varsa SENT olan secilir', async () => {
+        const db = makeDb({
+            orders: { ORD1: siparis({ status: 'READY' }) },
+            docs: { D0: irsaliye({ status: 'cancelled' }), D1: irsaliye() },
+        });
+        delete db._store.get('productionOrders/ORD1').parasutShipmentDocumentId;
+        const r = await calistir(db);
+        expect(r.closed).toBe(1);
+        expect(db._store.get('productionOrders/ORD1').closedByShipmentDocumentId).toBe('D1');
+    });
 
     test(`irsaliye onaylanmis ve ${MIN_AGE_HOURS} saatten eski -> KAPANIR`, async () => {
         const db = makeDb({ orders: { ORD1: siparis() }, docs: { D1: irsaliye() } });
