@@ -640,13 +640,20 @@ class ParasutProvider {
             const items = (data && Array.isArray(data.data)) ? data.data : [];
             if (items.length === 0) return { registered: false };
             const first = items[0];
+            const a = first.attributes || {};
+            // 2026-09-06: admin "Yeni Firma" sihirbazı resmî unvanı ve kayıt tarihini de kullanır
+            // (Paraşüt e_invoice_inboxes attributes: vkn, name, e_invoice_address, inbox_type,
+            // address_registered_at, registered_at). Eski alanlar (alias/type) korunur.
             return {
                 registered: true,
-                alias: first.attributes && (first.attributes.email_address || first.attributes.alias),
-                type: first.attributes && first.attributes.address_type,
+                alias: a.e_invoice_address || a.email_address || a.alias || null,
+                type: a.inbox_type || a.address_type || null,
+                name: a.name || null,
+                registeredAt: a.registered_at || a.address_registered_at || null,
             };
         } catch (_e) {
-            return { registered: false };
+            // ApprovalProcessor `!!inbox.registered` bakar; `error` yalnız taxpayer ucu için.
+            return { registered: false, error: true, message: _e && _e.message ? _e.message : 'lookup_failed' };
         }
     }
 

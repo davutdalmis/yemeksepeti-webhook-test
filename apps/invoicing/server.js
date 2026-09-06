@@ -305,6 +305,46 @@ app.post('/invoicing/test-connection', requireApiKey, async (req, res) => {
 
 // ---------------- Tenant settings read (no secrets) ----------------
 
+/**
+ * 2026-09-06 — Mükellef sorgusu (admin "Yeni Firma" sihirbazı, "VKN gerçek mi").
+ * GİB e-fatura kayıtlı kullanıcı listesine Paraşüt `e_invoice_inboxes?filter[vkn]=` ile bakar;
+ * kayıt varsa resmî unvan + e-fatura etiketi + kayıt tarihi döner. Yeni firma henüz sistemde
+ * olmadığı için sorgu, env ile seçilen "ev" firmanın Paraşüt hesabıyla yapılır
+ * (TAXPAYER_LOOKUP_TENANT_ID — Yemigo'nun kendi Paraşüt bağlantısı olan tenant). Çağıran:
+ * admin Cloud Function `taxpayerLookup` (INVOICING_API_KEY ile). Sonuç hiçbir yere yazılmaz.
+ */
+app.get('/invoicing/taxpayer/:taxId', requireApiKey, async (req, res) => {
+    const taxId = String(req.params.taxId || '').replace(/\D/g, '');
+    if (!/^(\d{10}|\d{11})$/.test(taxId)) {
+        return res.status(400).json({ error: 'invalid_tax_id', message: 'VKN 10, TCKN 11 haneli olmalidir.' });
+    }
+    const lookupTenantId = process.env.TAXPAYER_LOOKUP_TENANT_ID || '';
+    if (!lookupTenantId) {
+        return res.status(503).json({ error: 'lookup_not_configured', message: 'TAXPAYER_LOOKUP_TENANT_ID tanimli degil.' });
+    }
+    try {
+        const provider = await providerFactory(lookupTenantId);
+        const token = await tokenManager.getValidToken(lookupTenantId);
+        const r = await provider.checkVknInbox(token, taxId);
+        if (r && r.error) {
+            return res.status(502).json({ error: 'lookup_failed', message: r.message || 'Parasut sorgusu basarisiz.' });
+        }
+        return res.json({
+            taxId,
+            registered: !!r.registered,
+            name: r.name || null,
+            alias: r.alias || null,
+            registeredAt: r.registeredAt || null,
+            inboxType: r.type || null,
+            source: 'parasut:e_invoice_inboxes',
+            checkedAt: new Date().toISOString(),
+        });
+    } catch (e) {
+        console.error('[invoicing-engine] taxpayer lookup error:', e.message);
+        return res.status(502).json({ error: 'lookup_failed', message: e.message });
+    }
+});
+
 app.get('/invoicing/tenants/:tenantId', requireApiKey, async (req, res) => {
     try {
         if (!firebaseInitialized || !db) return res.status(500).json({ error: 'firestore_not_initialized' });
