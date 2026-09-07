@@ -1278,6 +1278,62 @@ function startInboxSyncScheduler() {
 // Acil kapatma: INVOICING_ORDER_CLOSE_DISABLED=true (varsayilan ACIK).
 // Tur araligi:  INVOICING_ORDER_CLOSE_INTERVAL_MIN (varsayilan 60 dk)
 
+// ---------------------------------------------------------------------------
+// Irsaliye Parasut durum senkronu (2026-09-06)
+// Sevkiyatci subede kagit e-Irsaliyenin QR'ini okutunca production-domain belgeyi
+// `parasutSync.uuid` (ETTN) ile bulur. Bu alan yalniz senkron kosunca dolar; panel/imalat
+// ekrani acilmadan gecen gecelerde bos kalmasin diye periyodik tur.
+// Kapatma: INVOICING_SHIPMENT_SYNC_DISABLED=true. Aralik: INVOICING_SHIPMENT_SYNC_INTERVAL_MIN (30).
+// ---------------------------------------------------------------------------
+let shipmentSyncTimer = null;
+let shipmentSyncRunning = false;
+
+async function runShipmentSyncCycle() {
+    if (!db) return;
+    if (shipmentSyncRunning) {
+        console.warn('[shipment-sync] onceki tur hala suruyor, bu tur atlandi');
+        return;
+    }
+    shipmentSyncRunning = true;
+    try {
+        const sync = getShipmentStatusSync();
+        if (!sync) return;
+        const tenants = await db.collection('invoicingCredentials').listDocuments();
+        for (const t of tenants) {
+            try {
+                const r = await sync.syncTenant(t.id);
+                if (r && (r.synced > 0 || r.errors > 0)) {
+                    console.log(`[shipment-sync] ${t.id}: ${r.synced} guncellendi (${r.legalized} resmi, ${r.deleted} silinmis, ${r.draft} taslak), ${r.errors} hata`);
+                }
+            } catch (e) {
+                if (e.code === 'TENANT_SETTINGS_MISSING' || e.code === 'TENANT_DISABLED') continue;
+                console.warn(`[shipment-sync] ${t.id} basarisiz: ${e.code || ''} ${e.message}`);
+            }
+        }
+    } catch (e) {
+        console.error('[shipment-sync] tur hatasi:', e.message);
+    } finally {
+        shipmentSyncRunning = false;
+    }
+}
+
+function startShipmentSyncScheduler() {
+    if (process.env.INVOICING_SHIPMENT_SYNC_DISABLED === 'true') {
+        console.log('[shipment-sync] KAPALI (INVOICING_SHIPMENT_SYNC_DISABLED=true)');
+        return;
+    }
+    if (!firebaseInitialized) {
+        console.warn('[shipment-sync] Firestore hazir degil — zamanlayici baslatilmadi');
+        return;
+    }
+    const minutes = Number(process.env.INVOICING_SHIPMENT_SYNC_INTERVAL_MIN) > 0
+        ? Number(process.env.INVOICING_SHIPMENT_SYNC_INTERVAL_MIN)
+        : 30;
+    console.log(`[shipment-sync] ACIK — her ${minutes} dakikada bir aktif irsaliyelerin Parasut durumu (ETTN/resmi no) tazelenecek`);
+    setTimeout(() => { void runShipmentSyncCycle(); }, 120000).unref();
+    shipmentSyncTimer = setInterval(() => { void runShipmentSyncCycle(); }, minutes * 60 * 1000);
+}
+
 let orderCloseTimer = null;
 let orderCloseRunning = false;
 
@@ -1323,6 +1379,7 @@ async function shutdown() {
     console.log('[invoicing-engine] Graceful shutdown...');
     if (inboxSyncTimer) clearInterval(inboxSyncTimer);
     if (orderCloseTimer) clearInterval(orderCloseTimer);
+    if (shipmentSyncTimer) clearInterval(shipmentSyncTimer);
     if (stockListener) stockListener.stop();
     if (productionOrderListener) productionOrderListener.stop();
     if (invoiceWorker) await invoiceWorker.close().catch(() => {});
@@ -1352,4 +1409,5 @@ app.listen(PORT, () => {
 
     startInboxSyncScheduler();
     startOrderCloseScheduler();
+    startShipmentSyncScheduler();
 });
