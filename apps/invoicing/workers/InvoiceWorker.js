@@ -93,6 +93,14 @@ class InvoiceWorker {
             console.log(`[InvoiceWorker] doc ${documentId} already in status=${doc.status}, skipping`);
             return { skipped: true, reason: doc.status };
         }
+        // 24.09.2026: irsaliye (documentKind='shipment') bu yoldan GECMEZ. Bu worker satis
+        // faturasi + e-arsiv keser; irsaliye ShipmentProcessor (create/finalize) ile resmilesir.
+        // 20.09'da panelden "Belge Kes" ile 6 irsaliye taslagi buraya dustu: her denemede
+        // Parasut'te yeni satis faturasi acildi, e-arsiv e-fatura mukellefi aliciya reddedildi.
+        if (doc.documentKind === 'shipment') {
+            console.warn(`[InvoiceWorker] doc ${documentId} documentKind=shipment — fatura yolu reddedildi`);
+            return { skipped: true, reason: 'shipment_not_invoice' };
+        }
         // Plan 28 Faz 1.1.4: only 'approved' (fresh from approve endpoint)
         // or 'queued' (mid-retry) docs are eligible. Anything else (draft,
         // pending_approval, sending, failed) means owner approval has not

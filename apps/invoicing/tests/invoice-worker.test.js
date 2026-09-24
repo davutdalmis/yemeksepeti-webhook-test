@@ -144,6 +144,24 @@ describe('InvoiceWorker._handler', () => {
         }
     });
 
+    test('irsaliye (documentKind=shipment) fatura yoluna girmez, Parasut cagrilmaz', async () => {
+        const { worker, idempotency, mock, db } = makeWorker();
+        const r = await idempotency.ensureDraft({
+            tenantId: 't1',
+            sourceType: 'productionOrder',
+            sourceId: 'PO-ship-1',
+            documentKind: 'shipment',
+            data: { branchId: 'b1', amount: 100 },
+        });
+        await idempotency.update(r.id, { status: 'queued' });
+        const result = await worker._handler({ id: r.id, data: { documentId: r.id, tenantId: 't1' }, attemptsMade: 0 });
+        expect(result).toEqual({ skipped: true, reason: 'shipment_not_invoice' });
+        expect(mock.calls.upsertContact).toBe(0);
+        expect(mock.calls.createInvoice).toBe(0);
+        const after = await idempotency.getById(r.id);
+        expect(after.status).toBe('queued');
+    });
+
     test('provider failure -> status=failed/queued + audit + rethrow', async () => {
         const mock = new MockInvoiceProvider();
         const { worker, idempotency, db } = makeWorker({ provider: mock });

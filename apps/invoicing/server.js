@@ -1184,6 +1184,13 @@ app.post('/invoicing/draft/:id/send', requireApiKey, async (req, res) => {
         const doc = await idempotency.getById(req.params.id);
         if (!doc) return res.status(404).json({ error: 'not_found' });
         if (doc.status === 'sent') return res.status(409).json({ error: 'already_sent' });
+        // 24.09.2026: irsaliye fatura kuyruguna girmez (bkz. InvoiceWorker).
+        if (doc.documentKind === 'shipment') {
+            return res.status(409).json({
+                error: 'shipment_not_invoice',
+                message: 'Bu belge irsaliye. "Bekleyen Irsaliye" sekmesinden olusturup onaylayin.',
+            });
+        }
 
         await idempotency.update(req.params.id, { status: 'queued' });
         const job = await invoiceQueue.add({
