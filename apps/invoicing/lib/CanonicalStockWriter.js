@@ -17,6 +17,12 @@
 // (kg↔g, lt↔ml — UnitConversion). Çevrilemeyen çift (adet↔g) TAHMİN EDİLMEZ: miktar aynen
 // yazılır, hareket `unitMismatch: true`; sourceQuantity/sourceUnit her zaman saklanır.
 //
+// SİPARİŞ BİRİMİ ÇARPANI (27.09.2026, Davut kararı): şubeler sayılabilir birimle sipariş verir
+// ("adet hamur") ama stok kartı ağırlıktadır (g). Firma bu eşitliği panelde ürün kartına kendisi
+// girer: productionProducts.stockUnitFactor = "1 sipariş birimi kaç stok kartı birimi"
+// (Bafetto Pizza Hamuru: 1 adet = 250 g). Çarpan YALNIZ çevrilemeyen çiftte (adet→g) uygulanır;
+// kg↔g gibi gerçek dönüşümde ve çarpan girilmemişse eski davranış aynen sürer (tahmin yok).
+//
 // ÜRETİLEN ÜRÜN (02.09.2026, Davut kararı): productionProducts.supplyType === 'produced'
 // (Pizza Hamuru, tatlılar, Makarna) STOK DEĞİLDİR. İmalat deposundan TRANSFER_OUT yazılmaz
 // ve satır açılmaz; yerine aktif productionRecipes reçetesi imalat hammaddesinden düşülür
@@ -72,21 +78,28 @@ async function planCanonicalStock(db, { tenantId, branchId, finalItems, orderId,
         }
         return cardUnitCache.get(invId);
     };
-    const addEntry = (list, key, { invId, name, qty, unit, cardUnit }) => {
-        const orderUnit = normalizeUnit(unit, 'adet');
+    const addEntry = (list, key, { invId, name, qty, unit, cardUnit, factor }) => {
+        let orderUnit = normalizeUnit(unit, 'adet');
+        const srcQty = roundQty(qty), srcUnit = orderUnit;
+        const f = Number(factor);
+        if (f > 0 && cardUnit && convertQuantity(qty, orderUnit, cardUnit).mismatch) {
+            qty = roundQty(qty * f);
+            orderUnit = cardUnit;
+        }
         const prev = list instanceof Map ? list.get(key) : list.find((e) => e.invId === key);
         if (prev) {
             const c = convertQuantity(qty, orderUnit, prev.unit);
             prev.qty = roundQty(prev.qty + c.qty);
             prev.converted = prev.converted || c.converted;
             prev.mismatch = prev.mismatch || c.mismatch;
-            if (prev.sourceUnit === orderUnit) prev.sourceQty = roundQty(prev.sourceQty + qty);
+            if (prev.sourceUnit === srcUnit) prev.sourceQty = roundQty(prev.sourceQty + srcQty);
             else { prev.sourceQty = null; prev.sourceUnit = null; } // karışık kaynak birim — iz tutulamaz
             return prev;
         }
         const target = cardUnit || orderUnit;
         const c = convertQuantity(qty, orderUnit, target);
-        const e = { invId, name, qty: c.qty, unit: target, cardUnit, sourceQty: roundQty(qty), sourceUnit: orderUnit, converted: c.converted, mismatch: c.mismatch };
+        const e = { invId, name, qty: c.qty, unit: target, cardUnit, sourceQty: srcQty, sourceUnit: srcUnit, converted: c.converted, mismatch: c.mismatch };
+        if (srcUnit !== orderUnit) e.unitFactor = f;
         if (list instanceof Map) list.set(key, e); else list.push(e);
         return e;
     };
@@ -104,7 +117,7 @@ async function planCanonicalStock(db, { tenantId, branchId, finalItems, orderId,
         const produced = !!(pd && pd.supplyType === 'produced');
         const cardUnit = await cardUnitOf(invId);
 
-        const e = addEntry(entries, invId, { invId, name: it.productName || invId, qty, unit: it.unit, cardUnit });
+        const e = addEntry(entries, invId, { invId, name: it.productName || invId, qty, unit: it.unit, cardUnit, factor: pd && pd.stockUnitFactor });
         e.produced = e.produced || produced;
 
         if (produced) {
@@ -181,6 +194,7 @@ function resolveForRow(e, snap) {
 function movementBase(e, r) {
     const m = { productId: e.invId, productName: e.name, unit: r.unit, sourceQuantity: e.sourceQty, sourceUnit: e.sourceUnit };
     if (r.mismatch) m.unitMismatch = true;
+    if (e.unitFactor) m.unitFactor = e.unitFactor;
     return m;
 }
 
