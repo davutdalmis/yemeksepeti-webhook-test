@@ -125,50 +125,77 @@ describe('CanonicalStockWriter birim davranışı', () => {
         expect(inn.notes).toContain('birim uyuşmazlığı');
     });
 
-    it('sipariş birimi çarpanı: 10 adet hamur, kart g, 1 adet = 250 g → şubeye +2500 g', async () => {
+    // Canlı şekil (27.09.2026): Pizza Hamuru ve Pesto kartı "adet", şube satırları "g", imalat Pesto satırı "adet".
+    it('karşılık: hamur kartı adet, şube satırı g, 1 adet = 250 g → 10 adet şubeye +2500 g', async () => {
         const db = makeDb({
-            'productionProducts/pHamur': { inventoryProductId: 'invHamur', supplyType: 'produced', stockUnitFactor: 250 },
-            'inventoryProducts/invHamur': { unit: 'g' },
+            'productionProducts/pHamur': { inventoryProductId: 'invHamur', supplyType: 'produced', stockUnitFactor: 250, stockUnitFactorUnit: 'g' },
+            'inventoryProducts/invHamur': { unit: 'adet' },
             'branchStocks/B_invHamur': { currentStock: -1000, unit: 'g' },
         });
         const r = await run(db, [{ productId: 'pHamur', productName: 'Pizza Hamuru', unit: 'adet', finalQuantity: 10 }]);
         expect(r.stok('B_invHamur')).toMatchObject({ currentStock: 1500, unit: 'g' });
         const inn = r.moves.find((m) => m.movementType === 'TRANSFER_IN');
-        expect(inn).toMatchObject({ quantity: 2500, unit: 'g', sourceQuantity: 10, sourceUnit: 'adet', unitFactor: 250 });
+        expect(inn).toMatchObject({ quantity: 2500, unit: 'g', sourceQuantity: 10, sourceUnit: 'adet', unitFactor: 250, unitFactorUnit: 'g' });
         expect(inn.unitMismatch).toBeUndefined();
         expect(inn.notes).not.toContain('birim uyuşmazlığı');
+        expect(r.moves.find((m) => m.movementType === 'TRANSFER_OUT')).toBeUndefined(); // üretilen ürün
     });
 
-    it('çarpan gerçek dönüşümde kullanılmaz: kg sipariş, g kart, çarpan 250 → 1 kg = 1000 g', async () => {
+    it('karşılık: pesto (ticari) imalat satırı adet → çıkış adet, şube satırı g → giriş gram', async () => {
         const db = makeDb({
-            'productionProducts/pX': { inventoryProductId: 'invX', stockUnitFactor: 250 },
-            'inventoryProducts/invX': { unit: 'g' },
+            'productionProducts/pPesto': { inventoryProductId: 'invPesto', supplyType: 'trade', stockUnitFactor: 500, stockUnitFactorUnit: 'g' },
+            'inventoryProducts/invPesto': { unit: 'adet' },
+            'branchStocks/imalat_T_invPesto': { currentStock: 77, unit: 'adet' },
+            'branchStocks/B_invPesto': { currentStock: -994.5, unit: 'g' },
         });
-        const r = await run(db, [{ productId: 'pX', productName: 'X', unit: 'kg', finalQuantity: 1 }]);
-        const inn = r.moves.find((m) => m.movementType === 'TRANSFER_IN');
-        expect(inn).toMatchObject({ quantity: 1000, unit: 'g' });
-        expect(inn.unitFactor).toBeUndefined();
+        const r = await run(db, [{ productId: 'pPesto', productName: 'Pesto Sos', unit: 'adet', finalQuantity: 3 }]);
+        expect(r.stok('imalat_T_invPesto')).toMatchObject({ currentStock: 74, unit: 'adet' });
+        expect(r.stok('B_invPesto')).toMatchObject({ currentStock: 505.5, unit: 'g' });
+        const out = r.moves.find((m) => m.movementType === 'TRANSFER_OUT');
+        expect(out).toMatchObject({ quantity: -3, unit: 'adet' });
+        expect(out.unitFactor).toBeUndefined();
     });
 
-    it('çarpan girilmemiş / 0 ise eski davranış: miktar aynen, unitMismatch', async () => {
+    it('karşılık birimi satırdan farklı ağırlıksa çevrilir: 1 adet = 0.25 kg, satır g → 4 adet = 1000 g', async () => {
         const db = makeDb({
-            'productionProducts/pY': { inventoryProductId: 'invY', stockUnitFactor: 0 },
-            'inventoryProducts/invY': { unit: 'g' },
+            'productionProducts/pH': { inventoryProductId: 'invH', supplyType: 'produced', stockUnitFactor: 0.25, stockUnitFactorUnit: 'kg' },
+            'inventoryProducts/invH': { unit: 'adet' },
+            'branchStocks/B_invH': { currentStock: 0, unit: 'g' },
+        });
+        const r = await run(db, [{ productId: 'pH', productName: 'H', unit: 'adet', finalQuantity: 4 }]);
+        expect(r.stok('B_invH')).toMatchObject({ currentStock: 1000, unit: 'g' });
+    });
+
+    it('şubede satır yoksa karşılık varken yeni satır karşılık biriminde (g) açılır', async () => {
+        const db = makeDb({
+            'productionProducts/pN': { inventoryProductId: 'invN', supplyType: 'produced', stockUnitFactor: 250, stockUnitFactorUnit: 'g' },
+            'inventoryProducts/invN': { unit: 'adet' },
+        });
+        const r = await run(db, [{ productId: 'pN', productName: 'N', unit: 'adet', finalQuantity: 2 }]);
+        expect(r.stok('B_invN')).toMatchObject({ currentStock: 500, unit: 'g' });
+    });
+
+    it('karşılık girilmemiş (veya birimi yok) ise eski davranış: miktar aynen, unitMismatch', async () => {
+        const db = makeDb({
+            'productionProducts/pY': { inventoryProductId: 'invY', stockUnitFactor: 250 }, // birim yok → kullanılmaz
+            'inventoryProducts/invY': { unit: 'adet' },
+            'branchStocks/B_invY': { currentStock: 0, unit: 'g' },
         });
         const r = await run(db, [{ productId: 'pY', productName: 'Y', unit: 'adet', finalQuantity: 4 }]);
         const inn = r.moves.find((m) => m.movementType === 'TRANSFER_IN');
         expect(inn).toMatchObject({ quantity: 4, unit: 'g', unitMismatch: true });
     });
 
-    it('ticari kalemde çarpan imalat çıkışına da uygulanır', async () => {
+    it('karşılık gerçek dönüşümü bozmaz: kg sipariş, g satır → 1 kg = 1000 g', async () => {
         const db = makeDb({
-            'productionProducts/pP': { inventoryProductId: 'invP', supplyType: 'trade', stockUnitFactor: 500 },
-            'inventoryProducts/invP': { unit: 'g' },
-            'branchStocks/imalat_T_invP': { currentStock: 5000, unit: 'g' },
+            'productionProducts/pX': { inventoryProductId: 'invX', stockUnitFactor: 250, stockUnitFactorUnit: 'g' },
+            'inventoryProducts/invX': { unit: 'g' },
+            'branchStocks/B_invX': { currentStock: 0, unit: 'g' },
         });
-        const r = await run(db, [{ productId: 'pP', productName: 'Pesto', unit: 'adet', finalQuantity: 3 }]);
-        expect(r.stok('imalat_T_invP')).toMatchObject({ currentStock: 3500 });
-        expect(r.stok('B_invP')).toMatchObject({ currentStock: 1500, unit: 'g' });
+        const r = await run(db, [{ productId: 'pX', productName: 'X', unit: 'kg', finalQuantity: 1 }]);
+        const inn = r.moves.find((m) => m.movementType === 'TRANSFER_IN');
+        expect(inn).toMatchObject({ quantity: 1000, unit: 'g' });
+        expect(inn.unitFactor).toBeUndefined();
     });
 
     it('aynı karta düşen iki kalem farklı birimlerle toplanır (0.5 kg + 250 g = 750 g)', async () => {

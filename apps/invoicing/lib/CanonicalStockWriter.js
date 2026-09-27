@@ -17,11 +17,14 @@
 // (kg↔g, lt↔ml — UnitConversion). Çevrilemeyen çift (adet↔g) TAHMİN EDİLMEZ: miktar aynen
 // yazılır, hareket `unitMismatch: true`; sourceQuantity/sourceUnit her zaman saklanır.
 //
-// SİPARİŞ BİRİMİ ÇARPANI (27.09.2026, Davut kararı): şubeler sayılabilir birimle sipariş verir
-// ("adet hamur") ama stok kartı ağırlıktadır (g). Firma bu eşitliği panelde ürün kartına kendisi
-// girer: productionProducts.stockUnitFactor = "1 sipariş birimi kaç stok kartı birimi"
-// (Bafetto Pizza Hamuru: 1 adet = 250 g). Çarpan YALNIZ çevrilemeyen çiftte (adet→g) uygulanır;
-// kg↔g gibi gerçek dönüşümde ve çarpan girilmemişse eski davranış aynen sürer (tahmin yok).
+// SİPARİŞ BİRİMİ KARŞILIĞI (27.09.2026, Davut kararı): şube sayılabilir birimle sipariş verir
+// ("adet hamur") ama şube stok satırı ağırlıktadır (g; satış reçetesi 150/250 g düşer). Kart birimi
+// de "adet" olabilir (canlı: Pizza Hamuru ve Pesto kartı adet, şube satırları g, imalat Pesto satırı
+// adet). Firma eşitliği panelde ürün kartına kendisi girer:
+//   productionProducts.stockUnitFactor = 250, stockUnitFactorUnit = 'g'  →  1 adet = 250 g
+// Karşılık SATIR düzeyinde, yalnız çevrilemeyen çiftte uygulanır: satır birimi sipariş birimiyle
+// aynıysa (imalat Pesto "adet") sipariş miktarı aynen, satır ağırlıksa miktar × karşılık yazılır.
+// Karşılık girilmemişse eski davranış aynen sürer (tahmin yok).
 //
 // ÜRETİLEN ÜRÜN (02.09.2026, Davut kararı): productionProducts.supplyType === 'produced'
 // (Pizza Hamuru, tatlılar, Makarna) STOK DEĞİLDİR. İmalat deposundan TRANSFER_OUT yazılmaz
@@ -78,28 +81,21 @@ async function planCanonicalStock(db, { tenantId, branchId, finalItems, orderId,
         }
         return cardUnitCache.get(invId);
     };
-    const addEntry = (list, key, { invId, name, qty, unit, cardUnit, factor }) => {
-        let orderUnit = normalizeUnit(unit, 'adet');
-        const srcQty = roundQty(qty), srcUnit = orderUnit;
-        const f = Number(factor);
-        if (f > 0 && cardUnit && convertQuantity(qty, orderUnit, cardUnit).mismatch) {
-            qty = roundQty(qty * f);
-            orderUnit = cardUnit;
-        }
+    const addEntry = (list, key, { invId, name, qty, unit, cardUnit }) => {
+        const orderUnit = normalizeUnit(unit, 'adet');
         const prev = list instanceof Map ? list.get(key) : list.find((e) => e.invId === key);
         if (prev) {
             const c = convertQuantity(qty, orderUnit, prev.unit);
             prev.qty = roundQty(prev.qty + c.qty);
             prev.converted = prev.converted || c.converted;
             prev.mismatch = prev.mismatch || c.mismatch;
-            if (prev.sourceUnit === srcUnit) prev.sourceQty = roundQty(prev.sourceQty + srcQty);
+            if (prev.sourceUnit === orderUnit) prev.sourceQty = roundQty(prev.sourceQty + qty);
             else { prev.sourceQty = null; prev.sourceUnit = null; } // karışık kaynak birim — iz tutulamaz
             return prev;
         }
         const target = cardUnit || orderUnit;
         const c = convertQuantity(qty, orderUnit, target);
-        const e = { invId, name, qty: c.qty, unit: target, cardUnit, sourceQty: srcQty, sourceUnit: srcUnit, converted: c.converted, mismatch: c.mismatch };
-        if (srcUnit !== orderUnit) e.unitFactor = f;
+        const e = { invId, name, qty: c.qty, unit: target, cardUnit, sourceQty: roundQty(qty), sourceUnit: orderUnit, converted: c.converted, mismatch: c.mismatch };
         if (list instanceof Map) list.set(key, e); else list.push(e);
         return e;
     };
@@ -117,8 +113,11 @@ async function planCanonicalStock(db, { tenantId, branchId, finalItems, orderId,
         const produced = !!(pd && pd.supplyType === 'produced');
         const cardUnit = await cardUnitOf(invId);
 
-        const e = addEntry(entries, invId, { invId, name: it.productName || invId, qty, unit: it.unit, cardUnit, factor: pd && pd.stockUnitFactor });
+        const e = addEntry(entries, invId, { invId, name: it.productName || invId, qty, unit: it.unit, cardUnit });
         e.produced = e.produced || produced;
+        const factorQty = Number(pd && pd.stockUnitFactor);
+        const factorUnit = pd && pd.stockUnitFactorUnit ? normalizeUnit(pd.stockUnitFactorUnit, null) : null;
+        if (factorQty > 0 && factorUnit) e.factor = { qty: factorQty, unit: factorUnit };
 
         if (produced) {
             // Reçete düşümü: item.qty / outputQuantity × ingredient.quantity (RecipeStockEngine paritesi)
@@ -183,18 +182,33 @@ function readRowUnit(snap) {
     return d.unit ? normalizeUnit(d.unit, null) : null;
 }
 
-/** Plan kalemini bu satır için hedef birime çevirir: satır birimi > kart birimi > sipariş birimi. */
-function resolveForRow(e, snap) {
+/**
+ * Plan kalemini bu satır için hedef birime çevirir: satır birimi > kart birimi > sipariş birimi.
+ * preferFactorUnit: satır yoksa ve sipariş birimi karşılığı varsa yeni satır karşılık biriminde açılır
+ * (şube girişi — satış reçetesi gram düşer).
+ */
+function resolveForRow(e, snap, { preferFactorUnit = false } = {}) {
     const rowUnit = readRowUnit(snap);
-    const target = rowUnit || e.unit;
+    const f = e.factor;
+    const canUseFactor = !!(f && e.sourceUnit && e.sourceQty != null);
+    const target = rowUnit || (preferFactorUnit && canUseFactor ? f.unit : e.unit);
     const c = convertQuantity(e.qty, e.unit, target);
+    if (canUseFactor && (c.mismatch || e.mismatch)) {
+        if (target === e.sourceUnit) {
+            return { qty: roundQty(e.sourceQty), unit: target, converted: false, mismatch: false };
+        }
+        const viaFactor = convertQuantity(roundQty(e.sourceQty * f.qty), f.unit, target);
+        if (!viaFactor.mismatch) {
+            return { qty: viaFactor.qty, unit: target, converted: true, mismatch: false, factor: f };
+        }
+    }
     return { qty: c.qty, unit: target, converted: e.converted || c.converted, mismatch: e.mismatch || c.mismatch };
 }
 
 function movementBase(e, r) {
     const m = { productId: e.invId, productName: e.name, unit: r.unit, sourceQuantity: e.sourceQty, sourceUnit: e.sourceUnit };
     if (r.mismatch) m.unitMismatch = true;
-    if (e.unitFactor) m.unitFactor = e.unitFactor;
+    if (r.factor) { m.unitFactor = r.factor.qty; m.unitFactorUnit = r.factor.unit; }
     return m;
 }
 
@@ -251,7 +265,7 @@ function writeCanonicalStock(db, txn, plan, snaps, { tenantId, branchId, sourceI
 
         // Hedef şube girişi (ticari + üretilen)
         const inSnap = snaps.inSnaps[i];
-        const inn = resolveForRow(e, inSnap);
+        const inn = resolveForRow(e, inSnap, { preferFactorUnit: true });
         const inCurrent = readStock(inSnap);
         txn.set(plan.inRefs[i], {
             id: `${branchId}_${e.invId}`,
