@@ -12,6 +12,16 @@ const { InvoiceProviderError } = require('./IInvoiceProvider');
 const DEFAULT_BASE_URL = 'https://api.parasut.com';
 const DEFAULT_TIMEOUT_MS = 30000;
 
+/**
+ * v0.4.9 — Bir yazma Parasut'ta BASARILI olduktan sonra gelen hata: TokenManager.withToken
+ * bu hatayi (401 olsa bile) tekrar DENEMEZ; aksi halde ayni metot bastan kosup ikinci
+ * belge acar.
+ */
+function markRetryUnsafe(err) {
+    if (err && typeof err === 'object') err.retryUnsafe = true;
+    return err;
+}
+
 class ParasutProvider {
     /**
      * @param {object} opts
@@ -154,7 +164,8 @@ class ParasutProvider {
                 company: { id: match.id, ...(match.attributes || {}) },
             };
         } catch (err) {
-            return { ok: false, error: err.message, code: err.code };
+            // v0.4.9: status eklendi — cagiran (throwIfUnauthorizedResult) 401'i tokeni yenileyip tekrar dener.
+            return { ok: false, error: err.message, code: err.code, status: (err.response && err.response.status) || null };
         }
     }
 
@@ -335,51 +346,57 @@ class ParasutProvider {
             eArchiveId: null,
         };
 
-        if (documentType === 'e_archive') {
-            // Plan 28++++ Gorev B: internet_sale ctx override (default values geriye uyumlu).
-            const is = internetSale || {};
-            const earchive = await this._post(token, '/e_archives', {
-                data: {
-                    type: 'e_archives',
-                    attributes: {
-                        vat_withholding_code: '',
-                        internet_sale: {
-                            url: is.url || '',
-                            payment_type: is.payment_type || 'KREDIKARTI/BANKAKARTI',
-                            payment_platform: is.payment_platform || 'SISTEM',
-                            payment_date: is.payment_date || issueDate,
+        // v0.4.9: sales_invoice OLUSTU. Buradan sonraki bir 401 withToken tarafindan tekrar
+        // denenirse ikinci fatura acilir -> hata retryUnsafe isaretlenir.
+        try {
+            if (documentType === 'e_archive') {
+                // Plan 28++++ Gorev B: internet_sale ctx override (default values geriye uyumlu).
+                const is = internetSale || {};
+                const earchive = await this._post(token, '/e_archives', {
+                    data: {
+                        type: 'e_archives',
+                        attributes: {
+                            vat_withholding_code: '',
+                            internet_sale: {
+                                url: is.url || '',
+                                payment_type: is.payment_type || 'KREDIKARTI/BANKAKARTI',
+                                payment_platform: is.payment_platform || 'SISTEM',
+                                payment_date: is.payment_date || issueDate,
+                            },
+                        },
+                        relationships: {
+                            sales_invoice: { data: { type: 'sales_invoices', id: created.data.id } },
                         },
                     },
-                    relationships: {
-                        sales_invoice: { data: { type: 'sales_invoices', id: created.data.id } },
-                    },
-                },
-            });
-            // 2026-07-29 DUZELTME — resmi doku (swagger.yaml:377): e-Fatura/e-Arsiv/e-Smm
-            // olusturma SENKRON DEGILDIR. POST /e_archives yaniti 201 "Trackable Job"
-            // olup donen id bir ISLEM TAKIP numarasidir, e-arsiv belgesinin id'si DEGIL.
-            // Eski kod bu id'yi eArchiveId sanip Firestore'a yaziyordu:
-            //   - id 15 dakika sonra olu; belgeye erisim icin kullanilamaz
-            //   - is "error" ile bitse bile biz "sent" yaziyorduk (sessiz basarisizlik)
-            // Dogru akis: isi bekle -> sonra sales_invoice'i ?include=active_e_document
-            // ile cekip GERCEK e-belge id'sini al (resmi doku 3. adim).
-            const respType = earchive && earchive.data && earchive.data.type;
-            const respId = earchive && earchive.data && earchive.data.id;
+                });
+                // 2026-07-29 DUZELTME — resmi doku (swagger.yaml:377): e-Fatura/e-Arsiv/e-Smm
+                // olusturma SENKRON DEGILDIR. POST /e_archives yaniti 201 "Trackable Job"
+                // olup donen id bir ISLEM TAKIP numarasidir, e-arsiv belgesinin id'si DEGIL.
+                // Eski kod bu id'yi eArchiveId sanip Firestore'a yaziyordu:
+                //   - id 15 dakika sonra olu; belgeye erisim icin kullanilamaz
+                //   - is "error" ile bitse bile biz "sent" yaziyorduk (sessiz basarisizlik)
+                // Dogru akis: isi bekle -> sonra sales_invoice'i ?include=active_e_document
+                // ile cekip GERCEK e-belge id'sini al (resmi doku 3. adim).
+                const respType = earchive && earchive.data && earchive.data.type;
+                const respId = earchive && earchive.data && earchive.data.id;
 
-            if (respId && respType === 'trackable_jobs') {
-                result.eArchiveJobId = String(respId);
-                await this.waitForTrackableJob(token, respId);
-                const resolved = await this._resolveActiveEDocument(token, created.data.id);
-                if (resolved) {
-                    result.eArchiveId = resolved.id;
-                    result.eDocType = resolved.type;
-                    if (resolved.pdfUrl) result.pdfUrl = resolved.pdfUrl;
+                if (respId && respType === 'trackable_jobs') {
+                    result.eArchiveJobId = String(respId);
+                    await this.waitForTrackableJob(token, respId);
+                    const resolved = await this._resolveActiveEDocument(token, created.data.id);
+                    if (resolved) {
+                        result.eArchiveId = resolved.id;
+                        result.eDocType = resolved.type;
+                        if (resolved.pdfUrl) result.pdfUrl = resolved.pdfUrl;
+                    }
+                } else if (respId) {
+                    // Savunma dali: bazi ortamlar/mock'lar dogrudan e_archives kaynagi donuyor.
+                    // Gercek Parasut API'sinde bu dal beklenmiyor.
+                    result.eArchiveId = String(respId);
                 }
-            } else if (respId) {
-                // Savunma dali: bazi ortamlar/mock'lar dogrudan e_archives kaynagi donuyor.
-                // Gercek Parasut API'sinde bu dal beklenmiyor.
-                result.eArchiveId = String(respId);
             }
+        } catch (err) {
+            throw markRetryUnsafe(err);
         }
 
         return result;
@@ -606,8 +623,14 @@ class ParasutProvider {
             throw new InvoiceProviderError('Finalize returned no id', { code: 'FINALIZE_NO_ID' });
         }
 
-        // Resmi belge ID'yi cek
-        const fresh = await this._get(token, `/sales_invoices/${providerInvoiceId}?include=active_e_document`);
+        // Resmi belge ID'yi cek. v0.4.9: convert_to_invoice CALISTI; bu GET'teki 401'in
+        // withToken tarafindan tekrarlanmasi convert'u yeniden gonderir -> retryUnsafe.
+        let fresh;
+        try {
+            fresh = await this._get(token, `/sales_invoices/${providerInvoiceId}?include=active_e_document`);
+        } catch (err) {
+            throw markRetryUnsafe(err);
+        }
         let eDocId = null;
         let eDocType = null;
         if (fresh && Array.isArray(fresh.included)) {
@@ -653,7 +676,8 @@ class ParasutProvider {
             };
         } catch (_e) {
             // ApprovalProcessor `!!inbox.registered` bakar; `error` yalnız taxpayer ucu için.
-            return { registered: false, error: true, message: _e && _e.message ? _e.message : 'lookup_failed' };
+            // v0.4.9: status eklendi — 401 ise cagiran token'i yenileyip tekrar dener.
+            return { registered: false, error: true, message: _e && _e.message ? _e.message : 'lookup_failed', status: (_e && _e.status) || null };
         }
     }
 

@@ -25,6 +25,7 @@
 // ==================================================================================
 
 const { validateTransition } = require('../lib/StatusTransitionValidator');
+const { runWithToken } = require('../auth/TokenManager');
 
 /**
  * Firestore Timestamp / ms / Date / null degerlerini guvenle ms'e cevirir.
@@ -468,8 +469,9 @@ class StockTransferListener {
         if (!this.providerFactory || !this.tokenManager) return;
         try {
             const provider = await this.providerFactory(tenantId);
-            const token = await this.tokenManager.getValidToken(tenantId);
-            await provider.cancelDocument(token, parasutInvoiceId, 'source_transfer_cancelled');
+            // v0.4.9: 401'de token zorunlu yenilenip YALNIZ o cagri bir kez tekrarlanir.
+            const withToken = (fn) => runWithToken(this.tokenManager, tenantId, fn);
+            await withToken((token) => provider.cancelDocument(token, parasutInvoiceId, 'source_transfer_cancelled'));
             await this.idempotency.appendAudit(docId, 'parasut_draft_deleted', 'listener', {
                 parasutInvoiceId,
             }).catch(() => {});
@@ -504,7 +506,8 @@ class StockTransferListener {
     async _tryCreateParasutShipment({ tenantId, docId, transferId, transfer }) {
         try {
             const provider = await this.providerFactory(tenantId);
-            const token = await this.tokenManager.getValidToken(tenantId);
+            // v0.4.9: 401'de token zorunlu yenilenip YALNIZ o cagri bir kez tekrarlanir.
+            const withToken = (fn) => runWithToken(this.tokenManager, tenantId, fn);
             const ctx = await this.contextLoader(tenantId, {
                 tenantId,
                 sourceType: 'stockTransfer',
@@ -513,21 +516,21 @@ class StockTransferListener {
             });
 
             // Contact upsert (alici sube)
-            const contact = await provider.upsertContact(token, {
+            const contact = await withToken((token) => provider.upsertContact(token, {
                 ...ctx.branch,
                 id: ctx.branch.id || transfer.destinationBranchId || transfer.targetBranchId,
-            });
+            }));
 
             // Product upsert (kalemleri Parasut'a tani)
             const itemsWithProductIds = [];
             for (const it of (ctx.items || [])) {
                 if (!it.quantity || it.quantity <= 0) continue;
-                const p = await provider.upsertProduct(token, {
+                const p = await withToken((token) => provider.upsertProduct(token, {
                     name: it.productName || it.name,
                     sku: it.productId || it.sku,
                     unit: it.unit,
                     vatRate: it.vatRate,
-                });
+                }));
                 itemsWithProductIds.push({
                     productId: p.productId,
                     name: it.productName || it.name,
@@ -545,7 +548,7 @@ class StockTransferListener {
 
             const shipmentDate = new Date(tsToMs(transfer.shippedAt)).toISOString();
 
-            const shipment = await provider.createShipmentDocument(token, {
+            const shipment = await withToken((token) => provider.createShipmentDocument(token, {
                 contactId: contact.contactId,
                 items: itemsWithProductIds,
                 issueDate: ctx.issueDate,
@@ -556,7 +559,7 @@ class StockTransferListener {
                 city: ctx.branch && ctx.branch.city,
                 district: ctx.branch && ctx.branch.district,
                 inflow: false,
-            });
+            }));
 
             await this.idempotency.update(docId, {
                 parasutShipmentId: shipment.providerShipmentId,
@@ -590,7 +593,8 @@ class StockTransferListener {
     async _tryCreateParasutDraft({ tenantId, docId, transferId, transfer }) {
         try {
             const provider = await this.providerFactory(tenantId);
-            const token = await this.tokenManager.getValidToken(tenantId);
+            // v0.4.9: 401'de token zorunlu yenilenip YALNIZ o cagri bir kez tekrarlanir.
+            const withToken = (fn) => runWithToken(this.tokenManager, tenantId, fn);
             const ctx = await this.contextLoader(tenantId, {
                 tenantId,
                 sourceType: 'stockTransfer',
@@ -599,21 +603,21 @@ class StockTransferListener {
             });
 
             // Contact upsert (alici sube)
-            const contact = await provider.upsertContact(token, {
+            const contact = await withToken((token) => provider.upsertContact(token, {
                 ...ctx.branch,
                 id: ctx.branch.id || transfer.destinationBranchId || transfer.targetBranchId,
-            });
+            }));
 
             // Product upsert (kalemleri Parasut'a tani)
             const itemsWithProductIds = [];
             for (const it of (ctx.items || [])) {
                 if (!it.quantity || it.quantity <= 0) continue;
-                const p = await provider.upsertProduct(token, {
+                const p = await withToken((token) => provider.upsertProduct(token, {
                     name: it.productName || it.name,
                     sku: it.productId || it.sku,
                     unit: it.unit,
                     vatRate: it.vatRate,
-                });
+                }));
                 itemsWithProductIds.push({
                     productId: p.productId,
                     name: it.productName || it.name,
@@ -630,7 +634,7 @@ class StockTransferListener {
                 return;
             }
 
-            const draft = await provider.createDraftInvoice(token, {
+            const draft = await withToken((token) => provider.createDraftInvoice(token, {
                 contactId: contact.contactId,
                 items: itemsWithProductIds,
                 currency: ctx.currency || 'TRL',
@@ -640,7 +644,7 @@ class StockTransferListener {
                 shipmentIncluded: !!ctx.shipmentIncluded,
                 orderNo: transfer.transferNumber || transfer.code,
                 orderDate: ctx.issueDate,
-            });
+            }));
 
             await this.idempotency.update(docId, {
                 parasutInvoiceId: draft.providerInvoiceId,

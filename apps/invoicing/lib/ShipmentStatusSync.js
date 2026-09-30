@@ -24,6 +24,7 @@
 // ==================================================================================
 
 const { Timestamp } = require('firebase-admin/firestore');
+const { runWithToken } = require('../auth/TokenManager');
 
 const ACTIVE_STATUSES = ['draft', 'pending_approval', 'sent'];
 const AUDIT_COLLECTION = 'integrationAuditLogs';
@@ -83,8 +84,9 @@ class ShipmentStatusSync {
             return { docId, parasutShipmentId: null, sync: null, skipped: 'no_parasut_document' };
         }
         const provider = await this.providerFactory(doc.tenantId);
-        const token = await this.tokenManager.getValidToken(doc.tenantId);
-        const status = await provider.getShipmentDocumentStatus(token, doc.parasutShipmentId);
+        // v0.4.9: 401'de token zorunlu yenilenip bir kez tekrar denenir (TokenManager.withToken).
+        const status = await runWithToken(this.tokenManager, doc.tenantId,
+            (token) => provider.getShipmentDocumentStatus(token, doc.parasutShipmentId));
         const now = this.now();
         const sync = { ...status, checkedAt: now };
         const update = { parasutSync: sync, updatedAt: now };

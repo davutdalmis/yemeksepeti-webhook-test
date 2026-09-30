@@ -19,6 +19,7 @@ const { applyMovement, makeEmptyAggregate } = require('./InventoryAggregator');
 const { invoicingStockWritesEnabled } = require('./stockWritesFlag');
 const { canonicalStockEnabled, planCanonicalStock, readCanonicalStock, writeCanonicalStock } = require('./CanonicalStockWriter');
 const { isDeletedInParasut } = require('./ShipmentStatusSync');
+const { runWithToken } = require('../auth/TokenManager');
 
 /**
  * 30.09.2026 (F3 bulgu 6): 20.09'da panel "Belge Kes" irsaliye taslaklarini fatura kuyruguna
@@ -118,25 +119,27 @@ class ShipmentProcessor {
         }
 
         const provider = await this.providerFactory(tenantId);
-        const token = await this.tokenManager.getValidToken(tenantId);
         const ctx = await this.contextLoader(tenantId, doc);
+        // v0.4.9: her Parasut cagrisi runWithToken ile — 401'de token zorunlu yenilenip
+        // YALNIZ o cagri bir kez tekrarlanir.
+        const withToken = (fn) => runWithToken(this.tokenManager, tenantId, fn);
 
         // Contact upsert
-        const contact = await provider.upsertContact(token, {
+        const contact = await withToken((token) => provider.upsertContact(token, {
             ...ctx.branch,
             id: ctx.branch.id || doc.branchId,
-        });
+        }));
 
         // Product upsert
         const itemsWithProductIds = [];
         for (const it of (ctx.items || [])) {
             if (!it.quantity || it.quantity <= 0) continue;
-            const p = await provider.upsertProduct(token, {
+            const p = await withToken((token) => provider.upsertProduct(token, {
                 name: it.productName || it.name,
                 sku: it.productId || it.sku,
                 unit: it.unit,
                 vatRate: it.vatRate,
-            });
+            }));
             itemsWithProductIds.push({
                 productId: p.productId,
                 name: it.productName || it.name,
@@ -163,7 +166,7 @@ class ShipmentProcessor {
                 : tsToMs(doc.shipmentMeta && doc.shipmentMeta.shippedAt);
             const description = buildShipmentDescription(ctx.description, effectiveDetails);
 
-            shipment = await provider.createShipmentDocument(token, {
+            shipment = await withToken((token) => provider.createShipmentDocument(token, {
                 contactId: contact.contactId,
                 items: itemsWithProductIds,
                 issueDate: ctx.issueDate,
@@ -175,7 +178,7 @@ class ShipmentProcessor {
                 // procurement_number kasten gönderilmiyor — Paraşüt otomatik üretir (BR0...).
                 // Yemigo'daki kaynak transfer no Firestore doc.sourceTransferNumber'da kalır.
                 inflow: false,
-            });
+            }));
         } catch (e) {
             await this.idempotency.update(documentId, {
                 lastError: { message: e.message, code: e.code || 'parasut_shipment_failed', ts: Date.now() },
@@ -284,7 +287,7 @@ class ShipmentProcessor {
         // Parasut tarafinda update — sadece parasutShipmentId varsa (yani daha once create edilmisse)
         if (doc.parasutShipmentId) {
             const provider = await this.providerFactory(tenantId);
-            const token = await this.tokenManager.getValidToken(tenantId);
+            const withToken = (fn) => runWithToken(this.tokenManager, tenantId, fn);
             const editsByIdx = new Map(cleanEdits.map((e) => [e.itemIndex, e]));
             const itemsForParasut = (doc.items || [])
                 .map((it) => {
@@ -304,18 +307,18 @@ class ShipmentProcessor {
             // Parasut'a yeni productId'leri tanit
             const itemsWithProductIds = [];
             for (const it of itemsForParasut) {
-                const p = await provider.upsertProduct(token, {
+                const p = await withToken((token) => provider.upsertProduct(token, {
                     name: it.name,
                     sku: it.productId,
                     vatRate: it.vatRate,
-                });
+                }));
                 itemsWithProductIds.push({ ...it, productId: p.productId });
             }
 
             try {
-                await provider.updateShipmentDocument(token, doc.parasutShipmentId, {
+                await withToken((token) => provider.updateShipmentDocument(token, doc.parasutShipmentId, {
                     items: itemsWithProductIds,
-                });
+                }));
             } catch (e) {
                 console.warn(`[ShipmentProcessor] updateShipmentDocument failed: ${e.message}`);
                 // Sessiz: Firestore update'i yine de yap (yetkili tekrar bastirinca duzelir)
@@ -326,7 +329,6 @@ class ShipmentProcessor {
         if (doc.parasutShipmentId && shipmentDetails) {
             try {
                 const provider = await this.providerFactory(tenantId);
-                const token = await this.tokenManager.getValidToken(tenantId);
                 const ctx = await this.contextLoader(tenantId, doc);
                 const description = buildShipmentDescription(ctx.description, shipmentDetails);
                 const formMs = shipmentDetails.shipmentDateTime
@@ -335,10 +337,10 @@ class ShipmentProcessor {
                 const shipmentDateIso = Number.isFinite(formMs)
                     ? new Date(formMs).toISOString()
                     : undefined;
-                await provider.updateShipmentDocument(token, doc.parasutShipmentId, {
+                await runWithToken(this.tokenManager, tenantId, (token) => provider.updateShipmentDocument(token, doc.parasutShipmentId, {
                     description,
                     ...(shipmentDateIso ? { shipmentDate: shipmentDateIso } : {}),
-                });
+                }));
             } catch (e) {
                 console.warn(`[ShipmentProcessor] updateShipmentDocument(meta) failed: ${e.message}`);
             }

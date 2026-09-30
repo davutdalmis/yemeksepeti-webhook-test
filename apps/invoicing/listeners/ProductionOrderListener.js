@@ -28,6 +28,7 @@
 // ==================================================================================
 
 const { validateTransition } = require('../lib/StatusTransitionValidator');
+const { runWithToken } = require('../auth/TokenManager');
 
 /**
  * Sipariş kalemlerinden invoiceDocuments items snapshot'ı üretir.
@@ -329,16 +330,17 @@ class ProductionOrderListener {
         if (doc.parasutShipmentId && this.providerFactory && this.tokenManager) {
             try {
                 const provider = await this.providerFactory(order.tenantId);
-                const token = await this.tokenManager.getValidToken(order.tenantId);
+                // v0.4.9: 401'de token zorunlu yenilenip YALNIZ o cagri bir kez tekrarlanir.
+                const withToken = (fn) => runWithToken(this.tokenManager, order.tenantId, fn);
                 const itemsWithProductIds = [];
                 for (const it of newItems) {
                     if (!it.originalQuantity || it.originalQuantity <= 0) continue;
-                    const p = await provider.upsertProduct(token, {
+                    const p = await withToken((token) => provider.upsertProduct(token, {
                         name: it.productName,
                         sku: it.productId,
                         unit: it.unit,
                         vatRate: it.vatRate,
-                    });
+                    }));
                     itemsWithProductIds.push({
                         productId: p.productId,
                         name: it.productName,
@@ -347,9 +349,9 @@ class ProductionOrderListener {
                         vatRate: it.vatRate,
                     });
                 }
-                await provider.updateShipmentDocument(token, doc.parasutShipmentId, {
+                await withToken((token) => provider.updateShipmentDocument(token, doc.parasutShipmentId, {
                     items: itemsWithProductIds,
-                });
+                }));
                 await this.idempotency.appendAudit(docId, 'parasut_shipment_items_updated', 'listener', {
                     items: itemsWithProductIds.length,
                 }).catch(() => {});
@@ -429,8 +431,9 @@ class ProductionOrderListener {
             if (doc.parasutShipmentId && tenantId && this.providerFactory && this.tokenManager) {
                 try {
                     const provider = await this.providerFactory(tenantId);
-                    const token = await this.tokenManager.getValidToken(tenantId);
-                    await provider.deleteShipmentDocument(token, doc.parasutShipmentId);
+                    // v0.4.9: 401'de token zorunlu yenilenip YALNIZ o cagri bir kez tekrarlanir.
+                    const withToken = (fn) => runWithToken(this.tokenManager, tenantId, fn);
+                    await withToken((token) => provider.deleteShipmentDocument(token, doc.parasutShipmentId));
                     await this.idempotency.appendAudit(docId, 'parasut_shipment_deleted', 'listener', {
                         parasutShipmentId: doc.parasutShipmentId,
                     }).catch(() => {});
@@ -491,7 +494,8 @@ class ProductionOrderListener {
     async _tryCreateParasutShipment({ tenantId, docId, orderId, order }) {
         try {
             const provider = await this.providerFactory(tenantId);
-            const token = await this.tokenManager.getValidToken(tenantId);
+            // v0.4.9: 401'de token zorunlu yenilenip YALNIZ o cagri bir kez tekrarlanir.
+            const withToken = (fn) => runWithToken(this.tokenManager, tenantId, fn);
             const ctx = await this.contextLoader(tenantId, {
                 tenantId,
                 sourceType: 'productionOrder',
@@ -499,20 +503,20 @@ class ProductionOrderListener {
                 branchId: order.branchId,
             });
 
-            const contact = await provider.upsertContact(token, {
+            const contact = await withToken((token) => provider.upsertContact(token, {
                 ...ctx.branch,
                 id: ctx.branch.id || order.branchId,
-            });
+            }));
 
             const itemsWithProductIds = [];
             for (const it of (ctx.items || [])) {
                 if (!it.quantity || it.quantity <= 0) continue;
-                const p = await provider.upsertProduct(token, {
+                const p = await withToken((token) => provider.upsertProduct(token, {
                     name: it.productName || it.name,
                     sku: it.productId || it.sku,
                     unit: it.unit,
                     vatRate: it.vatRate,
-                });
+                }));
                 itemsWithProductIds.push({
                     productId: p.productId,
                     name: it.productName || it.name,
@@ -528,7 +532,7 @@ class ProductionOrderListener {
                 return;
             }
 
-            const shipment = await provider.createShipmentDocument(token, {
+            const shipment = await withToken((token) => provider.createShipmentDocument(token, {
                 contactId: contact.contactId,
                 items: itemsWithProductIds,
                 issueDate: ctx.issueDate,
@@ -537,7 +541,7 @@ class ProductionOrderListener {
                 city: ctx.branch && ctx.branch.city,
                 district: ctx.branch && ctx.branch.district,
                 inflow: false,
-            });
+            }));
 
             await this.idempotency.update(docId, {
                 parasutShipmentId: shipment.providerShipmentId,

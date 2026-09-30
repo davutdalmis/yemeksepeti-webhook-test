@@ -13,6 +13,7 @@ const { InboxInvoiceService } = require('./lib/InboxInvoiceService');
 const { runCloseCycle, MIN_AGE_HOURS } = require('./lib/ProductionOrderCloser');
 const { ShipmentStatusSync } = require('./lib/ShipmentStatusSync');
 const TokenManager = require('./auth/TokenManager');
+const { throwIfUnauthorizedResult } = TokenManager;
 const CredentialVault = require('./secrets/CredentialVault');
 const { InvoiceProviderError } = require('./providers/IInvoiceProvider');
 const { IdempotencyService } = require('./lib/IdempotencyService');
@@ -279,8 +280,11 @@ app.post('/invoicing/test-connection', requireApiKey, async (req, res) => {
         if (!tenantId) return res.status(400).json({ error: 'missing_tenantId' });
 
         const provider = await providerFactory(tenantId);
-        const token = await tokenManager.getValidToken(tenantId);
-        const ping = await provider.ping(token);
+        // v0.4.9: ping hatayi yutup {ok:false,status} doner; 401 ise firlatilir ki withToken
+        // token'i zorunlu yenileyip bir kez tekrar denesin. Ikinci 401'de eski sonuc doner.
+        const ping = await tokenManager.withToken(tenantId, async (token) =>
+            throwIfUnauthorizedResult(await provider.ping(token)))
+            .catch((e) => { if (e && e.result) return e.result; throw e; });
 
         if (ping.ok) {
             await persistConnectionStatus(tenantId, {
@@ -329,8 +333,9 @@ app.get('/invoicing/taxpayer/:taxId', requireApiKey, async (req, res) => {
     }
     try {
         const provider = await providerFactory(lookupTenantId);
-        const token = await tokenManager.getValidToken(lookupTenantId);
-        const r = await provider.checkVknInbox(token, taxId);
+        const r = await tokenManager.withToken(lookupTenantId, async (token) =>
+            throwIfUnauthorizedResult(await provider.checkVknInbox(token, taxId)))
+            .catch((e) => { if (e && e.result) return e.result; throw e; });
         if (r && r.error) {
             return res.status(502).json({ error: 'lookup_failed', message: r.message || 'Parasut sorgusu basarisiz.' });
         }
@@ -375,8 +380,7 @@ app.get('/invoicing/parasut/:tenantId/contacts/persons', requireApiKey, async (r
         if (!tenantId) return res.status(400).json({ error: 'missing_tenantId' });
 
         const provider = await providerFactory(tenantId);
-        const token = await tokenManager.getValidToken(tenantId);
-        const contacts = await provider.listPersonContacts(token, { limit: 200 });
+        const contacts = await tokenManager.withToken(tenantId, (token) => provider.listPersonContacts(token, { limit: 200 }));
         res.json({ ok: true, count: contacts.length, contacts });
     } catch (e) {
         console.error('[invoicing-engine] persons contacts error:', e.message);
@@ -452,6 +456,13 @@ async function inboxProviderFactory(tenantId) {
             throw err;
         }
         const d = vault.decryptFields(settings, PARASUT_ENCRYPTED_FIELDS, tenantId);
+        // v0.4.9: firma basina TEK token kaynagi. Inbox eskiden her ornekte KENDI password
+        // grant'ini aliyordu (ayni kullanici/uygulama); 30.09 log zaman cizelgesi bu grant'larin
+        // TokenManager'daki token'i gecersiz kilmis olabilecegini dusunduruyor (kesin degil).
+        // Artik token TokenManager'dan alinir, 401'de TokenManager.refreshToken'a gidilir.
+        // Istisna: ozel baseUrl (sandbox vb.) — TokenManager'in providerFactory'si baseUrl
+        // gecirmez (varsayilan api.parasut.com), o token baska sunucuda gecmez; eski yol kalir.
+        const customBase = settings.baseUrl && settings.baseUrl !== 'https://api.parasut.com';
         return new ParasutInboxProvider({
             clientId: d.clientId,
             clientSecret: d.clientSecret,
@@ -459,6 +470,8 @@ async function inboxProviderFactory(tenantId) {
             password: d.password,
             companyId: settings.companyId,
             baseUrl: settings.baseUrl || undefined,
+            tokenManager: customBase ? undefined : tokenManager,
+            tenantId,
         });
     }
 
@@ -1085,8 +1098,7 @@ app.get('/invoicing/shipment/:id/pdf', requireApiKey, async (req, res) => {
         if (r.sync.deleted) return res.status(410).json({ error: 'deleted_in_parasut', message: 'Bu irsaliye Paraşüt\'te silinmiş; PDF yok.', parasutSync: r.sync });
         if (!r.sync.legalized) return res.status(409).json({ error: 'not_legalized', message: 'İrsaliye Paraşüt\'te henüz resmileşmedi (e-İrsaliye kesilmedi); PDF yok.', parasutSync: r.sync });
         const provider = await providerFactory(tenantId);
-        const token = await tokenManager.getValidToken(tenantId);
-        const pdf = await provider.getShipmentDocumentPdf(token, r.parasutShipmentId);
+        const pdf = await tokenManager.withToken(tenantId, (token) => provider.getShipmentDocumentPdf(token, r.parasutShipmentId));
         const fileName = `e-irsaliye-${(r.sync.despatchNo || r.parasutShipmentId).replace(/[^A-Za-z0-9_-]/g, '')}.pdf`;
         res.json({ ok: true, documentId: req.params.id, despatchNo: r.sync.despatchNo, fileName, pdfBase64: pdf.pdfBase64, parasutSync: r.sync });
     } catch (e) {

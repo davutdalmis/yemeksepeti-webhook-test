@@ -15,6 +15,7 @@
 // ==================================================================================
 
 const { validateTransition } = require('./StatusTransitionValidator');
+const { runWithToken, throwIfUnauthorizedResult } = require('../auth/TokenManager');
 const { applyMovement, makeEmptyAggregate } = require('./InventoryAggregator');
 const { invoicingStockWritesEnabled } = require('./stockWritesFlag');
 const { canonicalStockEnabled, planCanonicalStock, readCanonicalStock, writeCanonicalStock } = require('./CanonicalStockWriter');
@@ -200,7 +201,10 @@ class ApprovalProcessor {
         const useExistingDraft = !!doc.parasutInvoiceId;
 
         try {
-            const token = await this.tokenManager.getValidToken(tenantId);
+            // v0.4.9: her Parasut cagrisi runWithToken ile — 401'de token zorunlu yenilenip
+            // YALNIZ o cagri bir kez tekrarlanir. createInvoice/finalizeInvoice yazma
+            // basarili olduktan sonraki 401'i retryUnsafe isaretler (cift belge yok).
+            const withToken = (fn) => runWithToken(this.tokenManager, tenantId, fn);
 
             if (useExistingDraft) {
                 // YOL A — Plan 28+ iki asamali: mevcut taslagi guncelle + resmilestir
@@ -208,16 +212,16 @@ class ApprovalProcessor {
                 if (Array.isArray(items4Parasut) && items4Parasut.length > 0) {
                     const itemsWithProductIds = [];
                     for (const it of items4Parasut) {
-                        const p = await provider.upsertProduct(token, it);
+                        const p = await withToken((token) => provider.upsertProduct(token, it));
                         itemsWithProductIds.push({ ...it, productId: p.productId });
                     }
                     try {
-                        await provider.updateDraftInvoice(token, doc.parasutInvoiceId, {
+                        await withToken((token) => provider.updateDraftInvoice(token, doc.parasutInvoiceId, {
                             items: itemsWithProductIds,
                             description: ctx.description,
                             shipmentIncluded: !!ctx.shipmentIncluded,
                             issueDate: ctx.issueDate,
-                        });
+                        }));
                     } catch (updErr) {
                         console.warn(`[ApprovalProcessor] updateDraftInvoice fail (devam): ${updErr.message}`);
                     }
@@ -236,7 +240,11 @@ class ApprovalProcessor {
                     const branchVkn = ctx.branch && (ctx.branch.taxNumber || ctx.branch.vatNumber || ctx.branch.vergiNo);
                     if (branchVkn) {
                         try {
-                            const inbox = await provider.checkVknInbox(token, branchVkn);
+                            // checkVknInbox hatayi yutup {error, status} doner; 401 ise
+                            // firlatilir ki withToken yenileyip tekrar denesin. Ikinci 401
+                            // asagidaki catch'e duser (eskisi gibi B2C fallback).
+                            const inbox = await withToken(async (token) =>
+                                throwIfUnauthorizedResult(await provider.checkVknInbox(token, branchVkn)));
                             vknRegistered = !!inbox.registered;
                             resolvedDocType = vknRegistered ? 'e_invoice' : 'e_archive';
                         } catch (vknErr) {
@@ -259,7 +267,7 @@ class ApprovalProcessor {
                     }
                 }
 
-                const finalize = await provider.finalizeInvoice(token, doc.parasutInvoiceId, finalizeOpts);
+                const finalize = await withToken((token) => provider.finalizeInvoice(token, doc.parasutInvoiceId, finalizeOpts));
                 parasutResult = {
                     providerInvoiceId: finalize.providerInvoiceId,
                     contactId: doc.parasutContactId || null,
@@ -279,13 +287,13 @@ class ApprovalProcessor {
                 if (ctx.documentType === 'auto' || ctx.documentType === 'e_invoice') {
                     console.warn(`[ApprovalProcessor] YOL B fallback: ctx.documentType='${ctx.documentType}' istendi ama createInvoice sadece e_archive destekler. e_archive kullanildi.`);
                 }
-                const contact = await provider.upsertContact(token, ctx.branch);
+                const contact = await withToken((token) => provider.upsertContact(token, ctx.branch));
                 const itemsWithProductIds = [];
                 for (const it of items4Parasut) {
-                    const p = await provider.upsertProduct(token, it);
+                    const p = await withToken((token) => provider.upsertProduct(token, it));
                     itemsWithProductIds.push({ ...it, productId: p.productId });
                 }
-                parasutResult = await provider.createInvoice(token, {
+                parasutResult = await withToken((token) => provider.createInvoice(token, {
                     contactId: contact.contactId,
                     items: itemsWithProductIds.length > 0 ? itemsWithProductIds : [{
                         // Tum kalemler 0 ise (rare): tek bir "amount" kaydi olusturma
@@ -305,7 +313,7 @@ class ApprovalProcessor {
                     invoiceSeries: ctx.invoiceSeriesPrefix,
                     // Gorev B: internet_sale ctx override (yoksa ParasutProvider default kullanir)
                     internetSale: ctx.internetSale || undefined,
-                });
+                }));
                 parasutResult.contactId = contact.contactId;
                 parasutResult.documentTypeResolved = 'e_archive';
             }
@@ -504,11 +512,11 @@ class ApprovalProcessor {
             // Compensating action: try to delete the Paraşüt invoice we just created
             console.error(`[ApprovalProcessor] Firestore transaction failed for doc ${documentId}:`, txnErr.message);
             try {
-                const token = await this.tokenManager.getValidToken(tenantId);
                 if (parasutResult.providerInvoiceId) {
                     // NOT: provider kontratında silme metodu cancelDocument'tır (IInvoiceProvider).
                     // deleteInvoice diye bir metot yok — eski isim TypeError ile telafiyi her seferinde bozuyordu.
-                    await provider.cancelDocument(token, parasutResult.providerInvoiceId, 'firestore_txn_failed_compensation');
+                    await runWithToken(this.tokenManager, tenantId,
+                        (token) => provider.cancelDocument(token, parasutResult.providerInvoiceId, 'firestore_txn_failed_compensation'));
                     console.warn(`[ApprovalProcessor] compensating: deleted Paraşüt invoice ${parasutResult.providerInvoiceId}`);
                 }
             } catch (compErr) {

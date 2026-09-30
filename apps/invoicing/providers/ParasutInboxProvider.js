@@ -125,6 +125,10 @@ class ParasutInboxProvider {
      * @param {number} [opts.timeoutMs]
      * @param {number} [opts.minRequestIntervalMs]
      * @param {object} [opts.logger]
+     * @param {object} [opts.tokenManager]  v0.4.9: verilirse token TokenManager'dan alinir
+     *        (firma basina tek token kaynagi); 401'de TokenManager.refreshToken cagrilir.
+     *        Verilmezse eski davranis: ornek icinde kendi password grant'i.
+     * @param {string} [opts.tenantId]      tokenManager ile zorunlu
      */
     constructor(opts = {}) {
         for (const k of ['clientId', 'clientSecret', 'username', 'password', 'companyId']) {
@@ -153,6 +157,12 @@ class ParasutInboxProvider {
             timeoutMs: opts.timeoutMs,
         });
 
+        this.tokenManager = opts.tokenManager || null;
+        this.tenantId = opts.tenantId || null;
+        if (this.tokenManager && !this.tenantId) {
+            throw new Error('ParasutInboxProvider: tokenManager icin tenantId zorunlu');
+        }
+
         this._token = null;
         this._tokenExpiresAt = 0;
         this._tokenPromise = null;
@@ -161,8 +171,18 @@ class ParasutInboxProvider {
 
     // -------------------- AUTH --------------------
 
-    /** Token'i ornek icinde onbellekler; es zamanli cagrilar tek istek uretir. */
-    async _getToken(force = false) {
+    /**
+     * Token'i ornek icinde onbellekler; es zamanli cagrilar tek istek uretir.
+     * v0.4.9: tokenManager varsa kaynak odur (Redis cache + kilit + tekillestirilmis zorunlu
+     * yenileme). force=true -> refreshToken({ rejectedToken }) — baska bir cagri zaten
+     * yenilediyse yeni password grant acilmaz.
+     */
+    async _getToken(force = false, rejectedToken = null) {
+        if (this.tokenManager) {
+            return force
+                ? this.tokenManager.refreshToken(this.tenantId, { rejectedToken })
+                : this.tokenManager.getValidToken(this.tenantId);
+        }
         if (!force && this._token && Date.now() < this._tokenExpiresAt) return this._token;
         if (!this._tokenPromise) {
             this._tokenPromise = (async () => {
@@ -234,7 +254,7 @@ class ParasutInboxProvider {
             }
             if (res.status === 401 && !reauthed) {
                 reauthed = true;
-                await this._getToken(true);
+                await this._getToken(true, token);
                 continue;
             }
             if (res.status >= 400) {

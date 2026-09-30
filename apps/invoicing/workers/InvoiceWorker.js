@@ -14,6 +14,7 @@
 // ==================================================================================
 
 const { classify } = require('../lib/RetryPolicy');
+const { runWithToken } = require('../auth/TokenManager');
 
 const DEFAULT_CONCURRENCY = 5;
 
@@ -128,9 +129,11 @@ class InvoiceWorker {
         // 4. Token + provider
         const provider = await this.providerFactory(tenantId);
 
-        let token;
+        // Token burada bir kez alinir (alinamazsa TOKEN_FAIL ile 'failed'). Asagidaki her
+        // Parasut cagrisi v0.4.9'dan beri runWithToken ile: 401'de token zorunlu yenilenip
+        // YALNIZ o cagri bir kez tekrarlanir (cache'ten okuma, ek grant yok).
         try {
-            token = await this.tokenManager.getValidToken(tenantId);
+            await this.tokenManager.getValidToken(tenantId);
         } catch (e) {
             await this.idempotency.update(documentId, {
                 status: 'failed',
@@ -140,22 +143,24 @@ class InvoiceWorker {
             throw e;
         }
 
+        const withToken = (fn) => runWithToken(this.tokenManager, tenantId, fn);
+
         try {
             // 5. Load business context (branch + items + settings)
             const ctx = await this.tenantSettingsLoader(tenantId, doc);
 
             // 6. upsertContact
-            const contact = await provider.upsertContact(token, ctx.branch);
+            const contact = await withToken((token) => provider.upsertContact(token, ctx.branch));
 
             // 7. upsertProducts (per item)
             const itemsWithProductIds = [];
             for (const it of ctx.items) {
-                const p = await provider.upsertProduct(token, it);
+                const p = await withToken((token) => provider.upsertProduct(token, it));
                 itemsWithProductIds.push({ ...it, productId: p.productId });
             }
 
             // 8. createInvoice
-            const invoice = await provider.createInvoice(token, {
+            const invoice = await withToken((token) => provider.createInvoice(token, {
                 contactId: contact.contactId,
                 items: itemsWithProductIds,
                 currency: ctx.currency || 'TRL',
@@ -164,7 +169,7 @@ class InvoiceWorker {
                 documentType: ctx.documentType || 'sales_invoice',
                 description: ctx.description,
                 invoiceSeries: ctx.invoiceSeriesPrefix,
-            });
+            }));
 
             // 9. Update Firestore doc -> sent
             await this.idempotency.update(documentId, {
