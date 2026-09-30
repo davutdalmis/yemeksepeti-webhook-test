@@ -18,6 +18,16 @@
 const { applyMovement, makeEmptyAggregate } = require('./InventoryAggregator');
 const { invoicingStockWritesEnabled } = require('./stockWritesFlag');
 const { canonicalStockEnabled, planCanonicalStock, readCanonicalStock, writeCanonicalStock } = require('./CanonicalStockWriter');
+const { isDeletedInParasut } = require('./ShipmentStatusSync');
+
+/**
+ * 30.09.2026 (F3 bulgu 6): 20.09'da panel "Belge Kes" irsaliye taslaklarini fatura kuyruguna
+ * yolladi (/invoicing/draft/:id/send status='queued' yazdi); InvoiceWorker basarisiz olunca belge
+ * 'queued'/'failed'da kaldi. Panel bekleyen listesi yalniz draft/pending_approval gosterdigi icin
+ * bu belgeler hicbir ekranda gorunmuyor. Parasut irsaliyesi hic acilmamis (parasutShipmentId yok)
+ * ve stok hareket etmemis olanlar GUVENLE 'draft'a dondurulebilir.
+ */
+const STUCK_SHIPMENT_STATUSES = new Set(['queued', 'failed']);
 
 /** Firestore Timestamp / ms / Date / null -> ms (Plan 28++ Date(Invalid) bugfix) */
 function tsToMs(v) {
@@ -90,7 +100,10 @@ class ShipmentProcessor {
         if (doc.documentKind !== 'shipment') {
             throw new ShipmentError('document is not a shipment', { status: 409, code: 'not_shipment_kind' });
         }
-        if (doc.parasutShipmentId) {
+        // 30.09.2026: Parasut'te SILINMIS belge (onaylanmamis) yeniden kesilebilir — eski kimlik
+        // artik yok, "already" donmek belgeyi kalici olarak kilitlerdi.
+        const recreateAfterDelete = !!doc.parasutShipmentId && isDeletedInParasut(doc) && doc.status !== 'sent';
+        if (doc.parasutShipmentId && !recreateAfterDelete) {
             // Idempotent: zaten Parasut'a yazilmis
             return {
                 ok: true,
@@ -189,11 +202,24 @@ class ShipmentProcessor {
             parasutShipmentCreatedAt: Date.now(),
             // Plan 28+++ — sevkiyat detaylarini kalici sakla
             ...(shipmentDetails ? { shipmentDetails } : {}),
+            // Silinmis belge yeniden kesildi: eski senkron sonucu ve bayrak yeni kimlige ait degil.
+            ...(recreateAfterDelete ? {
+                deletedInParasut: false,
+                deletedInParasutClearedAt: Date.now(),
+                parasutSync: null,
+                previousParasutShipmentId: String(doc.parasutShipmentId),
+            } : {}),
         });
-        await this.idempotency.appendAudit(documentId, 'parasut_shipment_created', requestedBy || 'panel', {
-            parasutShipmentId: shipment.providerShipmentId,
-            items: itemsWithProductIds.length,
-        });
+        await this.idempotency.appendAudit(
+            documentId,
+            recreateAfterDelete ? 'parasut_shipment_recreated_after_delete' : 'parasut_shipment_created',
+            requestedBy || 'panel',
+            {
+                parasutShipmentId: shipment.providerShipmentId,
+                items: itemsWithProductIds.length,
+                ...(recreateAfterDelete ? { previousParasutShipmentId: String(doc.parasutShipmentId) } : {}),
+            },
+        );
 
         return {
             ok: true,
@@ -365,6 +391,15 @@ class ShipmentProcessor {
         }
         if (!doc.parasutShipmentId) {
             throw new ShipmentError('shipment not yet created on Parasut', { status: 409, code: 'no_parasut_shipment' });
+        }
+        // 30.09.2026 (F3 bulgu 5): Parasut'te silinmis belge onaylanmaz — yasal irsaliye yokken stok
+        // hareket ettirilmez. Once "Irsaliye Olustur" ile yeniden kesilmeli.
+        if (isDeletedInParasut(doc)) {
+            throw new ShipmentError('shipment document deleted on Parasut', {
+                status: 409,
+                code: 'parasut_document_deleted',
+                payload: { parasutShipmentId: String(doc.parasutShipmentId) },
+            });
         }
 
         const ctx = await this.contextLoader(tenantId, doc);
@@ -577,6 +612,63 @@ class ShipmentProcessor {
             fireQuantityTotal: fireTotal,
         };
     }
+
+    /**
+     * 30.09.2026 (F3 bulgu 6) — fatura kuyrugunda takili kalmis irsaliyeyi ('queued' / 'failed')
+     * normal akisa ('draft') geri dondurur; panelde "Irsaliye Olustur -> Onayla" yolu acilir.
+     * GUVENLIK: yalniz Parasut irsaliyesi hic acilmamis (parasutShipmentId yok), onaylanmamis,
+     * stok hareket etmemis belge. Fatura yolundan kalma parasutInvoiceId/invoiceNumber varsa
+     * DOKUNULMAZ (409) — Parasut'teki satis faturasi elle kontrol edilmeli.
+     * dryRun: hicbir sey yazmadan ne yapilacagini doner.
+     */
+    async resetStuckToDraft(documentId, body = {}) {
+        const { tenantId, requestedBy, dryRun = false } = body;
+        if (!tenantId) throw new ShipmentError('missing tenantId', { status: 400, code: 'missing_tenantId' });
+
+        const doc = await this.idempotency.getById(documentId);
+        if (!doc) throw new ShipmentError('document not found', { status: 404, code: 'not_found' });
+        if (doc.tenantId !== tenantId) throw new ShipmentError('tenant mismatch', { status: 403, code: 'tenant_mismatch' });
+        if (doc.documentKind !== 'shipment') {
+            throw new ShipmentError('not a shipment document', { status: 409, code: 'not_shipment_kind' });
+        }
+        if (!STUCK_SHIPMENT_STATUSES.has(doc.status)) {
+            throw new ShipmentError(`not stuck (status: ${doc.status})`, { status: 409, code: 'invalid_status' });
+        }
+        if (doc.parasutShipmentId) {
+            throw new ShipmentError('parasut shipment already exists', { status: 409, code: 'has_parasut_shipment' });
+        }
+        if (doc.parasutInvoiceId || doc.invoiceNumber) {
+            throw new ShipmentError('invoice path left a Parasut invoice id; manual review required', {
+                status: 409,
+                code: 'has_parasut_invoice',
+                payload: { parasutInvoiceId: doc.parasutInvoiceId || null, invoiceNumber: doc.invoiceNumber || null },
+            });
+        }
+        if (doc.approvalMeta && doc.approvalMeta.approvedAt) {
+            throw new ShipmentError('document already approved', { status: 409, code: 'already_approved' });
+        }
+
+        const plan = {
+            documentId,
+            fromStatus: doc.status,
+            toStatus: 'draft',
+            sourceTransferNumber: doc.sourceTransferNumber || null,
+            lastError: doc.lastError ? String(doc.lastError.message || '').slice(0, 200) : null,
+        };
+        if (dryRun) return { ok: true, dryRun: true, ...plan };
+
+        await this.idempotency.update(documentId, {
+            status: 'draft',
+            lastError: null,
+            stuckResetAt: Date.now(),
+            stuckResetFromStatus: doc.status,
+        });
+        await this.idempotency.appendAudit(documentId, 'shipment_reset_to_draft', requestedBy || 'panel', {
+            fromStatus: doc.status,
+            lastError: plan.lastError,
+        });
+        return { ok: true, ...plan };
+    }
 }
 
-module.exports = { ShipmentProcessor, ShipmentError };
+module.exports = { ShipmentProcessor, ShipmentError, STUCK_SHIPMENT_STATUSES };

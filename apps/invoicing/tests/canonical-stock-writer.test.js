@@ -100,7 +100,7 @@ describe('CanonicalStockWriter birim davranışı', () => {
         });
         const r = await run(db, [{ productId: 'p1', productName: 'X', unit: 'g', finalQuantity: 500 }]);
         expect(r.stok('B_p1')).toMatchObject({ currentStock: 2.5, unit: 'kg' });
-        expect(r.stok('imalat_T_p1')).toMatchObject({ currentStock: 0, unit: 'g' });
+        expect(r.stok('imalat_T_p1')).toMatchObject({ currentStock: -500, unit: 'g' });
     });
 
     it('yeni satır kart birimiyle açılır; kart yoksa sipariş birimiyle', async () => {
@@ -213,7 +213,7 @@ describe('CanonicalStockWriter birim davranışı', () => {
         expect(r.moves.find((m) => m.movementType === 'TRANSFER_IN').sourceQuantity).toBeNull();
     });
 
-    it('imalat 0 altına inmez (clamp korunur) ve sıfır/negatif adetler atlanır', async () => {
+    it('imalat EKSİYE İNER (kelepçe yok, bakiye = defter; 30.09 Davut) ve sıfır/negatif adetler atlanır', async () => {
         const db = makeDb({
             'inventoryProducts/p': { unit: 'kg' },
             'branchStocks/imalat_T_p': { currentStock: 1, unit: 'kg' },
@@ -223,8 +223,20 @@ describe('CanonicalStockWriter birim davranışı', () => {
             { productId: 'q', productName: 'Q', unit: 'kg', finalQuantity: 0 },
         ]);
         expect(r.n).toBe(1);
-        expect(r.stok('imalat_T_p')).toMatchObject({ currentStock: 0, unit: 'kg' });
+        expect(r.stok('imalat_T_p')).toMatchObject({ currentStock: -4, unit: 'kg' });
         expect(r.stok('B_p')).toMatchObject({ currentStock: 5, unit: 'kg' });
+        // bakiye = önceki + hareketler toplamı (defter ile birebir)
+        const out = r.moves.find((m) => m.movementType === 'TRANSFER_OUT');
+        expect(1 + out.quantity).toBe(r.stok('imalat_T_p').currentStock);
+    });
+
+    it('zaten eksi olan imalat satırı sıfıra çekilmez, hareket kadar daha eksiye iner', async () => {
+        const db = makeDb({
+            'inventoryProducts/p': { unit: 'g' },
+            'branchStocks/imalat_T_p': { currentStock: -250, unit: 'g' },
+        });
+        const r = await run(db, [{ productId: 'p', productName: 'P', unit: 'kg', finalQuantity: 1.5 }]);
+        expect(r.stok('imalat_T_p')).toMatchObject({ currentStock: -1750, unit: 'g' });
     });
 
     it('flag kapalıyken plan null döner', async () => {
@@ -307,10 +319,12 @@ describe('Üretilen ürün (supplyType=produced): imalattan stok değil reçete 
         expect(r.plan.entries[0].noRecipe).toBe(true);
     });
 
-    it('hammadde imalatta 0 altına inmez (clamp), sipariş kimliği yoksa marker yazılmaz ama düşüm yapılır', async () => {
+    it('hammadde imalatta eksiye iner (kelepçe yok), sipariş kimliği yoksa marker yazılmaz ama düşüm yapılır', async () => {
         const s = seed(); s['branchStocks/imalat_T_invUn'] = { currentStock: 10, unit: 'kg' };
         const r = await run(makeDb(s), [{ productId: 'pHamur', productName: 'Pizza Hamuru', unit: 'adet', finalQuantity: 300 }]);
-        expect(r.stok('imalat_T_invUn')).toMatchObject({ currentStock: 0 });
+        expect(r.stok('imalat_T_invUn')).toMatchObject({ currentStock: -40, unit: 'kg' });
+        const unMove = r.moves.find((m) => m.movementType === 'PRODUCTION_CONSUME' && m.productId === 'invUn');
+        expect(10 + unMove.quantity).toBe(-40);
         expect(r.moves.filter((m) => m.movementType === 'PRODUCTION_CONSUME')).toHaveLength(2);
         expect(r.plan.consumeEntries).toHaveLength(2);
         expect(r.plan.markerRef).toBeNull();

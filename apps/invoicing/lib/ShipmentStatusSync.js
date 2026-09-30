@@ -12,9 +12,28 @@
 // legalizedAt, eStatus, vehiclePlate, driverName, ... }. Panel rozetleri ve PDF düğmesi bu
 // alana bakar. Yemigo `status` alanına DOKUNMAZ — Yemigo'nun iç akışı (stok, onay) ayrıdır;
 // Paraşüt'te silinmiş belgenin ne yapılacağı yetkilinin kararıdır.
+//
+// SİLİNMİŞ BELGE İŞARETİ (30.09.2026, F3 bulgu 5): Paraşüt'te silinmiş 11 irsaliye Yemigo'da
+// "sent" kaldı, stoğu hareket etmişti ve kapatıcı bağlı siparişi DELIVERED yaptı; `parasutSync.deleted`
+// hiçbir yerde okunmuyordu. Artık silinmiş bulunan belgeye üst düzey bayrak yazılır:
+//   deletedInParasut: true, deletedInParasutAt, deletedInParasutWhileStatus, deletedInParasutStockMoved
+// ve ilk tespitte `integrationAuditLogs` kaydı (type SHIPMENT_DELETED_IN_PARASUT) düşülür.
+// Kapatıcı (ProductionOrderCloser) ve onay (ShipmentProcessor.finalize) bu bayrağa bakar.
+// STOK OTOMATİK TERS ÇEVRİLMEZ (Davut kararı bekliyor) — ters kayıt için ayrı betik gerekir.
+// `status` alanına yine dokunulmaz.
 // ==================================================================================
 
+const { Timestamp } = require('firebase-admin/firestore');
+
 const ACTIVE_STATUSES = ['draft', 'pending_approval', 'sent'];
+const AUDIT_COLLECTION = 'integrationAuditLogs';
+const AUDIT_TYPE_DELETED = 'SHIPMENT_DELETED_IN_PARASUT';
+
+/** Belge Paraşüt'te silinmiş olarak işaretli mi (üst bayrak ya da son senkron sonucu). */
+function isDeletedInParasut(doc) {
+    if (!doc) return false;
+    return doc.deletedInParasut === true || !!(doc.parasutSync && doc.parasutSync.deleted === true);
+}
 
 class ShipmentStatusSync {
     /**
@@ -66,12 +85,57 @@ class ShipmentStatusSync {
         const provider = await this.providerFactory(doc.tenantId);
         const token = await this.tokenManager.getValidToken(doc.tenantId);
         const status = await provider.getShipmentDocumentStatus(token, doc.parasutShipmentId);
-        const sync = { ...status, checkedAt: this.now() };
-        const update = { parasutSync: sync, updatedAt: this.now() };
+        const now = this.now();
+        const sync = { ...status, checkedAt: now };
+        const update = { parasutSync: sync, updatedAt: now };
         // Resmi numara gelince ekranların kullandığı alanı da doldur (önceden hep null kalıyordu).
         if (status.despatchNo && !doc.parasutShipmentNumber) update.parasutShipmentNumber = status.despatchNo;
+
+        const newlyDeleted = status.deleted === true && doc.deletedInParasut !== true;
+        if (newlyDeleted) {
+            update.deletedInParasut = true;
+            update.deletedInParasutAt = now;
+            update.deletedInParasutWhileStatus = doc.status || null;
+            // 'sent' = onay stoğu hareket ettirmiş (TRANSFER_OUT/IN + reçete düşümü yazılmış)
+            update.deletedInParasutStockMoved = doc.status === 'sent';
+        } else if (status.deleted !== true && status.found === true && doc.deletedInParasut === true) {
+            // Aynı belgede Paraşüt kimliği değişmiş (yeniden kesilmiş) ve bulunuyor → bayrak kalkar.
+            update.deletedInParasut = false;
+            update.deletedInParasutClearedAt = now;
+        }
         await ref.update(update);
-        return { docId, parasutShipmentId: String(doc.parasutShipmentId), sync };
+
+        if (newlyDeleted) await this._auditDeleted(docId, doc, now);
+        return { docId, parasutShipmentId: String(doc.parasutShipmentId), sync, newlyDeleted };
+    }
+
+    /** İlk tespitte bir kez yazılır; yazılamazsa senkron durmaz (bayrak zaten belgede). */
+    async _auditDeleted(docId, doc, now) {
+        const stockMoved = doc.status === 'sent';
+        try {
+            await this.db.collection(AUDIT_COLLECTION).add({
+                type: AUDIT_TYPE_DELETED,
+                collection: 'invoiceDocuments',
+                docId,
+                tenantId: doc.tenantId || null,
+                branchId: doc.branchId || null,
+                yemigoStatus: doc.status || null,
+                parasutShipmentId: doc.parasutShipmentId ? String(doc.parasutShipmentId) : null,
+                sourceType: doc.sourceType || null,
+                sourceId: doc.sourceId || null,
+                sourceTransferNumber: doc.sourceTransferNumber || null,
+                stockMoved,
+                action: stockMoved
+                    ? 'Stok onayda hareket etti; otomatik ters kayit YAPILMADI (karar yetkilide, ters kayit icin betik gerekir). Bagli siparis kapatilmaz.'
+                    : 'Onaylanmamis belge; stok hareketi yok. Onay engellendi.',
+                source: 'invoicing-engine/ShipmentStatusSync',
+                createdAt: Timestamp.fromMillis(now),
+                createdAtMs: now,
+            });
+        } catch (e) {
+            this.log.warn('[shipment-sync] ' + docId + ' silinmis belge audit yazilamadi: ' + (e && e.message));
+        }
+        this.log.warn('[shipment-sync] ' + docId + ' (' + (doc.sourceTransferNumber || '-') + ') PARASUTTA SILINMIS, Yemigo durumu=' + doc.status + (stockMoved ? ' — stok hareket etmis, ters kayit yok' : ''));
     }
 
     /**
@@ -87,7 +151,7 @@ class ShipmentStatusSync {
             .where('status', 'in', ACTIVE_STATUSES)
             .limit(limit)
             .get();
-        const out = { scanned: snap.size, synced: 0, skipped: 0, errors: 0, legalized: 0, deleted: 0, draft: 0, items: [] };
+        const out = { scanned: snap.size, synced: 0, skipped: 0, errors: 0, legalized: 0, deleted: 0, newlyDeleted: 0, draft: 0, items: [] };
         for (const d of snap.docs) {
             const data = d.data() || {};
             if (!data.parasutShipmentId) { out.skipped++; continue; }
@@ -95,7 +159,7 @@ class ShipmentStatusSync {
                 const r = await this.syncDocument(d.id, { tenantId });
                 if (!r.sync) { out.skipped++; continue; }
                 out.synced++;
-                if (r.sync.deleted) out.deleted++;
+                if (r.sync.deleted) { out.deleted++; if (r.newlyDeleted) out.newlyDeleted++; }
                 else if (r.sync.legalized) out.legalized++;
                 else out.draft++;
                 out.items.push({
@@ -103,6 +167,7 @@ class ShipmentStatusSync {
                     sourceTransferNumber: data.sourceTransferNumber || null,
                     yemigoStatus: data.status,
                     deleted: r.sync.deleted,
+                    stockMoved: !!(r.sync.deleted && data.status === 'sent'),
                     legalized: r.sync.legalized,
                     despatchNo: r.sync.despatchNo,
                 });
@@ -115,4 +180,4 @@ class ShipmentStatusSync {
     }
 }
 
-module.exports = { ShipmentStatusSync, ACTIVE_STATUSES };
+module.exports = { ShipmentStatusSync, ACTIVE_STATUSES, isDeletedInParasut, AUDIT_TYPE_DELETED };

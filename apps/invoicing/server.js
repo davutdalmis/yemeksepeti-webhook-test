@@ -1176,6 +1176,30 @@ app.post('/invoicing/shipment/:id/finalize', requireApiKey, async (req, res) => 
     }
 });
 
+// 30.09.2026 (F3 bulgu 6): fatura kuyrugunda takili irsaliyeyi ('queued'/'failed', Parasut
+// irsaliyesi hic acilmamis) 'draft'a dondurur. body: { tenantId, requestedBy, dryRun }.
+// Kosullar ShipmentProcessor.resetStuckToDraft'ta; uymayan belge 409 ile reddedilir.
+app.post('/invoicing/shipment/:id/reset-to-draft', requireApiKey, async (req, res) => {
+    if (!shipmentProcessor) {
+        return res.status(503).json({ error: 'shipment_processor_unavailable' });
+    }
+    try {
+        if (!(await requireMasterFlagForDoc(req, res))) return;
+        const result = await shipmentProcessor.resetStuckToDraft(req.params.id, req.body || {});
+        res.json(result);
+    } catch (e) {
+        if (e instanceof ShipmentError) {
+            return res.status(e.status || 500).json({
+                error: e.code || 'shipment_error',
+                message: e.message,
+                ...(e.payload ? { payload: e.payload } : {}),
+            });
+        }
+        console.error('[invoicing-engine] shipment reset-to-draft unexpected error:', e);
+        res.status(500).json({ error: 'internal_error', message: e.message });
+    }
+});
+
 // Manual mode: panel triggers send for an existing draft
 app.post('/invoicing/draft/:id/send', requireApiKey, async (req, res) => {
     if (!invoiceQueue || !idempotency) return res.status(503).json({ error: 'lifecycle_unavailable' });
@@ -1310,7 +1334,7 @@ async function runShipmentSyncCycle() {
             try {
                 const r = await sync.syncTenant(t.id);
                 if (r && (r.synced > 0 || r.errors > 0)) {
-                    console.log(`[shipment-sync] ${t.id}: ${r.synced} guncellendi (${r.legalized} resmi, ${r.deleted} silinmis, ${r.draft} taslak), ${r.errors} hata`);
+                    console.log(`[shipment-sync] ${t.id}: ${r.synced} guncellendi (${r.legalized} resmi, ${r.deleted} silinmis [${r.newlyDeleted || 0} yeni], ${r.draft} taslak), ${r.errors} hata`);
                 }
             } catch (e) {
                 if (e.code === 'TENANT_SETTINGS_MISSING' || e.code === 'TENANT_DISABLED') continue;
@@ -1353,8 +1377,8 @@ async function runOrderCloseCycle() {
     orderCloseRunning = true;
     try {
         const r = await runCloseCycle(db, { now: Date.now() });
-        if (r.closed > 0 || r.errors > 0) {
-            console.log(`[order-close] tur bitti: ${r.closed} kapandi, ${r.skipped} atlandi, ${r.errors} hata (${r.scanned} aktif siparis tarandi)`);
+        if (r.closed > 0 || r.errors > 0 || r.skippedDeletedInParasut > 0) {
+            console.log(`[order-close] tur bitti: ${r.closed} kapandi, ${r.skipped} atlandi (${r.skippedDeletedInParasut || 0} Parasutta silinmis irsaliye), ${r.errors} hata (${r.scanned} aktif siparis tarandi)`);
         }
     } catch (e) {
         console.error('[order-close] tur hatasi:', e.message);

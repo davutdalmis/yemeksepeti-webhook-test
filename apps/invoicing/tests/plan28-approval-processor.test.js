@@ -206,10 +206,10 @@ describe('ApprovalProcessor — Plan 30 KANONİK STOK (default: legacy off, cano
             const branchP1 = (await db.collection('branchStocks').doc('b-kadikoy_inv_p1').get()).data();
             expect(imalatP1.currentStock).toBe(105); // 200 - 95
             expect(branchP1.currentStock).toBe(95);
-            // p2 eşlemesiz → kendi id'siyle; imalat stoğu yoktu → clamp 0
+            // p2 eşlemesiz → kendi id'siyle; imalat stoğu yoktu → eksiye iner (kelepçe yok, 30.09 Davut: bakiye = defter)
             const imalatP2 = (await db.collection('branchStocks').doc('imalat_bafetto-001_p2').get()).data();
             const branchP2 = (await db.collection('branchStocks').doc('b-kadikoy_p2').get()).data();
-            expect(imalatP2.currentStock).toBe(0);
+            expect(imalatP2.currentStock).toBe(-5);
             expect(branchP2.currentStock).toBe(5);
 
             // stockMovements: 2 kalem × (OUT+IN) = 4

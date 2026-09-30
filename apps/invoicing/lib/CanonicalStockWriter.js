@@ -37,6 +37,11 @@
 // İdempotency: yazımlar finalize/approve transaction'ının İÇİNDE yapılır ve o
 // transaction "status zaten sent ise çık" guard'ı ile korunur → tek sefer çalışır.
 //
+// EKSİ STOK (30.09.2026, Davut kararı): bakiye = defter. Düşümde `Math.max(0, …)` kelepçesi
+// KALDIRILDI — satır = önceki + hareket, eksiye inebilir. Kelepçe hareketi (−5) yazıp bakiyeyi
+// 0'da tutuyordu; defter ile bakiye ayrışıyor, fazla çıkış görünmez oluyordu (F2 §4: imalat
+// satırlarında negatif 0, sıfır 21). Şube satırları WPF satış düşümüyle zaten eksiye iniyor.
+//
 // Acil kapatma: INVOICING_CANONICAL_STOCK_DISABLED=true (default: AÇIK).
 
 const { Timestamp } = require('firebase-admin/firestore');
@@ -218,7 +223,7 @@ function mismatchNote(e, r) {
 
 /**
  * Transaction içinde YAZIM (okumalar readCanonicalStock ile yapılmış olmalı):
- *  - ticari kalem: imalat −qty (0'da clamp), şube +qty, TRANSFER_OUT + TRANSFER_IN
+ *  - ticari kalem: imalat −qty (kelepçe YOK, eksiye inebilir), şube +qty, TRANSFER_OUT + TRANSFER_IN
  *  - üretilen kalem: şube +qty (TRANSFER_IN); imalatta reçete hammaddesi −qty (PRODUCTION_CONSUME),
  *    productionStockLog işareti varsa (Üretime Al düşmüş) reçete düşümü atlanır.
  * Dönüş: yazılan kalem sayısı (entries.length).
@@ -241,7 +246,7 @@ function writeCanonicalStock(db, txn, plan, snaps, { tenantId, branchId, sourceI
                 branchId: plan.imalatBranchId,
                 productId: e.invId,
                 productName: e.name,
-                currentStock: Math.max(0, roundQty(outCurrent - out.qty)),
+                currentStock: roundQty(outCurrent - out.qty),
                 unit: out.unit,
                 lastUpdated: ts,
             }, { merge: true });
@@ -309,7 +314,7 @@ function writeCanonicalStock(db, txn, plan, snaps, { tenantId, branchId, sourceI
                 branchId: plan.imalatBranchId,
                 productId: e.invId,
                 productName: e.name,
-                currentStock: Math.max(0, roundQty(current - r.qty)),
+                currentStock: roundQty(current - r.qty),
                 unit: r.unit,
                 lastUpdated: ts,
             }, { merge: true });

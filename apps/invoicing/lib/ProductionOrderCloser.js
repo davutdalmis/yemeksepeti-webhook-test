@@ -35,6 +35,7 @@
 
 const { Timestamp } = require('firebase-admin/firestore');
 const crypto = require('crypto');
+const { isDeletedInParasut } = require('./ShipmentStatusSync');
 
 const ORDERS_COLLECTION = 'productionOrders';
 const EVENTS_COLLECTION = 'productionOrderEvents';
@@ -78,7 +79,10 @@ async function findShipmentDocByOrder(db, { tenantId, orderId }) {
         .map((x) => ({ id: x.id, data: x.data() || {} }))
         .filter((x) => x.data.tenantId === tenantId);
     if (adaylar.length === 0) return null;
-    return adaylar.find((x) => x.data.status === 'sent') || adaylar[0];
+    // Paraşüt'te silinmiş 'sent' belge "mal çıktı" kanıtı değildir (30.09.2026) — canlı olan tercih edilir.
+    return adaylar.find((x) => x.data.status === 'sent' && !isDeletedInParasut(x.data))
+        || adaylar.find((x) => x.data.status === 'sent')
+        || adaylar[0];
 }
 
 /**
@@ -146,11 +150,13 @@ async function closeOrder(db, { orderId, tenantId, documentId, sourceLabel, appr
  * GUVENLIK SINIRI: yalniz `status='sent'` irsaliyeler sayilir. Taslak / onay bekleyen /
  * IPTAL edilmis irsaliye siparisi KAPATMAZ — iptal edilmis irsaliye "mal cikti" demek
  * degildir (26.08'de 58 taslak toplu iptal edilmisti, onlar kapanmamali).
+ * 2026-09-30 (F3 bulgu 5): Parasut'te SILINMIS irsaliye (deletedInParasut / parasutSync.deleted)
+ * de siparisi KAPATMAZ — yasal belge yok; karar yetkilinin (yeniden kes ya da ters kayit).
  *
- * @returns {{scanned:number, closed:number, skipped:number, errors:number}}
+ * @returns {{scanned:number, closed:number, skipped:number, skippedDeletedInParasut:number, errors:number}}
  */
 async function runCloseCycle(db, { now = Date.now(), limit = 300, log = console } = {}) {
-    const sonuc = { scanned: 0, closed: 0, skipped: 0, errors: 0 };
+    const sonuc = { scanned: 0, closed: 0, skipped: 0, skippedDeletedInParasut: 0, errors: 0 };
     const esik = now - MIN_AGE_HOURS * 60 * 60 * 1000;
 
     // Tek alan sorgusu (`in`) — bilesik index gerektirmez.
@@ -178,6 +184,12 @@ async function runCloseCycle(db, { now = Date.now(), limit = 300, log = console 
             }
             if (doc.tenantId !== order.tenantId) { sonuc.skipped++; continue; }
             if (doc.documentKind !== 'shipment' || doc.status !== 'sent') { sonuc.skipped++; continue; }
+            if (isDeletedInParasut(doc)) {
+                sonuc.skipped++;
+                sonuc.skippedDeletedInParasut++;
+                log.warn('[order-close] ' + (order.orderNumber || d.id) + ' kapatilmadi: irsaliye ' + docId + ' Parasutta silinmis');
+                continue;
+            }
 
             const onay = toMs(doc.approvalMeta && doc.approvalMeta.approvedAt);
             if (onay === null || onay > esik) { sonuc.skipped++; continue; }
