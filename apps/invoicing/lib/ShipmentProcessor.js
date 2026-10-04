@@ -17,7 +17,7 @@
 
 const { applyMovement, makeEmptyAggregate } = require('./InventoryAggregator');
 const { invoicingStockWritesEnabled } = require('./stockWritesFlag');
-const { canonicalStockEnabled, planCanonicalStock, readCanonicalStock, writeCanonicalStock } = require('./CanonicalStockWriter');
+const { canonicalStockEnabled, planCanonicalStock, collectStockWarnings, readCanonicalStock, writeCanonicalStock } = require('./CanonicalStockWriter');
 const { isDeletedInParasut } = require('./ShipmentStatusSync');
 const { runWithToken } = require('../auth/TokenManager');
 
@@ -450,6 +450,7 @@ class ShipmentProcessor {
             orderNumber: doc.sourceTransferNumber || null,
         });
 
+        let stockWarnings = [];
         try {
             await this.db.runTransaction(async (txn) => {
                 const docRef = this.db.collection('invoiceDocuments').doc(documentId);
@@ -466,8 +467,10 @@ class ShipmentProcessor {
                 const freshData = fresh.data();
                 if (freshData.status === 'sent') return; // race idempotent
 
+                stockWarnings = collectStockWarnings(stockPlan, stockSnaps);
                 txn.update(docRef, {
                     status: 'sent',
+                    stockWarnings,
                     'approvalMeta.approvedAt': ts,
                     'approvalMeta.approvedBy': approvedBy,
                     'approvalMeta.fireQuantityTotal': fireTotal,
@@ -601,9 +604,14 @@ class ShipmentProcessor {
             });
         }
 
+        if (stockWarnings.length) {
+            console.warn(`[ShipmentProcessor] finalize ${documentId}: ${stockWarnings.length} stok uyarisi`,
+                stockWarnings.map((w) => `${w.code}:${w.productName}`).join(' | '));
+        }
         await this.idempotency.appendAudit(documentId, 'shipment_finalized', approvedBy, {
             parasutShipmentId: doc.parasutShipmentId,
             fireTotal,
+            stockWarningCount: stockWarnings.length,
         });
 
         return {
@@ -612,6 +620,7 @@ class ShipmentProcessor {
             parasutShipmentNumber: doc.parasutShipmentNumber,
             pdfUrl: doc.pdfUrl,
             fireQuantityTotal: fireTotal,
+            stockWarnings,
         };
     }
 

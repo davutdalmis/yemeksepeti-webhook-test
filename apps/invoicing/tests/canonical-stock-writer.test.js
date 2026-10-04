@@ -6,7 +6,7 @@ jest.mock('firebase-admin/firestore', () => ({
     Timestamp: { fromMillis: (ms) => ({ _ms: ms }) },
 }));
 
-const { planCanonicalStock, readCanonicalStock, writeCanonicalStock } = require('../lib/CanonicalStockWriter');
+const { planCanonicalStock, readCanonicalStock, writeCanonicalStock, collectStockWarnings } = require('../lib/CanonicalStockWriter');
 const { convertQuantity, normalizeUnit } = require('../lib/UnitConversion');
 
 function makeDb(seed = {}) {
@@ -328,5 +328,69 @@ describe('Üretilen ürün (supplyType=produced): imalattan stok değil reçete 
         expect(r.moves.filter((m) => m.movementType === 'PRODUCTION_CONSUME')).toHaveLength(2);
         expect(r.plan.consumeEntries).toHaveLength(2);
         expect(r.plan.markerRef).toBeNull();
+    });
+});
+
+// 04.10.2026 — onayda sessiz geçen durumlar belgeye uyarı olarak yazılır (stok davranışı değişmez)
+describe('collectStockWarnings', () => {
+    async function warn(seed, finalItems, extra = {}) {
+        const db = makeDb(seed);
+        const plan = await planCanonicalStock(db, { tenantId: 'T', branchId: 'B', finalItems, ...extra });
+        const snaps = await readCanonicalStock(db.txn(), plan);
+        return collectStockWarnings(plan, snaps);
+    }
+
+    it('temiz kalem: uyarı yok', async () => {
+        const w = await warn({
+            'productionProducts/pS': { inventoryProductId: 'invS', supplyType: 'trade' },
+            'inventoryProducts/invS': { unit: 'kg' },
+            'branchStocks/imalat_T_invS': { currentStock: 10, unit: 'kg' },
+            'branchStocks/B_invS': { currentStock: 1000, unit: 'g' },
+        }, [{ productId: 'pS', productName: 'Sucuk', unit: 'kg', finalQuantity: 4 }]);
+        expect(w).toEqual([]);
+    });
+
+    it('canlı vaka 30.09: hamur adet → şube satırı g, karşılık yok → unit_mismatch_in', async () => {
+        const w = await warn({
+            'productionProducts/pH': { inventoryProductId: 'invH', supplyType: 'produced' },
+            'inventoryProducts/invH': { unit: 'adet' },
+            'branchStocks/B_invH': { currentStock: 0, unit: 'g' },
+            'productionRecipes/r': { tenantId: 'T', productionProductId: 'pH', isActive: true, outputQuantity: 1, ingredients: [] },
+        }, [{ productId: 'pH', productName: 'Pizza Hamuru', unit: 'adet', finalQuantity: 100 }]);
+        expect(w).toEqual([expect.objectContaining({ code: 'unit_mismatch_in', productName: 'Pizza Hamuru', detail: '100 adet → g' })]);
+    });
+
+    it('karşılık girilmişse aynı hamur uyarı üretmez', async () => {
+        const w = await warn({
+            'productionProducts/pH': { inventoryProductId: 'invH', supplyType: 'produced', stockUnitFactor: 250, stockUnitFactorUnit: 'g' },
+            'inventoryProducts/invH': { unit: 'adet' },
+            'branchStocks/B_invH': { currentStock: 0, unit: 'g' },
+            'productionRecipes/r': { tenantId: 'T', productionProductId: 'pH', isActive: true, outputQuantity: 1, ingredients: [] },
+        }, [{ productId: 'pH', productName: 'Pizza Hamuru', unit: 'adet', finalQuantity: 100 }]);
+        expect(w).toEqual([]);
+    });
+
+    it('reçetesiz üretilen ürün, bağsız kart, bağsız reçete malzemesi, koli→adet imalat satırı', async () => {
+        const w = await warn({
+            'productionProducts/pHm': { inventoryProductId: 'invHm', supplyType: 'produced' },
+            'productionProducts/pT': { inventoryProductId: 'invT', supplyType: 'produced' },
+            'productionRecipes/rT': { tenantId: 'T', productionProductId: 'pT', isActive: true, outputQuantity: 1,
+                ingredients: [{ inventoryProductName: 'Kakao', quantity: 1, unit: 'kg' }] },
+            'productionProducts/pK': { inventoryProductId: 'invK' },
+            'branchStocks/imalat_T_invK': { currentStock: 500, unit: 'adet' },
+        }, [
+            { productId: 'pHm', productName: 'HMBGR HAMUR', unit: 'adet', finalQuantity: 10 },
+            { productId: 'pX', productName: 'Kartsız', unit: 'adet', finalQuantity: 1 },
+            { productId: 'pT', productName: 'Tatlı', unit: 'adet', finalQuantity: 2 },
+            { productId: 'pK', productName: 'Pizza Kutusu', unit: 'koli', finalQuantity: 2 },
+        ]);
+        const codes = w.map((x) => `${x.code}:${x.productName}`);
+        expect(codes).toEqual(expect.arrayContaining([
+            'no_recipe:HMBGR HAMUR',
+            'no_inventory_link:Kartsız',
+            'recipe_unlinked:Tatlı',
+            'unit_mismatch_out:Pizza Kutusu',
+        ]));
+        expect(w.find((x) => x.code === 'recipe_unlinked').detail).toBe('Kakao');
     });
 });

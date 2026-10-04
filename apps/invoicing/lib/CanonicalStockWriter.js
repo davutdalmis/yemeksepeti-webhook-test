@@ -120,6 +120,7 @@ async function planCanonicalStock(db, { tenantId, branchId, finalItems, orderId,
 
         const e = addEntry(entries, invId, { invId, name: it.productName || invId, qty, unit: it.unit, cardUnit });
         e.produced = e.produced || produced;
+        if (!pd || !pd.inventoryProductId) e.noLink = true;
         const factorQty = Number(pd && pd.stockUnitFactor);
         const factorUnit = pd && pd.stockUnitFactorUnit ? normalizeUnit(pd.stockUnitFactorUnit, null) : null;
         if (factorQty > 0 && factorUnit) e.factor = { qty: factorQty, unit: factorUnit };
@@ -131,7 +132,11 @@ async function planCanonicalStock(db, { tenantId, branchId, finalItems, orderId,
             const output = recipe.outputQuantity > 0 ? recipe.outputQuantity : 1;
             const mult = qty / output;
             for (const ing of recipe.ingredients || []) {
-                if (!ing.inventoryProductId || !(ing.quantity > 0)) continue;
+                if (!ing.inventoryProductId) {
+                    (e.unlinkedIngredients = e.unlinkedIngredients || []).push(ing.inventoryProductName || ing.name || '?');
+                    continue;
+                }
+                if (!(ing.quantity > 0)) continue;
                 const ce = addEntry(consume, ing.inventoryProductId, {
                     invId: ing.inventoryProductId,
                     name: ing.inventoryProductName || ing.inventoryProductId,
@@ -208,6 +213,40 @@ function resolveForRow(e, snap, { preferFactorUnit = false } = {}) {
         }
     }
     return { qty: c.qty, unit: target, converted: e.converted || c.converted, mismatch: e.mismatch || c.mismatch };
+}
+
+/**
+ * 04.10.2026 — onayda SESSİZ geçen durumların listesi (stok yine yazılır, davranış değişmez).
+ * Belgeye `stockWarnings` olarak yazılır, panel onay sonrası gösterir. Kodlar:
+ *   no_recipe            üretilen ürünün aktif reçetesi yok → imalatta hiçbir şey düşmedi
+ *   no_inventory_link    productionProducts kartında inventoryProductId yok → ürün kimliğiyle ayrı satır
+ *   recipe_unlinked      reçete malzemesinde inventoryProductId yok → o malzeme düşmedi
+ *   unit_mismatch_out    imalat satırı birimi çevrilemedi → miktar çevrilmeden düşüldü
+ *   unit_mismatch_in     şube satırı birimi çevrilemedi → miktar çevrilmeden eklendi
+ */
+function collectStockWarnings(plan, snaps) {
+    if (!plan || !snaps) return [];
+    const out = [];
+    const push = (code, e, detail) => out.push({ code, productId: e.invId, productName: e.name, ...(detail ? { detail } : {}) });
+    plan.entries.forEach((e, i) => {
+        if (e.noLink) push('no_inventory_link', e);
+        if (e.produced && e.noRecipe) push('no_recipe', e);
+        if (e.unlinkedIngredients && e.unlinkedIngredients.length) push('recipe_unlinked', e, e.unlinkedIngredients.join(', '));
+        if (!e.produced) {
+            const r = resolveForRow(e, snaps.outSnaps[i]);
+            if (r.mismatch) push('unit_mismatch_out', e, `${e.sourceQty ?? '?'} ${e.sourceUnit || '?'} → ${r.unit}`);
+        }
+        const r = resolveForRow(e, snaps.inSnaps[i], { preferFactorUnit: true });
+        if (r.mismatch) push('unit_mismatch_in', e, `${e.sourceQty ?? '?'} ${e.sourceUnit || '?'} → ${r.unit}`);
+    });
+    const alreadyConsumed = !!(snaps.markerSnap && snaps.markerSnap.exists);
+    if (!alreadyConsumed) {
+        (plan.consumeEntries || []).forEach((e, i) => {
+            const r = resolveForRow(e, snaps.consumeSnaps[i]);
+            if (r.mismatch) push('unit_mismatch_out', e, `${e.sourceQty ?? '?'} ${e.sourceUnit || '?'} → ${r.unit} (reçete malzemesi)`);
+        });
+    }
+    return out;
 }
 
 function movementBase(e, r) {
@@ -356,4 +395,5 @@ module.exports = {
     planCanonicalStock,
     readCanonicalStock,
     writeCanonicalStock,
+    collectStockWarnings,
 };
