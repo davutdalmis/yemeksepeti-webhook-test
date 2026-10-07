@@ -298,6 +298,7 @@ class ShipmentProcessor {
                         productId: it.productId,
                         name: it.productName,
                         quantity: editedQty,
+                        unit: it.unit,
                         unitPrice: it.unitPrice,
                         vatRate: it.vatRate,
                     };
@@ -310,6 +311,7 @@ class ShipmentProcessor {
                 const p = await withToken((token) => provider.upsertProduct(token, {
                     name: it.name,
                     sku: it.productId,
+                    unit: it.unit, // yoksa yeni kart hep 'Adet' aciliyordu
                     vatRate: it.vatRate,
                 }));
                 itemsWithProductIds.push({ ...it, productId: p.productId });

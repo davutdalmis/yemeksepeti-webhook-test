@@ -22,6 +22,43 @@ function markRetryUnsafe(err) {
     return err;
 }
 
+/**
+ * 07.10.2026 (Bafetto) — Urun adi karsilastirmasi icin katlama. Parasut'un filter[name]
+ * aramasi buyuk/kucuk harfe duyarli: "Füme kaburga" mevcut "Füme Kaburga" kartini bulamadi
+ * ve motor Firestore id kodlu, "g" birimli kopya kart acti. Turkce kucuk harf + ı/i esitleme.
+ */
+function foldProductName(raw) {
+    return String(raw == null ? '' : raw)
+        .trim()
+        .replace(/\s+/g, ' ')
+        .toLocaleLowerCase('tr-TR')
+        .replace(/ı/g, 'i');
+}
+
+// Yemigo birimi -> Parasut kart birimi. Muhasebenin elle actigi kartlar bu yazimi kullaniyor.
+const PARASUT_UNIT_NAMES = {
+    kg: 'Kilogram', kilo: 'Kilogram', kilogram: 'Kilogram',
+    g: 'Gram', gr: 'Gram', gram: 'Gram',
+    adet: 'Adet', ad: 'Adet',
+    lt: 'Litre', l: 'Litre', litre: 'Litre',
+    ml: 'Mililitre', mililitre: 'Mililitre',
+    koli: 'Koli', paket: 'Paket', kutu: 'Kutu', porsiyon: 'Porsiyon',
+};
+
+function toParasutUnit(raw) {
+    const u = String(raw == null ? '' : raw).trim();
+    if (!u) return 'Adet';
+    const known = PARASUT_UNIT_NAMES[foldProductName(u)];
+    if (known) return known;
+    return u.charAt(0).toLocaleUpperCase('tr-TR') + u.slice(1);
+}
+
+// Katalog taramasi yalniz onbellek + ad aramasi iskalarsa yapilir; ayni is icinde
+// birden cok yeni urun icin tekrar tekrar taramamak icin kisa sureli tutulur.
+const CATALOG_TTL_MS = 10 * 60 * 1000;
+const CATALOG_MAX_PAGES = 40; // 25'lik sayfa -> 1000 kart
+const catalogCache = new Map(); // companyId -> { at, items }
+
 class ParasutProvider {
     /**
      * @param {object} opts
@@ -233,6 +270,13 @@ class ParasutProvider {
             await this._rememberRef('products', name, foundId);
             return { productId: foundId, created: false };
         }
+
+        // Ad aramasi harf duyarli; yeni kart acmadan once katalogda harf duyarsiz ad / kod ara.
+        const matchedId = await this._findProductInCatalog(token, name, product.code || product.sku);
+        if (matchedId) {
+            await this._rememberRef('products', name, matchedId);
+            return { productId: matchedId, created: false, matchedBy: 'catalog' };
+        }
         const payload = {
             data: {
                 type: 'products',
@@ -240,7 +284,7 @@ class ParasutProvider {
                     name,
                     code: product.code || product.sku || '',
                     vat_rate: typeof product.vatRate === 'number' ? product.vatRate : 20,
-                    unit: product.unit || 'Adet',
+                    unit: toParasutUnit(product.unit),
                     list_price: typeof product.listPrice === 'number' ? product.listPrice : 0,
                     currency: product.currency || 'TRL',
                     inventory_tracking: false,
@@ -253,7 +297,48 @@ class ParasutProvider {
         }
         const newId = String(created.data.id);
         await this._rememberRef('products', name, newId);
+        const cat = catalogCache.get(this.companyId);
+        if (cat) cat.items.push({ id: newId, name, code: payload.data.attributes.code, archived: false });
         return { productId: newId, created: true };
+    }
+
+    /**
+     * Tum urun kartlarini tarayip harf duyarsiz ad ya da birebir kod eslesmesi arar.
+     * Arsivli olmayan kart onceliklidir. Tarama hatasi akisi DURDURMAZ (null -> kart acilir,
+     * eski davranis); irsaliyeyi bloklamaktansa kopya kart riski kabul edilir.
+     */
+    async _findProductInCatalog(token, name, code) {
+        let items;
+        try {
+            items = await this._loadProductCatalog(token);
+        } catch (e) {
+            console.warn(`[ParasutProvider] urun katalogu taranamadi: ${e.message}`);
+            return null;
+        }
+        const want = foldProductName(name);
+        const wantCode = code ? String(code).trim() : '';
+        const hits = items.filter((p) => foldProductName(p.name) === want
+            || (wantCode && p.code && String(p.code).trim() === wantCode));
+        if (hits.length === 0) return null;
+        const best = hits.find((p) => !p.archived) || hits[0];
+        return String(best.id);
+    }
+
+    async _loadProductCatalog(token) {
+        const cached = catalogCache.get(this.companyId);
+        if (cached && Date.now() - cached.at < CATALOG_TTL_MS) return cached.items;
+        const items = [];
+        for (let page = 1; page <= CATALOG_MAX_PAGES; page++) {
+            const data = await this._get(token, `/products?page[number]=${page}&page[size]=25&sort=id`);
+            const rows = Array.isArray(data && data.data) ? data.data : [];
+            for (const r of rows) {
+                const a = r.attributes || {};
+                items.push({ id: r.id, name: a.name || '', code: a.code || '', archived: a.archived === true });
+            }
+            if (rows.length < 25) break;
+        }
+        catalogCache.set(this.companyId, { at: Date.now(), items });
+        return items;
     }
 
     // -------------------- REF CACHE (isim -> Parasut ID) --------------------
@@ -1152,3 +1237,6 @@ class ParasutProvider {
 }
 
 module.exports = ParasutProvider;
+module.exports.foldProductName = foldProductName;
+module.exports.toParasutUnit = toParasutUnit;
+module.exports._resetCatalogCache = () => catalogCache.clear();

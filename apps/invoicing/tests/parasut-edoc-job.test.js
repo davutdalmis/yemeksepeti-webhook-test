@@ -215,11 +215,12 @@ describe('istek-basina hiz limiti', () => {
         const limiter = makeCountingLimiter();
         const p = makeProvider({ rateLimiter: limiter, tenantId: 'T1' });
 
-        nock(BASE).get(`/v4/${COMPANY_ID}/products`).query(true).reply(200, { data: [] });
+        nock(BASE).get(`/v4/${COMPANY_ID}/products`).query(true).times(2).reply(200, { data: [] });
         nock(BASE).post(`/v4/${COMPANY_ID}/products`).reply(201, { data: { id: 'new-1' } });
 
         await p.upsertProduct(TOKEN, { name: 'Yeni' });
-        expect(limiter.state.calls).toBe(2); // 1 GET + 1 POST
+        // 1 GET ad aramasi + 1 GET katalog (07.10: kart acmadan once harf duyarsiz tarama) + 1 POST
+        expect(limiter.state.calls).toBe(3);
     });
 
     test('jeton yoksa BEKLER, sonra devam eder (siparis ortasinda patlamaz)', async () => {
